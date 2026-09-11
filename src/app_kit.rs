@@ -1,0 +1,105 @@
+//! Shared AppKit bring-up and main-loop control.
+//!
+//! Two features need `NSApp`: the gesture overlay ([`crate::overlay`])
+//! and the menu-bar status item ([`crate::status_item`]). Both used to
+//! be optional, so whichever ran first owned the application object —
+//! which breaks as soon as both are enabled and each sets its own
+//! activation policy. This module owns that setup instead, and both
+//! call in.
+//!
+//! The loop itself is `[NSApp run]`, not `CFRunLoopRun()`. A status
+//! item needs `sendEvent:` dispatch to respond to clicks, and only
+//! `NSApplication`'s loop does that — a bare CFRunLoop renders the icon
+//! but swallows every click. IOHID sources scheduled on the main run
+//! loop still fire, since `[NSApp run]` pumps that same run loop.
+
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use objc2::MainThreadMarker;
+use objc2::rc::Retained;
+use objc2_app_kit::{
+    NSApplication, NSApplicationActivationPolicy, NSEvent, NSEventModifierFlags, NSEventType,
+};
+use objc2_foundation::NSPoint;
+
+unsafe extern "C" {
+    /// libdispatch's main queue. Declared by hand rather than pulling in
+    /// a dispatch crate for one symbol.
+    static _dispatch_main_q: c_void;
+
+    fn dispatch_async_f(
+        queue: *mut c_void,
+        context: *mut c_void,
+        work: extern "C" fn(*mut c_void),
+    );
+}
+
+/// `finishLaunching` posts `NSApplicationDidFinishLaunching`; calling it
+/// twice posts it twice. The rest of the setup is idempotent, so only
+/// this needs guarding.
+static LAUNCHED: AtomicBool = AtomicBool::new(false);
+
+/// Bring up `NSApp` as an accessory app — no Dock tile, no app-switcher
+/// entry, no focus stealing. Safe to call from every feature that needs
+/// AppKit; the first call wins and later ones are cheap no-ops.
+///
+/// Must run on the main thread; the `MainThreadMarker` enforces it.
+pub fn ensure_app(mtm: MainThreadMarker) -> Retained<NSApplication> {
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    if !LAUNCHED.swap(true, Ordering::SeqCst) {
+        app.finishLaunching();
+    }
+    app
+}
+
+/// Run the AppKit event loop. Blocks until [`request_stop`] fires.
+///
+/// Replaces the `CFRunLoopRun()` that `hid::Manager::run` used before
+/// there was any UI.
+pub fn run_event_loop(mtm: MainThreadMarker) {
+    let app = ensure_app(mtm);
+    app.run();
+}
+
+/// Ask the event loop to exit. Callable from any thread — the sigwait
+/// worker calls it from its own thread.
+///
+/// `[NSApp stop:]` only takes effect when the loop next finishes
+/// dispatching an event, so a stop with no events pending would hang
+/// until the user happened to move the mouse. The dummy
+/// `ApplicationDefined` event is the standard way to guarantee one more
+/// turn of the loop.
+pub fn request_stop() {
+    unsafe {
+        let queue = &raw const _dispatch_main_q as *mut c_void;
+        dispatch_async_f(queue, std::ptr::null_mut(), stop_on_main);
+    }
+}
+
+extern "C" fn stop_on_main(_ctx: *mut c_void) {
+    // dispatch_async_f onto the main queue always lands on the main
+    // thread, so this marker is sound.
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    app.stop(None);
+
+    let event =
+        NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
+            NSEventType::ApplicationDefined,
+            NSPoint::new(0.0, 0.0),
+            NSEventModifierFlags::empty(),
+            0.0,
+            0,
+            None,
+            0,
+            0,
+            0,
+        );
+    if let Some(event) = event {
+        app.postEvent_atStart(&event, true);
+    }
+}

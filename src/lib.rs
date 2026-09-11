@@ -4,6 +4,7 @@
 //! to characterize real-trackpad event streams).
 
 pub mod app_context;
+pub mod app_kit;
 pub mod config;
 pub mod descriptor;
 pub mod gesture;
@@ -13,4 +14,5 @@ pub mod output;
 pub mod overlay;
 pub mod report;
 pub mod scan_clock;
+pub mod status_item;
 pub mod time;

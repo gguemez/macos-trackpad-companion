@@ -20,10 +20,13 @@ use core_foundation::date::CFDate;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::CFNumber;
 use core_foundation::runloop::{
-    CFRunLoop, CFRunLoopRun, CFRunLoopStop, CFRunLoopTimer, kCFRunLoopDefaultMode,
+    CFRunLoop, CFRunLoopRun, CFRunLoopTimer, kCFRunLoopDefaultMode,
 };
+use objc2::MainThreadMarker;
 use core_foundation::string::CFString;
-use core_foundation_sys::runloop::{CFRunLoopTimerContext, CFRunLoopTimerRef};
+use core_foundation_sys::runloop::{
+    CFRunLoopTimerContext, CFRunLoopTimerInvalidate, CFRunLoopTimerRef,
+};
 use std::ffi::c_void;
 use std::os::raw::c_int;
 use std::pin::Pin;
@@ -268,16 +271,24 @@ impl Manager {
             );
         }
 
+        // Opening the manager is deliberately non-fatal. The status
+        // item is this app's only UI, so bailing here would flash the
+        // icon up and tear it down again before the error could be
+        // read. Report it in the menu and keep retrying instead — the
+        // usual causes (missing Input Monitoring grant, another driver
+        // holding the HID devices) are both fixable while we wait.
+        let mut open_retry_timer = None;
         let rv = unsafe { IOHIDManagerOpen(self.raw, kIOHIDOptionsTypeNone) };
-        if rv != kIOReturnSuccess {
-            if rv as u32 == 0xE00002C5 {
-                bail!(
-                    "IOHIDManagerOpen denied (0xE00002C5): grant Input Monitoring \
-                     in System Settings → Privacy & Security → Input Monitoring."
-                );
-            }
-            bail!("IOHIDManagerOpen failed: {:#x}", rv as u32);
+        if rv == kIOReturnSuccess {
+            crate::status_item::set_status("Waiting for device…");
+        } else {
+            log::error!("IOHIDManagerOpen failed: {}", describe_open_failure(rv));
+            crate::status_item::set_status(short_open_failure(rv));
+            open_retry_timer = Some(install_open_retry_timer(self.raw));
         }
+        // Held so the CFRunLoopTimer stays retained for the life of the
+        // run loop; the callback invalidates it once the open succeeds.
+        let _open_retry_timer = open_retry_timer;
 
         log::info!(
             "waiting for PTP device (vid={:?} pid={:?})",
@@ -302,7 +313,17 @@ impl Manager {
         // the run loop.
         let _heartbeat_timer = install_heartbeat_timer(bridge_ptr);
 
-        unsafe { CFRunLoopRun() };
+        // `[NSApp run]` rather than `CFRunLoopRun()`: the menu-bar
+        // status item needs `sendEvent:` dispatch to react to clicks,
+        // and only NSApplication's loop provides it. IOHID sources are
+        // scheduled on the main run loop, which NSApp pumps, so device
+        // callbacks are unaffected.
+        match MainThreadMarker::new() {
+            Some(mtm) => crate::app_kit::run_event_loop(mtm),
+            // Not reachable from `main`, but a caller on another thread
+            // should get the old behaviour rather than a panic.
+            None => unsafe { CFRunLoopRun() },
+        }
 
         Ok(())
     }
@@ -348,6 +369,71 @@ extern "C" fn on_heartbeat_tick(_timer: CFRunLoopTimerRef, info: *mut c_void) {
     }
 }
 
+/// How often to retry `IOHIDManagerOpen` after a failed attempt.
+const OPEN_RETRY_SECS: f64 = 3.0;
+
+/// Full explanation for an `IOHIDManagerOpen` failure, for the log.
+fn describe_open_failure(rv: IOReturn) -> String {
+    match rv as u32 {
+        0xE00002C5 => "denied (0xE00002C5) — grant Input Monitoring in System Settings → \
+                       Privacy & Security → Input Monitoring"
+            .to_string(),
+        0xE00002E2 => "exclusive access (0xE00002E2) — another process has seized the HID \
+                       devices; a third-party mouse/trackpad driver is the usual cause"
+            .to_string(),
+        other => format!("{other:#x}"),
+    }
+}
+
+/// Menu-width version of the same, for the status line.
+fn short_open_failure(rv: IOReturn) -> &'static str {
+    match rv as u32 {
+        0xE00002C5 => "Needs Input Monitoring",
+        0xE00002E2 => "HID devices held by another app",
+        _ => "HID open failed",
+    }
+}
+
+/// Retry `IOHIDManagerOpen` on a timer until it succeeds, then stop.
+/// Lets the companion recover without a restart once the user grants
+/// the permission or quits whatever was holding the devices.
+fn install_open_retry_timer(manager: IOHIDManagerRef) -> CFRunLoopTimer {
+    // Leaked on purpose: the callback dereferences this for as long as
+    // the timer can fire, which is the life of the process.
+    let ctx = Box::into_raw(Box::new(manager));
+    let mut context = CFRunLoopTimerContext {
+        version: 0,
+        info: ctx as *mut c_void,
+        retain: None,
+        release: None,
+        copyDescription: None,
+    };
+    let now = CFDate::now().abs_time();
+    let timer = CFRunLoopTimer::new(
+        now + OPEN_RETRY_SECS,
+        OPEN_RETRY_SECS,
+        0,
+        0,
+        on_open_retry,
+        &mut context,
+    );
+    let mode = unsafe { kCFRunLoopDefaultMode };
+    CFRunLoop::get_current().add_timer(&timer, mode);
+    timer
+}
+
+extern "C" fn on_open_retry(timer: CFRunLoopTimerRef, info: *mut c_void) {
+    let manager = unsafe { *(info as *const IOHIDManagerRef) };
+    let rv = unsafe { IOHIDManagerOpen(manager, kIOHIDOptionsTypeNone) };
+    if rv == kIOReturnSuccess {
+        log::info!("IOHIDManagerOpen succeeded on retry");
+        crate::status_item::set_status("Waiting for device…");
+        unsafe { CFRunLoopTimerInvalidate(timer) };
+    } else {
+        log::debug!("IOHIDManagerOpen retry: {:#x}", rv as u32);
+    }
+}
+
 /// Block SIGINT/SIGTERM in the calling thread, *and in every thread
 /// spawned later by this process* (since spawned threads inherit the
 /// caller's signal mask). Must be called from `main` before any other
@@ -389,12 +475,6 @@ pub fn block_shutdown_signals() {
 fn install_shutdown_worker() {
     use std::mem;
 
-    // The CFRunLoopRef from get_current() is reference-counted by Apple
-    // but the main run loop has effectively static lifetime, so capturing
-    // its raw pointer as a `usize` for the worker thread is safe.
-    // Going through `usize` side-steps `!Send` on `CFRunLoop` itself.
-    let run_loop_ref = CFRunLoop::get_current().as_concrete_TypeRef() as usize;
-
     std::thread::spawn(move || {
         unsafe {
             let mut set: libc::sigset_t = mem::zeroed();
@@ -407,8 +487,13 @@ fn install_shutdown_worker() {
             // ordinary thread context (not a signal handler).
             let _ = libc::sigwait(&set, &mut sig);
             log::info!("received signal {sig}, shutting down");
-            CFRunLoopStop(run_loop_ref as *mut _);
         }
+        // `CFRunLoopStop` is not enough now that the loop is
+        // `[NSApp run]`: NSApplication's loop treats a stopped run loop
+        // as "no event this time round" and keeps going. `request_stop`
+        // hops to the main thread and does the `stop:` + dummy-event
+        // dance that actually unwinds it.
+        crate::app_kit::request_stop();
     });
 }
 
@@ -480,6 +565,8 @@ unsafe extern "C" fn on_device_matched(
         layout.button_bit,
         desc.len(),
     );
+
+    crate::status_item::set_status(&format!("Connected — {product}"));
 
     // Prefer the RMK vendor control path when supported. For standard
     // Precision Touchpads, discover the Input Mode and optional configuration
@@ -650,6 +737,9 @@ unsafe extern "C" fn on_device_removed(
     let bridge = unsafe { &mut *(context as *mut Bridge) };
     bridge.devices.retain(|d| d.device != device);
     log::info!("device removed");
+    if bridge.devices.is_empty() {
+        crate::status_item::set_status("Waiting for device…");
+    }
 }
 
 unsafe extern "C" fn on_input_report(

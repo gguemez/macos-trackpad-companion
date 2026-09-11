@@ -18,9 +18,35 @@ learned into a nice spec and develop a high-quality codebase from it.
 
 ## Build & run
 
+The primary artifact is a menu-bar app bundle:
+
+```sh
+./scripts/bundle.sh
+open target/companion.app
+```
+
+The companion runs as an `LSUIElement` agent — no Dock tile, no window,
+no app-switcher entry. Its only UI is a menu-bar icon whose menu reports
+device state and offers Quit. Quit raises `SIGTERM` at the process, the
+same path Ctrl+C takes, so `DeviceState::drop` still reverts the
+firmware to mouse mode on the way out.
+
+The plain binary still works for debugging, with logs on stderr:
+
 ```sh
 cargo build --release
 ./target/release/companion -v
+```
+
+**Permissions are keyed to code identity.** `bundle.sh` ad-hoc signs, and
+an ad-hoc signature's designated requirement embeds the binary's cdhash
+— so every rebuild looks like a brand-new app to macOS, and Input
+Monitoring / Accessibility have to be granted again. To make grants
+stick across builds, sign with a self-signed certificate from the login
+keychain:
+
+```sh
+SIGN_IDENTITY="My Dev Cert" ./scripts/bundle.sh
 ```
 
 CLI flags (intentionally tiny — everything else lives in the config file):
@@ -103,7 +129,9 @@ duration_ms = 600             # how long the flash stays up
 ## Permissions
 
 The first run on a fresh macOS install will prompt for two privacy
-permissions; without them the companion exits with an actionable error.
+permissions. Without them the companion no longer exits — it keeps
+running, reports the problem in its menu-bar menu, and retries in the
+background (see **Caveats**).
 
 - **Input Monitoring** — required to read raw HID input reports from
   the trackpad. macOS surfaces error `0xE00002C5` from `IOHIDManagerOpen`
@@ -207,6 +235,8 @@ on separate interfaces.
 | `gesture.rs` | Pure state machine — classifies 1F/2F/3F/4F gestures, locks 2F mode on first significant motion. Tested without I/O. |
 | `output.rs` | macOS event synthesis. Public CGEvent for cursor/click/scroll, private CGEvent type/field IDs for pinch/rotate/swipe. |
 | `hid.rs` | IOHIDManager FFI: device matching, descriptor + input-report subscription, run-loop pumping. |
+| `app_kit.rs` | Shared `NSApp` bring-up (accessory policy) and the `[NSApp run]` event loop, plus the cross-thread stop. |
+| `status_item.rs` | Menu-bar status item: template icon, device-state line, Quit. |
 | `config.rs` | TOML config loading and defaults. Unknown keys are rejected. |
 | `app_context.rs` | Resolves the bundle ID of the app under the cursor, for the per-gesture `only` / `except` filters. |
 | `overlay.rs` | Optional click-through `NSPanel` HUD that flashes the gesture name at lock time. |
@@ -232,3 +262,16 @@ on separate interfaces.
   Once the centroid travels 0.4 mm, the inter-finger distance changes
   by 4%, or the angle changes by 4°, that mode wins for the duration of
   the touch. The thresholds live at the top of `gesture.rs`.
+- **A failed HID open is not fatal.** The menu-bar icon is the only UI,
+  so exiting on `IOHIDManagerOpen` failure would flash it up and tear it
+  down before the error could be read. Instead the failure is logged,
+  shown in the menu, and retried on a timer. Note that the internal
+  Apple trackpad *does* match the digitizer filter — `IOHIDManager`
+  matches on `DeviceUsagePairs`, not just `PrimaryUsagePage` — and is
+  held seized by the system, which is a common source of
+  `kIOReturnExclusiveAccess` (`0xE00002E2`) at startup. It clears on its
+  own; the descriptor parse then rejects the device properly.
+- **Retries are subject to App Nap.** The retry timer asks for 3 s, but
+  a windowless `LSUIElement` agent gets its timers coalesced — observed
+  ~9 s in practice. Recovery works, just slower than the interval
+  suggests. `NSProcessInfo beginActivityWithOptions` would opt out.

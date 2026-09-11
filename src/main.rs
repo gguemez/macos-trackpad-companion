@@ -17,6 +17,7 @@
 //! / README for the full schema.
 
 mod app_context;
+mod app_kit;
 mod config;
 mod descriptor;
 mod gesture;
@@ -26,6 +27,7 @@ mod output;
 mod overlay;
 mod report;
 mod scan_clock;
+mod status_item;
 mod time;
 
 use anyhow::{Context, Result};
@@ -126,6 +128,13 @@ fn main() -> Result<()> {
         pid: cfg.device.pid,
     })
     .context("open IOHIDManager")?;
+
+    // Install the menu-bar icon before the event loop starts. Bound to
+    // a named guard: dropping a `StatusItem` pulls it out of the menu
+    // bar, so it has to live as long as `main` does.
+    let _status_item = objc2::MainThreadMarker::new()
+        .map(status_item::StatusItem::install)
+        .ok_or_else(|| anyhow::anyhow!("main() must run on the main thread"))?;
 
     if cfg.overlay.enable {
         let overlay = overlay::Overlay::new(cfg.overlay.duration_ms);

@@ -20,8 +20,8 @@ use core_foundation_sys::runloop::CFRunLoopTimerRef;
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSFont,
-    NSPanel, NSScreen, NSTextAlignment, NSTextField, NSWindowStyleMask,
+    NSBackingStoreType, NSColor, NSFont, NSPanel, NSScreen, NSTextAlignment, NSTextField,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
@@ -60,11 +60,10 @@ impl Overlay {
         let mtm = MainThreadMarker::new()
             .expect("Overlay::new must run on the main thread");
 
-        // Bring up NSApp as an accessory so the daemon doesn't grow a
-        // Dock icon or steal focus. Idempotent if NSApp already exists.
-        let app = NSApplication::sharedApplication(mtm);
-        app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
-        app.finishLaunching();
+        // Shared with the menu-bar status item — whichever feature is
+        // enabled first brings NSApp up, and neither overrides the
+        // other's activation policy.
+        crate::app_kit::ensure_app(mtm);
 
         let screen_frame = NSScreen::mainScreen(mtm)
             .map(|s| s.frame())
