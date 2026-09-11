@@ -711,4 +711,36 @@ mod tests {
         assert_eq!(layout.scan_time_offset, 31);
         assert_eq!(layout.contact_count_offset, 33);
     }
+
+    #[test]
+    fn discovers_standard_ptp_feature_report_ids() {
+        let mut desc = wpt_descriptor_with_mouse_tlc();
+
+        // Standard Precision Touchpad configuration features.
+        //
+        // Report 0x25: Input Mode (Digitizer Usage 0x52)
+        // Report 0x22: Selective Reporting
+        //              Surface Switch 0x57 + Button Switch 0x58
+        // Report 0x23: Latency Mode (Digitizer Usage 0x60)
+        desc.extend_from_slice(&[
+            // Usage Page (Digitizer)
+            0x05, 0x0d, // Configuration collection
+            0x09, 0x0e, 0xa1, 0x01, // Input Mode -- Report ID 0x25
+            0x85, 0x25, 0x09, 0x52, 0x15, 0x00, 0x25, 0x0a, 0x75, 0x08, 0x95, 0x01, 0xb1, 0x02,
+            // Selective Reporting -- Report ID 0x22
+            0x85, 0x22, 0x09, 0x57, 0x09, 0x58, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x02,
+            0xb1, 0x02, // 6 bits padding
+            0x95, 0x06, 0xb1, 0x03, // Latency Mode -- Report ID 0x23
+            0x85, 0x23, 0x09, 0x60, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x01, 0xb1, 0x02,
+            // 7 bits padding
+            0x95, 0x07, 0xb1, 0x03, // End Configuration collection
+            0xc0,
+        ]);
+
+        let layout = parse(&desc).expect("descriptor should parse");
+
+        assert_eq!(layout.input_mode_report_id, Some(0x25));
+        assert_eq!(layout.selective_reporting_report_id, Some(0x22));
+        assert_eq!(layout.latency_mode_report_id, Some(0x23));
+    }
 }
