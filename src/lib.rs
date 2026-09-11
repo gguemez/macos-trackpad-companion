@@ -6,6 +6,7 @@
 pub mod app_context;
 pub mod app_kit;
 pub mod config;
+pub mod config_watch;
 pub mod descriptor;
 pub mod gesture;
 pub mod hid;

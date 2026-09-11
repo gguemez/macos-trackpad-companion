@@ -441,6 +441,15 @@ pub struct State<O: Output> {
 }
 
 impl<O: Output> State<O> {
+    /// Swap the settings a config reload is allowed to change while
+    /// the daemon runs. Deliberately does not touch in-flight gesture
+    /// state: a reload mid-gesture adjusts the curve for subsequent
+    /// frames rather than resetting the lock.
+    pub fn apply_config(&mut self, cursor_accel: CursorAccel, out_cfg: crate::output::Config) {
+        self.cursor_accel = cursor_accel;
+        self.out.set_config(out_cfg);
+    }
+
     pub fn new(out: O, cursor_accel: CursorAccel) -> Self {
         let now = Timestamp::now();
         Self {

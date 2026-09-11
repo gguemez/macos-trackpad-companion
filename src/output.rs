@@ -20,7 +20,7 @@ use core_foundation_sys::runloop::{
 };
 use core_graphics::display::CGDisplay;
 use core_graphics::geometry::{CGPoint, CGRect};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::time::Duration;
 
@@ -875,6 +875,10 @@ pub trait Output {
     /// so test fakes that don't care about timestamps don't have to
     /// implement it.
     fn set_event_time(&self, _ts: Timestamp) {}
+    /// Replace the live-tunable settings after a config reload. Taken
+    /// by value so implementations can store it without cloning, and
+    /// defaulted to a no-op so test fakes are unaffected.
+    fn set_config(&self, _cfg: Config) {}
     /// Whether pinch / rotate / per-axis swipe are currently admissible
     /// under the active output's policy. The gesture engine consults
     /// these once at gesture start (when it stages the per-gesture
@@ -970,6 +974,9 @@ impl<O: Output> OverlayOutput<O> {
 }
 
 impl<O: Output> Output for OverlayOutput<O> {
+    fn set_config(&self, cfg: Config) {
+        self.inner.set_config(cfg);
+    }
     fn set_event_time(&self, ts: Timestamp) {
         self.inner.set_event_time(ts);
     }
@@ -1026,7 +1033,9 @@ impl<O: Output> Output for OverlayOutput<O> {
 }
 
 pub struct Emitter {
-    cfg: Config,
+    /// Interior-mutable so a config reload can swap the live-tunable
+    /// settings: every `Output` method takes `&self`.
+    cfg: RefCell<Config>,
     /// Persistent CGEventSource. Created with
     /// `kCGEventSourceStateCombinedSessionState` so apps see our scroll
     /// events as coming from a real input device — Chrome / WebKit
@@ -1092,7 +1101,7 @@ struct Momentum {
     /// Mirror of `Config::scroll_accel` — the only Config field the
     /// momentum integrator reads. Narrowed so Momentum doesn't have to
     /// hold the whole (now `Vec<String>`-bearing) Config.
-    scroll_accel: f64,
+    scroll_accel: Cell<f64>,
     /// Same persistent CGEventSource the Emitter holds. Aliased here
     /// (not retained separately) because the timer callback needs to
     /// post events but doesn't have the Emitter handy. Lifetime is the
@@ -1130,7 +1139,7 @@ impl Emitter {
         }
         let scroll_accel = cfg.scroll_accel;
         Self {
-            cfg,
+            cfg: RefCell::new(cfg),
             event_source,
             last_click: Cell::new(None),
             click_count: Cell::new(0),
@@ -1138,7 +1147,7 @@ impl Emitter {
             scroll_carry_y_px: Cell::new(0.0),
             scroll_last_time: Cell::new(None),
             momentum: Box::new(Momentum {
-                scroll_accel,
+                scroll_accel: Cell::new(scroll_accel),
                 event_source,
                 vel_x_mm_per_sec: Cell::new(0.0),
                 vel_y_mm_per_sec: Cell::new(0.0),
@@ -1347,7 +1356,7 @@ impl Emitter {
     /// Per-frame mm is converted to mm/s via wall-clock dt so the
     /// acceleration curve runs on a frame-rate-independent velocity.
     pub fn scroll(&self, dx_mm: f64, dy_mm: f64, phase: Phase) {
-        let sign = if self.cfg.natural_scroll { 1.0 } else { -1.0 };
+        let sign = if self.cfg.borrow().natural_scroll { 1.0 } else { -1.0 };
         let now = self.event_timestamp();
         // Reset per-stroke state on Began. Carry would otherwise leak a
         // fraction-of-a-pixel from the previous stroke; `scroll_last_time`
@@ -1365,8 +1374,8 @@ impl Emitter {
         };
         let vx = dx_mm / dt;
         let vy = dy_mm / dt;
-        let dx_px = sign * accelerate_scroll(vx, self.cfg.scroll_accel) * dt;
-        let dy_px = sign * accelerate_scroll(vy, self.cfg.scroll_accel) * dt;
+        let dx_px = sign * accelerate_scroll(vx, self.cfg.borrow().scroll_accel) * dt;
+        let dy_px = sign * accelerate_scroll(vy, self.cfg.borrow().scroll_accel) * dt;
         let total_x = self.scroll_carry_x_px.get() + dx_px;
         let total_y = self.scroll_carry_y_px.get() + dy_px;
         let int_x = total_x.trunc() as i32;
@@ -1391,7 +1400,7 @@ impl Emitter {
     /// Seed inertia from the just-ended pan. Cancels any in-flight coast
     /// and starts a new one driven by a CFRunLoopTimer.
     pub fn scroll_inertia(&self, vx_mm_per_sec: f64, vy_mm_per_sec: f64) {
-        let sign = if self.cfg.natural_scroll { 1.0 } else { -1.0 };
+        let sign = if self.cfg.borrow().natural_scroll { 1.0 } else { -1.0 };
         // Apply direction sign here so the Momentum struct doesn't have
         // to know about natural_scroll — it just integrates a velocity.
         self.momentum
@@ -1457,8 +1466,8 @@ impl Emitter {
     /// so this function negates both before sending.
     pub fn swipe(&self, axis: SwipeAxis, signed_progress: f64, velocity_mm_per_sec: f64, phase: Phase) {
         let backend = match axis {
-            SwipeAxis::Horizontal => self.cfg.horizontal_swipe.backend,
-            SwipeAxis::Vertical => self.cfg.vertical_swipe.backend,
+            SwipeAxis::Horizontal => self.cfg.borrow().horizontal_swipe.backend,
+            SwipeAxis::Vertical => self.cfg.borrow().vertical_swipe.backend,
         };
         match (backend, axis) {
             (SwipeBackend::Off, _) | (SwipeBackend::Notification, SwipeAxis::Horizontal) => {
@@ -1836,8 +1845,8 @@ impl Momentum {
         // power curve as the active-scroll path so the user feels a
         // continuous deceleration from flick → coast (rather than a
         // step at lift from "amplified" to "linear").
-        let dx_px = accelerate_scroll(vx, self.scroll_accel) * dt;
-        let dy_px = accelerate_scroll(vy, self.scroll_accel) * dt;
+        let dx_px = accelerate_scroll(vx, self.scroll_accel.get()) * dt;
+        let dy_px = accelerate_scroll(vy, self.scroll_accel.get()) * dt;
         let total_x = self.carry_x_px.get() + dx_px;
         let total_y = self.carry_y_px.get() + dy_px;
         let int_x = total_x.trunc() as i32;
@@ -1913,30 +1922,40 @@ impl Output for Emitter {
     fn set_event_time(&self, ts: Timestamp) {
         self.event_time.set(Some(ts));
     }
+    fn set_config(&self, cfg: Config) {
+        // The momentum integrator holds its own mirror of
+        // `scroll_accel`; update it too or a coast started after the
+        // reload would still use the old curve.
+        self.momentum.scroll_accel.set(cfg.scroll_accel);
+        *self.cfg.borrow_mut() = cfg;
+    }
     fn pinch_admissible_now(&self) -> bool {
         let admit = self
             .cfg
+            .borrow()
             .pinch
             .evaluate(crate::app_context::bundle_id_under_cursor);
         if !admit {
-            log::debug!("admit: pinch denied by policy {:?}", self.cfg.pinch);
+            log::debug!("admit: pinch denied by policy {:?}", self.cfg.borrow().pinch);
         }
         admit
     }
     fn rotate_admissible_now(&self) -> bool {
         let admit = self
             .cfg
+            .borrow()
             .rotate
             .evaluate(crate::app_context::bundle_id_under_cursor);
         if !admit {
-            log::debug!("admit: rotate denied by policy {:?}", self.cfg.rotate);
+            log::debug!("admit: rotate denied by policy {:?}", self.cfg.borrow().rotate);
         }
         admit
     }
     fn swipe_admissible_now(&self, axis: SwipeAxis) -> bool {
+        let cfg = self.cfg.borrow();
         let policy = match axis {
-            SwipeAxis::Horizontal => &self.cfg.horizontal_swipe.policy,
-            SwipeAxis::Vertical => &self.cfg.vertical_swipe.policy,
+            SwipeAxis::Horizontal => &cfg.horizontal_swipe.policy,
+            SwipeAxis::Vertical => &cfg.vertical_swipe.policy,
         };
         let admit = policy.evaluate(crate::app_context::bundle_id_under_cursor);
         if !admit {

@@ -19,6 +19,7 @@
 mod app_context;
 mod app_kit;
 mod config;
+mod config_watch;
 mod descriptor;
 mod gesture;
 mod hid;
@@ -34,7 +35,9 @@ mod time;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -125,20 +128,7 @@ fn main() -> Result<()> {
         );
     }
 
-    let out_cfg = output::Config {
-        scroll_accel: cfg.scroll.sensitivity,
-        natural_scroll: cfg.scroll.natural,
-        pinch: enable_to_policy(&cfg.gestures.pinch.enable),
-        rotate: enable_to_policy(&cfg.gestures.rotate.enable),
-        horizontal_swipe: resolve_swipe(&cfg.gestures.swipe.horizontal),
-        vertical_swipe: resolve_swipe(&cfg.gestures.swipe.vertical),
-    };
-    let cursor_accel = gesture::CursorAccel {
-        px_per_mm_at_ref: cfg.cursor.sensitivity,
-        exponent: cfg.cursor.accel_exponent,
-        ref_mm_per_sec: cfg.cursor.accel_ref,
-    };
-    let emitter = output::Emitter::new(out_cfg);
+    let emitter = output::Emitter::new(output_config(&cfg));
     let mut manager = hid::Manager::new(hid::Filter {
         vid: cfg.device.vid,
         pid: cfg.device.pid,
@@ -160,14 +150,67 @@ fn main() -> Result<()> {
     if cfg.overlay.enable {
         let overlay = overlay::Overlay::new(cfg.overlay.duration_ms);
         let wrapped = output::OverlayOutput::new(emitter, overlay);
-        let mut state = gesture::State::new(wrapped, cursor_accel);
-        manager.run(move |frame, ts| state.on_frame_at(frame, ts))?;
+        run(&mut manager, wrapped, &cfg, cfg_path)?;
     } else {
-        let mut state = gesture::State::new(emitter, cursor_accel);
-        manager.run(move |frame, ts| state.on_frame_at(frame, ts))?;
+        run(&mut manager, emitter, &cfg, cfg_path)?;
     }
 
     Ok(())
+}
+
+/// Drive the gesture engine, with the config file watched for changes.
+///
+/// The engine lives behind `Rc<RefCell<_>>` so two callbacks can reach
+/// it: the per-frame HID callback and the config-reload callback. Both
+/// run on the main run loop, so there is no contention — the `RefCell`
+/// is bookkeeping, not synchronisation.
+fn run<O: output::Output + 'static>(
+    manager: &mut hid::Manager,
+    out: O,
+    cfg: &config::Config,
+    cfg_path: PathBuf,
+) -> Result<()> {
+    let state = Rc::new(RefCell::new(gesture::State::new(out, cursor_accel(cfg))));
+
+    let reload_state = Rc::clone(&state);
+    // Held until `run` returns: dropping the timer stops the watching.
+    let _watch = config_watch::start(cfg_path, cfg, move |new_cfg| {
+        log::debug!(
+            "applying: cursor.sensitivity={} cursor.accel_exponent={} \
+             scroll.sensitivity={} scroll.natural={}",
+            new_cfg.cursor.sensitivity,
+            new_cfg.cursor.accel_exponent,
+            new_cfg.scroll.sensitivity,
+            new_cfg.scroll.natural,
+        );
+        reload_state
+            .borrow_mut()
+            .apply_config(cursor_accel(new_cfg), output_config(new_cfg));
+    });
+
+    let frame_state = Rc::clone(&state);
+    manager.run(move |frame, ts| frame_state.borrow_mut().on_frame_at(frame, ts))
+}
+
+/// Flatten the TOML config into the emitter's runtime settings. Called
+/// at startup and again on every reload.
+fn output_config(cfg: &config::Config) -> output::Config {
+    output::Config {
+        scroll_accel: cfg.scroll.sensitivity,
+        natural_scroll: cfg.scroll.natural,
+        pinch: enable_to_policy(&cfg.gestures.pinch.enable),
+        rotate: enable_to_policy(&cfg.gestures.rotate.enable),
+        horizontal_swipe: resolve_swipe(&cfg.gestures.swipe.horizontal),
+        vertical_swipe: resolve_swipe(&cfg.gestures.swipe.vertical),
+    }
+}
+
+fn cursor_accel(cfg: &config::Config) -> gesture::CursorAccel {
+    gesture::CursorAccel {
+        px_per_mm_at_ref: cfg.cursor.sensitivity,
+        exponent: cfg.cursor.accel_exponent,
+        ref_mm_per_sec: cfg.cursor.accel_ref,
+    }
 }
 
 /// Translate a [`config::GestureEnable`] (TOML-shaped) into the

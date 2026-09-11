@@ -1,0 +1,125 @@
+//! Watch the config file and re-apply it without a restart.
+//!
+//! Implemented as an mtime poll on a `CFRunLoopTimer` rather than
+//! FSEvents. A config file changes a handful of times in a session, one
+//! `stat` per second is free, and polling the path (rather than a file
+//! descriptor) is naturally correct for editors that save by writing a
+//! temp file and renaming over the original — the case that silently
+//! breaks watchers bound to an inode. The interface here is narrow
+//! enough that swapping in FSEvents later touches only this file.
+//!
+//! A file that fails to parse does not disturb the running daemon: the
+//! error is logged and the previous settings stay in force. `config.rs`
+//! rejects unknown keys, so a typo is a parse error — fatal at startup
+//! by design, but no reason to tear down a daemon that is already
+//! working.
+
+use std::ffi::c_void;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use core_foundation::date::CFAbsoluteTimeGetCurrent;
+use core_foundation::runloop::{
+    CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext, kCFRunLoopCommonModes,
+};
+use core_foundation_sys::runloop::CFRunLoopTimerRef;
+
+use crate::config::Config;
+
+/// How often to stat the config file.
+const POLL_SECS: f64 = 1.0;
+
+struct Watcher {
+    path: PathBuf,
+    last_mtime: Option<SystemTime>,
+    /// Settings that are only read during startup. Held so a change to
+    /// one can be reported rather than silently ignored — the reload
+    /// applies everything else, and staying quiet about the rest would
+    /// be worse than saying "restart for this to take effect".
+    initial_device: (Option<u16>, Option<u16>),
+    initial_log: (String, Option<PathBuf>),
+    on_change: Box<dyn FnMut(&Config)>,
+}
+
+/// Start watching `path`. The returned timer must be held for as long
+/// as watching should continue; dropping it stops the polling.
+///
+/// `on_change` runs on the main thread, in the same run loop as the HID
+/// callbacks, so it can mutate engine state directly.
+pub fn start<F>(path: PathBuf, initial: &Config, on_change: F) -> CFRunLoopTimer
+where
+    F: FnMut(&Config) + 'static,
+{
+    let watcher = Box::new(Watcher {
+        last_mtime: mtime(&path),
+        path,
+        initial_device: (initial.device.vid, initial.device.pid),
+        initial_log: (initial.log.level.clone(), initial.log.file.clone()),
+        on_change: Box::new(on_change),
+    });
+    // Leaked deliberately: the callback dereferences this for as long
+    // as the timer can fire, which is the life of the process.
+    let raw = Box::into_raw(watcher);
+
+    let mut context = CFRunLoopTimerContext {
+        version: 0,
+        info: raw as *mut c_void,
+        retain: None,
+        release: None,
+        copyDescription: None,
+    };
+    let fire_at = unsafe { CFAbsoluteTimeGetCurrent() } + POLL_SECS;
+    let timer = CFRunLoopTimer::new(fire_at, POLL_SECS, 0, 0, on_tick, &mut context);
+    CFRunLoop::get_current().add_timer(&timer, unsafe { kCFRunLoopCommonModes });
+
+    log::debug!("watching config for changes every {POLL_SECS}s");
+    timer
+}
+
+fn mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+extern "C" fn on_tick(_timer: CFRunLoopTimerRef, info: *mut c_void) {
+    let watcher = unsafe { &mut *(info as *mut Watcher) };
+
+    let current = mtime(&watcher.path);
+    if current == watcher.last_mtime {
+        return;
+    }
+    // Record the new mtime even when the parse fails, so a file that
+    // stays broken is reported once rather than every second.
+    watcher.last_mtime = current;
+
+    if current.is_none() {
+        log::warn!(
+            "config {} disappeared; keeping current settings",
+            watcher.path.display()
+        );
+        return;
+    }
+
+    match crate::config::load(Some(&watcher.path)) {
+        Ok((cfg, _)) => {
+            if (cfg.device.vid, cfg.device.pid) != watcher.initial_device {
+                log::warn!(
+                    "[device] changed in config but is only read at startup — \
+                     restart for it to take effect"
+                );
+            }
+            if (cfg.log.level.clone(), cfg.log.file.clone()) != watcher.initial_log {
+                log::warn!(
+                    "[log] changed in config but is only read at startup — \
+                     restart for it to take effect"
+                );
+            }
+            log::info!("config reloaded from {}", watcher.path.display());
+            (watcher.on_change)(&cfg);
+        }
+        Err(e) => {
+            log::warn!(
+                "config reload failed, keeping previous settings: {e:#}"
+            );
+        }
+    }
+}

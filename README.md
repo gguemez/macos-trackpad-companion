@@ -142,6 +142,21 @@ enable      = false
 duration_ms = 600             # how long the flash stays up
 ```
 
+### Live reload
+
+The config file is watched while the companion runs; edits are picked up
+within a second, no restart needed. Cursor and scroll tuning, the
+per-gesture `enable` policies, swipe backends and the overlay all apply
+immediately.
+
+Two sections are only read at startup — `[device]` and `[log]`. Changing
+either is reported in the log as needing a restart rather than being
+silently ignored.
+
+A file that fails to parse never disturbs a running daemon: the error is
+logged and the previous settings stay in force. (At startup a bad file
+is still fatal — unknown keys are rejected so typos surface immediately.)
+
 ## Permissions
 
 The first run on a fresh macOS install will prompt for two privacy
