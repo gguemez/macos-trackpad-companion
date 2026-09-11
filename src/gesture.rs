@@ -107,6 +107,14 @@ const SCROLL_VELOCITY_ALPHA: f64 = 0.4;
 /// 125 Hz PTP pad, which both supported keyboards run at.
 const DEFAULT_FRAME_DT: Duration = Duration::from_micros(8000);
 
+/// Minimum per-frame movement before a contact can be selected as the
+/// cursor-driving finger during a multi-finger physical-button drag.
+const PHYSICAL_DRAG_SELECT_MM: f64 = 0.3;
+
+/// The moving contact must move this many times farther than the next-most
+/// active contact before we latch it. Avoids choosing based on finger jitter.
+const PHYSICAL_DRAG_SELECT_RATIO: f64 = 2.0;
+
 /// Power-curve cursor acceleration parameters. The curve is
 /// `pixels_per_sec = c · |v|^E` (in finger mm/s → screen px/s), with
 /// `c` chosen so that at `v == ref_mm_per_sec` the result equals the
@@ -419,6 +427,17 @@ pub struct State<O: Output> {
     /// over to LeftMouseDragged. Treated independently of finger
     /// gestures (taps/scroll still classify normally while held).
     prev_button: bool,
+
+    /// Contact selected to drive cursor motion while the physical button is
+    /// held with multiple fingers on the pad. Once selected, the contact ID
+    /// remains latched until the physical button is released or that contact
+    /// disappears.
+    physical_drag_contact_id: Option<u8>,
+
+    /// One-frame deferred motion for the selected physical-drag contact.
+    /// Kept separate from `pending_motion`, whose lifecycle belongs to the
+    /// normal OneFinger gesture state.
+    physical_drag_pending_motion: Option<(f64, f64, Duration)>,
 }
 
 impl<O: Output> State<O> {
@@ -442,6 +461,8 @@ impl<O: Output> State<O> {
             born_during_coast: false,
             suppress_one_finger_click: false,
             prev_button: false,
+            physical_drag_contact_id: None,
+            physical_drag_pending_motion: None,
         }
     }
 
@@ -472,7 +493,8 @@ impl<O: Output> State<O> {
         // could-still-tap gate anyway, so the exact value barely
         // matters.
         let frame_dt = match self.prev_frame_at.replace(now) {
-            Some(prev) => now.saturating_duration_since(prev)
+            Some(prev) => now
+                .saturating_duration_since(prev)
                 .clamp(Duration::from_millis(1), Duration::from_millis(100)),
             None => DEFAULT_FRAME_DT,
         };
@@ -490,6 +512,13 @@ impl<O: Output> State<O> {
         if frame.button != self.prev_button {
             self.out.set_left_button_held(frame.button);
             self.prev_button = frame.button;
+
+            if !frame.button {
+                self.physical_drag_contact_id = None;
+                self.physical_drag_pending_motion = None;
+                self.cursor_carry_x_px = 0.0;
+                self.cursor_carry_y_px = 0.0;
+            }
         }
 
         let active: Vec<Contact> = frame.contacts.iter().copied().filter(|c| c.tip).collect();
@@ -523,6 +552,30 @@ impl<O: Output> State<O> {
             }
         }
         self.contacts = next;
+
+        // A held physical button takes precedence over normal multi-finger
+        // gesture recognition. In this mode, additional fingers belong to the
+        // physical drag rather than scroll/pinch/rotate/swipe classification.
+        //
+        // Cursor-driving selection is added below; for now simply suppress the
+        // normal multi-finger pipeline.
+        if frame.button && active.len() >= 2 {
+            // Multi-finger physical-button drag takes precedence over normal
+            // scroll/pinch/rotate/swipe recognition.
+            self.pending_motion = None;
+
+            // While we're still waiting to identify the moving contact, discard any
+            // fractional carry inherited from the preceding OneFinger session.
+            if self.physical_drag_contact_id.is_none()
+                && self.physical_drag_pending_motion.is_none()
+            {
+                self.cursor_carry_x_px = 0.0;
+                self.cursor_carry_y_px = 0.0;
+            }
+
+            self.dispatch_physical_drag(&active, frame_dt);
+            return;
+        }
 
         let new_kind = self.classify(active.len());
         if new_kind != self.kind {
@@ -572,12 +625,7 @@ impl<O: Output> State<O> {
         }
     }
 
-    fn transition(
-        &mut self,
-        new_kind: GestureKind,
-        active: &[Contact],
-        now: Timestamp,
-    ) {
+    fn transition(&mut self, new_kind: GestureKind, active: &[Contact], now: Timestamp) {
         // First contact after Idle cancels any in-flight scroll inertia.
         // `SwipeLatched → Idle → ...` doesn't count: a deliberate new
         // touch has to come from no-fingers, and the user wants their
@@ -666,7 +714,11 @@ impl<O: Output> State<O> {
                                 "1f tap: click Left (dur={}ms max_move={:.2}mm{})",
                                 dur.as_millis(),
                                 max_move,
-                                if dropped.is_some() { ", dropped lift-frame motion" } else { "" },
+                                if dropped.is_some() {
+                                    ", dropped lift-frame motion"
+                                } else {
+                                    ""
+                                },
                             );
                             self.out.click(MouseButton::Left);
                         } else {
@@ -689,7 +741,9 @@ impl<O: Output> State<O> {
                 let speed = (vx * vx + vy * vy).sqrt();
                 log::debug!(
                     "scroll: ended (v=({:+.0},{:+.0})mm/s speed={:.0}mm/s)",
-                    vx, vy, speed,
+                    vx,
+                    vy,
+                    speed,
                 );
                 self.out.scroll(0.0, 0.0, Phase::Ended);
                 // Seed inertia from the lift velocity. `Output` decides
@@ -803,7 +857,9 @@ impl<O: Output> State<O> {
                     };
                     log::debug!(
                         "swipe: ended axis={:?} progress={:+.3} v={:+.1}mm/s",
-                        axis, progress, velocity,
+                        axis,
+                        progress,
+                        velocity,
                     );
                     self.out.swipe(axis, progress, velocity, Phase::Ended);
                     // Treat the post-swipe residual fingers (e.g. async
@@ -960,7 +1016,9 @@ impl<O: Output> State<O> {
         } else {
             log::debug!(
                 "partial-lift rejoin rejected: surviving id={} absent from active=[{}, {}]",
-                recent.surviving_id, a.id, b.id,
+                recent.surviving_id,
+                a.id,
+                b.id,
             );
             return false;
         };
@@ -972,7 +1030,8 @@ impl<O: Output> State<O> {
         if drift > PARTIAL_LIFT_REJOIN_DRIFT_MM {
             log::debug!(
                 "partial-lift rejoin rejected: surviving drift={:.2}mm > {:.2}mm",
-                drift, PARTIAL_LIFT_REJOIN_DRIFT_MM,
+                drift,
+                PARTIAL_LIFT_REJOIN_DRIFT_MM,
             );
             return false;
         }
@@ -1015,7 +1074,9 @@ impl<O: Output> State<O> {
 
         log::debug!(
             "partial-lift rejoin: resumed kind={:?} (gap={}ms surviving_drift={:.2}mm)",
-            recent.kind, age.as_millis(), drift,
+            recent.kind,
+            age.as_millis(),
+            drift,
         );
 
         // Locked kinds emitted Phase::Ended at the partial-lift save
@@ -1045,8 +1106,96 @@ impl<O: Output> State<O> {
             GestureKind::TwoFingerUnclassified
             | GestureKind::TwoFingerPan
             | GestureKind::TwoFingerPinchAndRotate => self.dispatch_two(active, now),
-            GestureKind::ThreeFingerLive | GestureKind::FourFingerLive => self.dispatch_swipe(active, now),
+            GestureKind::ThreeFingerLive | GestureKind::FourFingerLive => {
+                self.dispatch_swipe(active, now)
+            }
         }
+    }
+
+    fn dispatch_physical_drag(&mut self, active: &[Contact], frame_dt: Duration) {
+        if active.len() < 2 {
+            return;
+        }
+
+        // If the selected contact disappeared, forget it and wait for a clean
+        // re-selection rather than jumping immediately to another finger.
+        if let Some(id) = self.physical_drag_contact_id {
+            if !active.iter().any(|c| c.id == id) {
+                self.physical_drag_contact_id = None;
+                self.physical_drag_pending_motion = None;
+                self.cursor_carry_x_px = 0.0;
+                self.cursor_carry_y_px = 0.0;
+                return;
+            }
+        }
+
+        // No mover selected yet: compare this frame's displacement for every
+        // active contact and latch the one that is clearly moving the most.
+        if self.physical_drag_contact_id.is_none() {
+            let mut motion: Vec<(u8, f64)> = active
+                .iter()
+                .filter_map(|c| {
+                    self.contacts.get(&c.id).map(|tr| {
+                        let dx = tr.x - tr.prev_x;
+                        let dy = tr.y - tr.prev_y;
+                        (c.id, (dx * dx + dy * dy).sqrt())
+                    })
+                })
+                .collect();
+
+            motion.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+            let Some(&(best_id, best_move)) = motion.first() else {
+                return;
+            };
+
+            let second_move = motion.get(1).map(|(_, m)| *m).unwrap_or(0.0);
+
+            if best_move < PHYSICAL_DRAG_SELECT_MM
+                || (second_move > 0.0 && best_move < second_move * PHYSICAL_DRAG_SELECT_RATIO)
+            {
+                return;
+            }
+
+            log::debug!(
+                "physical drag: selected contact {} (move={:.3}mm next={:.3}mm)",
+                best_id,
+                best_move,
+                second_move,
+            );
+
+            self.physical_drag_contact_id = Some(best_id);
+
+            // Don't consume the selection frame's movement. Start from the next
+            // frame so switching to the second finger cannot produce a jump.
+            self.physical_drag_pending_motion = None;
+            self.cursor_carry_x_px = 0.0;
+            self.cursor_carry_y_px = 0.0;
+            return;
+        }
+
+        let id = self.physical_drag_contact_id.unwrap();
+
+        let Some(tr) = self.contacts.get(&id).copied() else {
+            return;
+        };
+
+        let dx = tr.x - tr.prev_x;
+        let dy = tr.y - tr.prev_y;
+
+        // Same one-frame deferral used by normal cursor movement. If the chosen
+        // contact lifts on the next report, this buffered final delta is dropped
+        // rather than causing a lift-frame jump.
+        if let Some((bdx, bdy, bdt)) = self.physical_drag_pending_motion.take() {
+            if bdx.abs() > MOTION_DEAD_ZONE_MM || bdy.abs() > MOTION_DEAD_ZONE_MM {
+                let (dx_px, dy_px) = self.cursor_pixels_for(bdx, bdy, bdt);
+                if dx_px != 0 || dy_px != 0 {
+                    self.out.move_cursor_by(dx_px, dy_px);
+                }
+            }
+        }
+
+        self.physical_drag_pending_motion = Some((dx, dy, frame_dt));
     }
 
     fn dispatch_one(&mut self, active: &[Contact], now: Timestamp, frame_dt: Duration) {
@@ -1103,7 +1252,12 @@ impl<O: Output> State<O> {
                     log::debug!(
                         "cursor: emit deferred d=({:+.3},{:+.3})mm → ({:+},{:+})px \
                          (cur frame at=({:.2},{:.2})mm)",
-                        bdx, bdy, dx_px, dy_px, c.x, c.y,
+                        bdx,
+                        bdy,
+                        dx_px,
+                        dy_px,
+                        c.x,
+                        c.y,
                     );
                     self.out.move_cursor_by(dx_px, dy_px);
                 }
@@ -1204,8 +1358,7 @@ impl<O: Output> State<O> {
             let common = ((da.0 + db.0) * 0.5, (da.1 + db.1) * 0.5);
             let differential = ((da.0 - db.0) * 0.5, (da.1 - db.1) * 0.5);
             let common_mag = (common.0.powi(2) + common.1.powi(2)).sqrt();
-            let differential_mag =
-                (differential.0.powi(2) + differential.1.powi(2)).sqrt();
+            let differential_mag = (differential.0.powi(2) + differential.1.powi(2)).sqrt();
             // Pan requires both fingers to participate in roughly the
             // same translation. Two gates filter pinch/rotate signals
             // that masquerade as pan:
@@ -1286,8 +1439,8 @@ impl<O: Output> State<O> {
             //     min=0.47 mm) → leader committed but trailer's 0.47 mm
             //     of opposite-y noise looks anti-parallel; defer until
             //     trailer commits.
-            let pinch_rot_admissible = min_per_finger >= TAP_MAX_MOVE_MM
-                || min_per_finger < ANCHORED_FINGER_FLOOR_MM;
+            let pinch_rot_admissible =
+                min_per_finger >= TAP_MAX_MOVE_MM || min_per_finger < ANCHORED_FINGER_FLOOR_MM;
             // Penalize pinch/rot selection scores when the two finger-
             // motion vectors are roughly parallel (high positive
             // alignment cosine). Real pinch and real rotate have
@@ -1367,7 +1520,8 @@ impl<O: Output> State<O> {
                     {
                         log::debug!(
                             "pinch+rotate lock deferred: pan_lenient={:.2} alignment={:.3}",
-                            pan_lenient, alignment,
+                            pan_lenient,
+                            alignment,
                         );
                         base.pinch_rot_lock_pending = true;
                         self.two_baseline = Some(base);
@@ -1401,20 +1555,32 @@ impl<O: Output> State<O> {
                     GestureKind::TwoFingerPan => {
                         log::info!(
                             "2F lock=scroll scores[pan={:.2}{} pinch={:.2}{} rot={:.2}{}] common={:.2}mm diff={:.2}mm align={:.2} balance={:.2}",
-                            pan_raw, pan_tag,
-                            pinch_raw, pinch_tag,
-                            rot_raw, rot_tag,
-                            common_mag, differential_mag, alignment, balance,
+                            pan_raw,
+                            pan_tag,
+                            pinch_raw,
+                            pinch_tag,
+                            rot_raw,
+                            rot_tag,
+                            common_mag,
+                            differential_mag,
+                            alignment,
+                            balance,
                         );
                         self.out.scroll(0.0, 0.0, Phase::Began);
                     }
                     GestureKind::TwoFingerPinchAndRotate => {
                         log::info!(
                             "2F lock=pinch+rotate scores[pinch={:.2}{} rot={:.2}{} pan={:.2}{}] common={:.2}mm diff={:.2}mm align={:.2} balance={:.2}",
-                            pinch_raw, pinch_tag,
-                            rot_raw, rot_tag,
-                            pan_raw, pan_tag,
-                            common_mag, differential_mag, alignment, balance,
+                            pinch_raw,
+                            pinch_tag,
+                            rot_raw,
+                            rot_tag,
+                            pan_raw,
+                            pan_tag,
+                            common_mag,
+                            differential_mag,
+                            alignment,
+                            balance,
                         );
                         // Both streams begin at lock so a downstream app
                         // subscribed to either gets a coherent
@@ -1457,7 +1623,10 @@ impl<O: Output> State<O> {
                     base.last_scroll_time = Some(now);
                     log::debug!(
                         "scroll: d=({:+.3},{:+.3})mm v=({:+.0},{:+.0})mm/s",
-                        ddx, ddy, base.scroll_velocity.0, base.scroll_velocity.1,
+                        ddx,
+                        ddy,
+                        base.scroll_velocity.0,
+                        base.scroll_velocity.1,
                     );
                     self.out.scroll(ddx, ddy, Phase::Changed);
                     // Advance baseline only on emit — sub-dead-zone drift
@@ -1585,11 +1754,14 @@ impl<O: Output> State<O> {
             base.began_posted = true;
             log::debug!(
                 "swipe: began axis={:?} progress={:+.3} (n_fingers={})",
-                axis, signed_progress, active.len(),
+                axis,
+                signed_progress,
+                active.len(),
             );
             Phase::Began
         };
-        self.out.swipe(axis, signed_progress, /* velocity */ 0.0, phase);
+        self.out
+            .swipe(axis, signed_progress, /* velocity */ 0.0, phase);
         self.multi_baseline = Some(base);
     }
 }
@@ -1732,7 +1904,11 @@ mod tests {
     /// mm 1:1 (modulo the integer truncation + carry), keeping the
     /// existing assertions readable.
     fn test_accel() -> CursorAccel {
-        CursorAccel { px_per_mm_at_ref: 1.0, exponent: 1.0, ref_mm_per_sec: 80.0 }
+        CursorAccel {
+            px_per_mm_at_ref: 1.0,
+            exponent: 1.0,
+            ref_mm_per_sec: 80.0,
+        }
     }
 
     fn frame(contacts: &[(u8, f64, f64)]) -> Frame {
@@ -1756,6 +1932,132 @@ mod tests {
         let mut f = frame(contacts);
         f.button = button;
         f
+    }
+
+    #[test]
+    fn physical_button_with_two_fingers_suppresses_two_finger_gestures() {
+        let out = Recorder {
+            log: RefCell::new(Vec::new()),
+            ..Default::default()
+        };
+        let mut s = State::new(&out, CursorAccel::default());
+
+        // Establish one finger, then physically press.
+        s.on_frame(frame_with_button(&[(1, 0.0, 0.0)], true));
+
+        // Add a second finger while the physical button remains held.
+        s.on_frame(frame_with_button(&[(1, 0.0, 0.0), (2, 10.0, 0.0)], true));
+
+        // Move both substantially. Without the physical-drag override this
+        // would eventually enter normal 2F pan/pinch/rotate classification.
+        s.on_frame(frame_with_button(&[(1, 2.0, 0.0), (2, 12.0, 0.0)], true));
+        s.on_frame(frame_with_button(&[(1, 4.0, 0.0), (2, 14.0, 0.0)], true));
+
+        let log = s.out.log.borrow();
+
+        assert!(
+            !log.iter().any(|l| l.starts_with("scroll ")),
+            "physical drag unexpectedly emitted scroll: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.starts_with("pinch ")),
+            "physical drag unexpectedly emitted pinch: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.starts_with("rotate ")),
+            "physical drag unexpectedly emitted rotate: {log:?}"
+        );
+    }
+
+    #[test]
+    fn physical_button_two_finger_drag_uses_moving_contact() {
+        let out = Recorder {
+            log: RefCell::new(Vec::new()),
+            ..Default::default()
+        };
+        let mut s = State::new(&out, CursorAccel::default());
+
+        // Finger 1 is the anchor/click finger.
+        s.on_frame(frame_with_button(&[(1, 0.0, 0.0)], true));
+
+        // Finger 2 lands. Its landing position must not move the cursor.
+        s.on_frame(frame_with_button(&[(1, 0.0, 0.0), (2, 10.0, 0.0)], true));
+
+        // Finger 2 moves enough to be selected as the drag contact.
+        // Selection itself deliberately emits no cursor movement.
+        s.on_frame(frame_with_button(&[(1, 0.02, 0.0), (2, 11.0, 0.0)], true));
+
+        // Subsequent movement from finger 2 is staged.
+        s.on_frame(frame_with_button(&[(1, 0.03, 0.0), (2, 12.0, 0.0)], true));
+
+        // One more frame causes the staged movement to be emitted.
+        s.on_frame(frame_with_button(&[(1, 0.04, 0.0), (2, 13.0, 0.0)], true));
+
+        assert_eq!(s.physical_drag_contact_id, Some(2));
+
+        let log = out.log.borrow();
+
+        assert!(
+            log.iter().any(|l| l.starts_with("move ")),
+            "moving second finger did not produce cursor movement: {log:?}"
+        );
+
+        assert!(
+            !log.iter().any(|l| l.starts_with("scroll ")),
+            "physical drag unexpectedly emitted scroll: {log:?}"
+        );
+    }
+
+    #[test]
+    fn physical_drag_contact_stays_latched_despite_anchor_motion() {
+        let out = Recorder::default();
+        let mut s = State::new(&out, CursorAccel::default());
+
+        s.on_frame(frame_with_button(&[(1, 0.0, 0.0)], true));
+
+        s.on_frame(frame_with_button(&[(1, 0.0, 0.0), (2, 10.0, 0.0)], true));
+
+        // Contact 2 clearly wins selection.
+        s.on_frame(frame_with_button(&[(1, 0.02, 0.0), (2, 11.0, 0.0)], true));
+
+        assert_eq!(s.physical_drag_contact_id, Some(2));
+
+        // Now the anchor moves noticeably too. Selection must remain latched
+        // to contact 2 rather than being reconsidered frame-by-frame.
+        s.on_frame(frame_with_button(&[(1, 0.7, 0.0), (2, 12.0, 0.0)], true));
+
+        assert_eq!(s.physical_drag_contact_id, Some(2));
+    }
+
+    #[test]
+    fn selected_physical_drag_contact_lift_does_not_jump() {
+        let out = Recorder::default();
+        let mut s = State::new(&out, CursorAccel::default());
+
+        s.on_frame(frame_with_button(&[(1, 0.0, 0.0)], true));
+
+        s.on_frame(frame_with_button(&[(1, 0.0, 0.0), (2, 10.0, 0.0)], true));
+
+        // Select contact 2.
+        s.on_frame(frame_with_button(&[(1, 0.02, 0.0), (2, 11.0, 0.0)], true));
+
+        // Stage movement from contact 2.
+        s.on_frame(frame_with_button(&[(1, 0.03, 0.0), (2, 12.0, 0.0)], true));
+
+        assert_eq!(s.physical_drag_contact_id, Some(2));
+
+        // Clear anything previously logged so we're only examining the lift.
+        out.pop();
+
+        // Contact 2 disappears while the physical button remains held.
+        s.on_frame(frame_with_button(&[(1, 0.03, 0.0)], true));
+
+        let log = out.pop();
+
+        assert!(
+            !log.iter().any(|l| l.starts_with("move ")),
+            "selected contact lift unexpectedly moved cursor: {log:?}"
+        );
     }
 
     #[test]
@@ -1852,7 +2154,8 @@ mod tests {
         s.on_frame(frame(&[]));
         let log = r.pop();
         assert!(
-            log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
+            log.iter()
+                .any(|l| l.starts_with("scroll") && l.contains("Began")),
             "{log:?}"
         );
         assert!(log.iter().any(|l| l.contains("Ended")), "{log:?}");
@@ -1875,7 +2178,8 @@ mod tests {
         s.on_frame(frame(&[]));
         let log = r.pop();
         assert!(
-            !log.iter().any(|l| l.starts_with("pinch") || l.starts_with("rotate")),
+            !log.iter()
+                .any(|l| l.starts_with("pinch") || l.starts_with("rotate")),
             "denied policy must suppress pinch/rotate: {log:?}"
         );
     }
@@ -1897,11 +2201,13 @@ mod tests {
         s.on_frame(frame(&[]));
         let log = r.pop();
         assert!(
-            log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
+            log.iter()
+                .any(|l| l.starts_with("scroll") && l.contains("Began")),
             "denied pinch/rotate must not block scroll: {log:?}"
         );
         assert!(
-            !log.iter().any(|l| l.starts_with("pinch") || l.starts_with("rotate")),
+            !log.iter()
+                .any(|l| l.starts_with("pinch") || l.starts_with("rotate")),
             "{log:?}"
         );
     }
@@ -1916,7 +2222,8 @@ mod tests {
         s.on_frame(frame(&[]));
         let log = r.pop();
         assert!(
-            log.iter().any(|l| l.starts_with("pinch") && l.contains("Began")),
+            log.iter()
+                .any(|l| l.starts_with("pinch") && l.contains("Began")),
             "{log:?}"
         );
     }
@@ -1944,11 +2251,13 @@ mod tests {
         s.on_frame(frame(&[]));
         let log = r.pop();
         assert!(
-            log.iter().any(|l| l.starts_with("pinch") && l.contains("Began")),
+            log.iter()
+                .any(|l| l.starts_with("pinch") && l.contains("Began")),
             "expected pinch lock, got: {log:?}"
         );
         assert!(
-            !log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
+            !log.iter()
+                .any(|l| l.starts_with("scroll") && l.contains("Began")),
             "must not lock pan: {log:?}"
         );
     }
@@ -1977,11 +2286,13 @@ mod tests {
         s.on_frame(frame(&[]));
         let log = r.pop();
         assert!(
-            log.iter().any(|l| l.starts_with("pinch") && l.contains("Began")),
+            log.iter()
+                .any(|l| l.starts_with("pinch") && l.contains("Began")),
             "expected pinch lock, got: {log:?}"
         );
         assert!(
-            !log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
+            !log.iter()
+                .any(|l| l.starts_with("scroll") && l.contains("Began")),
             "must not lock pan: {log:?}"
         );
     }
@@ -1997,7 +2308,8 @@ mod tests {
         s.on_frame(frame(&[]));
         let log = r.pop();
         assert!(
-            log.iter().any(|l| l.starts_with("rotate") && l.contains("Began")),
+            log.iter()
+                .any(|l| l.starts_with("rotate") && l.contains("Began")),
             "{log:?}"
         );
     }
@@ -2028,11 +2340,13 @@ mod tests {
         s.on_frame(frame(&[]));
         let log = r.pop();
         assert!(
-            log.iter().any(|l| l.starts_with("pinch") && l.contains("Changed")),
+            log.iter()
+                .any(|l| l.starts_with("pinch") && l.contains("Changed")),
             "expected pinch Changed (the gesture is mostly pinch), got: {log:?}"
         );
         assert!(
-            !log.iter().any(|l| l.starts_with("rotate") && l.contains("Changed")),
+            !log.iter()
+                .any(|l| l.starts_with("rotate") && l.contains("Changed")),
             "rotational noise must not flip dominance — no rotate Changed expected, got: {log:?}"
         );
     }
@@ -2070,16 +2384,19 @@ mod tests {
         s.on_frame(frame(&[]));
         let log = r.pop();
         assert!(
-            !log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
+            !log.iter()
+                .any(|l| l.starts_with("scroll") && l.contains("Began")),
             "asymmetric motion must not classify as pan: {log:?}"
         );
         assert!(
-            !log.iter().any(|l| l.starts_with("pinch") && l.contains("Began")),
+            !log.iter()
+                .any(|l| l.starts_with("pinch") && l.contains("Began")),
             "ambiguous same-direction geometry must defer, not lock \
              pinch+rotate (idea #2 tradeoff): {log:?}"
         );
         assert!(
-            !log.iter().any(|l| l.starts_with("rotate") && l.contains("Began")),
+            !log.iter()
+                .any(|l| l.starts_with("rotate") && l.contains("Began")),
             "ambiguous same-direction geometry must defer, not lock \
              pinch+rotate (idea #2 tradeoff): {log:?}"
         );
@@ -2111,11 +2428,13 @@ mod tests {
         s.on_frame(frame(&[]));
         let log = r.pop();
         assert!(
-            log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
+            log.iter()
+                .any(|l| l.starts_with("scroll") && l.contains("Began")),
             "expected pan lock after one-frame deferral, got: {log:?}"
         );
         assert!(
-            !log.iter().any(|l| l.starts_with("pinch") && l.contains("Began")),
+            !log.iter()
+                .any(|l| l.starts_with("pinch") && l.contains("Began")),
             "must not lock pinch+rotate: {log:?}"
         );
     }
@@ -2147,11 +2466,13 @@ mod tests {
         s.on_frame(frame(&[]));
         let log = r.pop();
         assert!(
-            log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
+            log.iter()
+                .any(|l| l.starts_with("scroll") && l.contains("Began")),
             "expected pan lock after one-frame deferral, got: {log:?}"
         );
         assert!(
-            !log.iter().any(|l| l.starts_with("pinch") && l.contains("Began")),
+            !log.iter()
+                .any(|l| l.starts_with("pinch") && l.contains("Began")),
             "must not lock pinch+rotate: {log:?}"
         );
     }
@@ -2179,11 +2500,13 @@ mod tests {
         s.on_frame(frame(&[]));
         let log = r.pop();
         assert!(
-            log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
+            log.iter()
+                .any(|l| l.starts_with("scroll") && l.contains("Began")),
             "expected pan lock, got: {log:?}"
         );
         assert!(
-            !log.iter().any(|l| l.starts_with("pinch") && l.contains("Began")),
+            !log.iter()
+                .any(|l| l.starts_with("pinch") && l.contains("Began")),
             "must not lock pinch+rotate: {log:?}"
         );
     }
@@ -2209,10 +2532,7 @@ mod tests {
         // mm coordinates / 50, lifted from the user's log. y values run
         // above 1.0 because the SoflePLUS2 pad is 65 mm tall — fine for
         // the test, only relative motion matters.
-        s.on_frame_at(
-            frame(&[(1, 0.7016, 1.0884), (2, 0.3498, 1.1134)]),
-            t0,
-        );
+        s.on_frame_at(frame(&[(1, 0.7016, 1.0884), (2, 0.3498, 1.1134)]), t0);
         s.on_frame_at(
             frame(&[(1, 0.7058, 1.0812), (2, 0.3498, 1.1134)]),
             at(t0, 18),
@@ -2255,15 +2575,18 @@ mod tests {
         s.on_frame_at(frame(&[]), at(t0, 180));
         let log = r.pop();
         assert!(
-            log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
+            log.iter()
+                .any(|l| l.starts_with("scroll") && l.contains("Began")),
             "expected pan lock once trailer catches up, got: {log:?}"
         );
         assert!(
-            !log.iter().any(|l| l.starts_with("pinch") && l.contains("Began")),
+            !log.iter()
+                .any(|l| l.starts_with("pinch") && l.contains("Began")),
             "must not lock pinch+rotate during the lazy-trailer phase: {log:?}"
         );
         assert!(
-            !log.iter().any(|l| l.starts_with("rotate") && l.contains("Began")),
+            !log.iter()
+                .any(|l| l.starts_with("rotate") && l.contains("Began")),
             "must not lock pinch+rotate during the lazy-trailer phase: {log:?}"
         );
     }
@@ -2289,29 +2612,59 @@ mod tests {
         // displacement at the would-be lock frame is ~0.67 mm and
         // ~0.89 mm — both under TAP_MAX_MOVE_MM (1.0).
         s.on_frame_at(frame(&[(1, 0.0224, 0.7542), (2, 0.3832, 0.6614)]), t0);
-        s.on_frame_at(frame(&[(1, 0.0224, 0.7524), (2, 0.3942, 0.6632)]), at(t0, 35));
-        s.on_frame_at(frame(&[(1, 0.0230, 0.7486), (2, 0.4010, 0.6644)]), at(t0, 85));
-        s.on_frame_at(frame(&[(1, 0.0240, 0.7448), (2, 0.4020, 0.6652)]), at(t0, 135));
-        s.on_frame_at(frame(&[(1, 0.0244, 0.7444), (2, 0.4020, 0.6660)]), at(t0, 185));
-        s.on_frame_at(frame(&[(1, 0.0254, 0.7440), (2, 0.4010, 0.6694)]), at(t0, 235));
-        s.on_frame_at(frame(&[(1, 0.0264, 0.7444), (2, 0.3986, 0.6724)]), at(t0, 290));
-        s.on_frame_at(frame(&[(1, 0.0278, 0.7436), (2, 0.3966, 0.6750)]), at(t0, 345));
-        s.on_frame_at(frame(&[(1, 0.0292, 0.7426), (2, 0.3948, 0.6754)]), at(t0, 395));
-        s.on_frame_at(frame(&[(1, 0.0292, 0.7426), (2, 0.3938, 0.6758)]), at(t0, 485));
+        s.on_frame_at(
+            frame(&[(1, 0.0224, 0.7524), (2, 0.3942, 0.6632)]),
+            at(t0, 35),
+        );
+        s.on_frame_at(
+            frame(&[(1, 0.0230, 0.7486), (2, 0.4010, 0.6644)]),
+            at(t0, 85),
+        );
+        s.on_frame_at(
+            frame(&[(1, 0.0240, 0.7448), (2, 0.4020, 0.6652)]),
+            at(t0, 135),
+        );
+        s.on_frame_at(
+            frame(&[(1, 0.0244, 0.7444), (2, 0.4020, 0.6660)]),
+            at(t0, 185),
+        );
+        s.on_frame_at(
+            frame(&[(1, 0.0254, 0.7440), (2, 0.4010, 0.6694)]),
+            at(t0, 235),
+        );
+        s.on_frame_at(
+            frame(&[(1, 0.0264, 0.7444), (2, 0.3986, 0.6724)]),
+            at(t0, 290),
+        );
+        s.on_frame_at(
+            frame(&[(1, 0.0278, 0.7436), (2, 0.3966, 0.6750)]),
+            at(t0, 345),
+        );
+        s.on_frame_at(
+            frame(&[(1, 0.0292, 0.7426), (2, 0.3948, 0.6754)]),
+            at(t0, 395),
+        );
+        s.on_frame_at(
+            frame(&[(1, 0.0292, 0.7426), (2, 0.3938, 0.6758)]),
+            at(t0, 485),
+        );
         s.on_frame_at(frame(&[]), at(t0, 500));
         let log = r.pop();
         assert!(
-            !log.iter().any(|l| l.starts_with("pinch") && l.contains("Began")),
+            !log.iter()
+                .any(|l| l.starts_with("pinch") && l.contains("Began")),
             "must not lock pinch+rotate from sub-mm jitter on a wide-spread \
              baseline: {log:?}"
         );
         assert!(
-            !log.iter().any(|l| l.starts_with("rotate") && l.contains("Began")),
+            !log.iter()
+                .any(|l| l.starts_with("rotate") && l.contains("Began")),
             "must not lock pinch+rotate from sub-mm jitter on a wide-spread \
              baseline: {log:?}"
         );
         assert!(
-            !log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
+            !log.iter()
+                .any(|l| l.starts_with("scroll") && l.contains("Began")),
             "must not lock pan either — common-mag stays well below \
              PAN_LOCK_MM here: {log:?}"
         );
@@ -2338,24 +2691,47 @@ mod tests {
         // mm coordinates / 50, sampled from user's hardware log. Real
         // device pad is 49×65 mm.
         s.on_frame_at(frame(&[(1, 0.7986, 0.7922), (2, 0.3900, 0.9112)]), t0);
-        s.on_frame_at(frame(&[(1, 0.7986, 0.7922), (2, 0.3914, 0.9078)]), at(t0, 100));
-        s.on_frame_at(frame(&[(1, 0.7986, 0.7926), (2, 0.3924, 0.9040)]), at(t0, 200));
-        s.on_frame_at(frame(&[(1, 0.7976, 0.7930), (2, 0.3934, 0.9006)]), at(t0, 300));
-        s.on_frame_at(frame(&[(1, 0.7972, 0.7934), (2, 0.3938, 0.8992)]), at(t0, 400));
-        s.on_frame_at(frame(&[(1, 0.7972, 0.7944), (2, 0.3938, 0.8992)]), at(t0, 460));
+        s.on_frame_at(
+            frame(&[(1, 0.7986, 0.7922), (2, 0.3914, 0.9078)]),
+            at(t0, 100),
+        );
+        s.on_frame_at(
+            frame(&[(1, 0.7986, 0.7926), (2, 0.3924, 0.9040)]),
+            at(t0, 200),
+        );
+        s.on_frame_at(
+            frame(&[(1, 0.7976, 0.7930), (2, 0.3934, 0.9006)]),
+            at(t0, 300),
+        );
+        s.on_frame_at(
+            frame(&[(1, 0.7972, 0.7934), (2, 0.3938, 0.8992)]),
+            at(t0, 400),
+        );
+        s.on_frame_at(
+            frame(&[(1, 0.7972, 0.7944), (2, 0.3938, 0.8992)]),
+            at(t0, 460),
+        );
         // Leader (c0) starts heading south, trailer (c1) still drifting
         // in the noise band — would-be lock frame at ~570 ms.
-        s.on_frame_at(frame(&[(1, 0.7972, 0.7982), (2, 0.3938, 0.8992)]), at(t0, 530));
-        s.on_frame_at(frame(&[(1, 0.7968, 0.8176), (2, 0.3938, 0.9026)]), at(t0, 569));
+        s.on_frame_at(
+            frame(&[(1, 0.7972, 0.7982), (2, 0.3938, 0.8992)]),
+            at(t0, 530),
+        );
+        s.on_frame_at(
+            frame(&[(1, 0.7968, 0.8176), (2, 0.3938, 0.9026)]),
+            at(t0, 569),
+        );
         s.on_frame_at(frame(&[]), at(t0, 600));
         let log = r.pop();
         assert!(
-            !log.iter().any(|l| l.starts_with("pinch") && l.contains("Began")),
+            !log.iter()
+                .any(|l| l.starts_with("pinch") && l.contains("Began")),
             "leader-only motion with trailer in noise band must not lock \
              pinch+rotate: {log:?}"
         );
         assert!(
-            !log.iter().any(|l| l.starts_with("rotate") && l.contains("Began")),
+            !log.iter()
+                .any(|l| l.starts_with("rotate") && l.contains("Began")),
             "leader-only motion with trailer in noise band must not lock \
              pinch+rotate: {log:?}"
         );
@@ -2393,23 +2769,28 @@ mod tests {
         s.on_frame(frame(&[]));
         let log = r.pop();
         assert!(
-            log.iter().any(|l| l.starts_with("rotate") && l.contains("Began")),
+            log.iter()
+                .any(|l| l.starts_with("rotate") && l.contains("Began")),
             "expected rotate Began, got: {log:?}"
         );
         assert!(
-            log.iter().any(|l| l.starts_with("pinch") && l.contains("Began")),
+            log.iter()
+                .any(|l| l.starts_with("pinch") && l.contains("Began")),
             "expected pinch Began, got: {log:?}"
         );
         assert!(
-            log.iter().any(|l| l.starts_with("rotate") && l.contains("Changed")),
+            log.iter()
+                .any(|l| l.starts_with("rotate") && l.contains("Changed")),
             "expected rotate Changed once rotation dominates a frame, got: {log:?}"
         );
         assert!(
-            log.iter().any(|l| l.starts_with("pinch") && l.contains("Changed")),
+            log.iter()
+                .any(|l| l.starts_with("pinch") && l.contains("Changed")),
             "expected pinch Changed (lock-frame pinch delta), got: {log:?}"
         );
         assert!(
-            !log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
+            !log.iter()
+                .any(|l| l.starts_with("scroll") && l.contains("Began")),
             "must not lock pan: {log:?}"
         );
     }
@@ -2443,15 +2824,18 @@ mod tests {
         s.on_frame(frame(&[]));
         let log = r.pop();
         assert!(
-            log.iter().any(|l| l.starts_with("rotate") && l.contains("Began")),
+            log.iter()
+                .any(|l| l.starts_with("rotate") && l.contains("Began")),
             "expected rotate Began, got: {log:?}"
         );
         assert!(
-            log.iter().any(|l| l.starts_with("pinch") && l.contains("Began")),
+            log.iter()
+                .any(|l| l.starts_with("pinch") && l.contains("Began")),
             "expected pinch Began, got: {log:?}"
         );
         assert!(
-            !log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
+            !log.iter()
+                .any(|l| l.starts_with("scroll") && l.contains("Began")),
             "must not lock pan: {log:?}"
         );
     }
@@ -2486,11 +2870,13 @@ mod tests {
         s.on_frame(frame(&[]));
         let log = r.pop();
         assert!(
-            log.iter().any(|l| l.starts_with("rotate") && l.contains("Began")),
+            log.iter()
+                .any(|l| l.starts_with("rotate") && l.contains("Began")),
             "expected rotate lock, got: {log:?}"
         );
         assert!(
-            !log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
+            !log.iter()
+                .any(|l| l.starts_with("scroll") && l.contains("Began")),
             "must not lock pan: {log:?}"
         );
     }
@@ -2508,7 +2894,8 @@ mod tests {
         s.on_frame(frame(&[(1, 0.3, 0.5), (2, 0.35, 0.5), (3, 0.4, 0.5)]));
         let log = r.pop();
         assert!(
-            log.iter().any(|l| l.contains("Horizontal") && l.contains("Began") && l.contains('-')),
+            log.iter()
+                .any(|l| l.contains("Horizontal") && l.contains("Began") && l.contains('-')),
             "expected Horizontal Began with negative progress, got: {log:?}",
         );
     }
@@ -2528,7 +2915,8 @@ mod tests {
         // Swipe Began should have fired by here — drain the log.
         let mid = r.pop();
         assert!(
-            mid.iter().any(|l| l.contains("Vertical") && l.contains("Began")),
+            mid.iter()
+                .any(|l| l.contains("Vertical") && l.contains("Began")),
             "{mid:?}",
         );
         // Async lift: contact 2 lifts first (only 1 and 3 remain),
@@ -2543,7 +2931,8 @@ mod tests {
         );
         // We do expect an Ended on the swipe stream itself.
         assert!(
-            log.iter().any(|l| l.contains("Vertical") && l.contains("Ended")),
+            log.iter()
+                .any(|l| l.contains("Vertical") && l.contains("Ended")),
             "expected swipe Ended on lift, got: {log:?}",
         );
     }
@@ -2674,7 +3063,8 @@ mod tests {
         s.on_frame_at(frame(&[]), at(t0, 48));
         let log = r.pop();
         assert!(
-            log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
+            log.iter()
+                .any(|l| l.starts_with("scroll") && l.contains("Began")),
             "expected scroll Began ({log:?})",
         );
         assert!(
@@ -2713,7 +3103,8 @@ mod tests {
         // will require extending `Output` with `mouse_down`/`mouse_up`
         // (or similar) and routing them from `gesture.rs`.
         assert!(
-            log.iter().any(|l| l.contains("press") || l.contains("down")),
+            log.iter()
+                .any(|l| l.contains("press") || l.contains("down")),
             "expected explicit button press from hold latch ({log:?})",
         );
         assert!(
@@ -2721,7 +3112,8 @@ mod tests {
             "expected drag motion under held button ({log:?})",
         );
         assert!(
-            log.iter().any(|l| l.contains("release") || l.contains("up")),
+            log.iter()
+                .any(|l| l.contains("release") || l.contains("up")),
             "expected button release on lift ({log:?})",
         );
     }
@@ -2743,7 +3135,8 @@ mod tests {
             s.on_frame_at(frame(&[(1, 0.55, 0.55)]), at(t0, 460));
             let log = r.pop();
             assert!(
-                !log.iter().any(|l| l.contains("press") || l.contains("down")),
+                !log.iter()
+                    .any(|l| l.contains("press") || l.contains("down")),
                 "motion past TAP_MAX_MOVE_MM must not latch a hold ({log:?})",
             );
         }
@@ -2757,7 +3150,8 @@ mod tests {
             s.on_frame_at(frame(&[(1, 0.40, 0.50), (2, 0.60, 0.50)]), at(t0, 460));
             let log = r.pop();
             assert!(
-                !log.iter().any(|l| l.contains("press") || l.contains("down")),
+                !log.iter()
+                    .any(|l| l.contains("press") || l.contains("down")),
                 "two-finger touch must not latch a hold ({log:?})",
             );
         }
@@ -2791,7 +3185,10 @@ mod tests {
 
         let log = r.pop();
         let moves: Vec<&String> = log.iter().filter(|l| l.starts_with("move ")).collect();
-        assert!(!moves.is_empty(), "test must emit some move lines to be meaningful: {log:?}");
+        assert!(
+            !moves.is_empty(),
+            "test must emit some move lines to be meaningful: {log:?}"
+        );
         // Tracking deltas are 2.5 mm; the lift-frame jump is 7.5 mm. A 5 mm
         // ceiling separates the two — anything above is the artifact leaking.
         for line in &moves {
@@ -2830,20 +3227,11 @@ mod tests {
         // Second finger lands. On this frame the engine transitions to
         // TwoFingerUnclassified — dispatch_one should NOT run for finger
         // 0's drift.
-        s.on_frame_at(
-            frame(&[(1, 0.323, 0.535), (2, 0.505, 0.453)]),
-            at(t0, 25),
-        );
+        s.on_frame_at(frame(&[(1, 0.323, 0.535), (2, 0.505, 0.453)]), at(t0, 25));
         // Subsequent settling frames: finger 0 drifts, both fingers track
         // together but slowly; centroid hasn't moved enough to lock pan.
-        s.on_frame_at(
-            frame(&[(1, 0.322, 0.535), (2, 0.505, 0.452)]),
-            at(t0, 41),
-        );
-        s.on_frame_at(
-            frame(&[(1, 0.321, 0.534), (2, 0.504, 0.450)]),
-            at(t0, 56),
-        );
+        s.on_frame_at(frame(&[(1, 0.322, 0.535), (2, 0.505, 0.452)]), at(t0, 41));
+        s.on_frame_at(frame(&[(1, 0.321, 0.534), (2, 0.504, 0.450)]), at(t0, 56));
         let log = r.pop();
         assert!(
             !log.iter().any(|l| l.starts_with("move ")),
@@ -2884,7 +3272,14 @@ mod tests {
         s.on_frame_at(frame_at_mm(35.67, 39.02), at(t0, 17));
         s.on_frame_at(frame_at_mm(35.65, 38.97), at(t0, 31));
         s.on_frame_at(frame_at_mm(35.63, 38.93), at(t0, 47));
-        s.on_frame_at(Frame { contacts: vec![], scan_time_100us: 0, button: false }, at(t0, 70));
+        s.on_frame_at(
+            Frame {
+                contacts: vec![],
+                scan_time_100us: 0,
+                button: false,
+            },
+            at(t0, 70),
+        );
 
         let log = r.pop();
         assert!(
@@ -2911,8 +3306,20 @@ mod tests {
         let t0 = Timestamp::now();
         let frame_two_mm = |ay: f64, by: f64| Frame {
             contacts: vec![
-                Contact { id: 1, x: 20.0, y: ay, tip: true, confidence: true },
-                Contact { id: 2, x: 30.0, y: by, tip: true, confidence: true },
+                Contact {
+                    id: 1,
+                    x: 20.0,
+                    y: ay,
+                    tip: true,
+                    confidence: true,
+                },
+                Contact {
+                    id: 2,
+                    x: 30.0,
+                    y: by,
+                    tip: true,
+                    confidence: true,
+                },
             ],
             scan_time_100us: 0,
             button: false,
@@ -2982,8 +3389,14 @@ mod tests {
         let parts: Vec<&str> = line.split_whitespace().collect();
         let vx: f64 = parts[1].parse().unwrap();
         let vy: f64 = parts[2].parse().unwrap();
-        assert!(vy.abs() > 50.0, "expected Y velocity > 50 mm/s, got {vy} ({line})");
-        assert!(vx.abs() < 50.0, "expected near-zero X velocity, got {vx} ({line})");
+        assert!(
+            vy.abs() > 50.0,
+            "expected Y velocity > 50 mm/s, got {vy} ({line})"
+        );
+        assert!(
+            vx.abs() < 50.0,
+            "expected near-zero X velocity, got {vx} ({line})"
+        );
     }
 
     /// First contact after a fully-released gesture must cancel any
@@ -3074,7 +3487,13 @@ mod tests {
         let r = Recorder::default();
         let mut s = State::new(&r, test_accel());
         let t0 = Timestamp::now();
-        let one = |id, x, y, tip| Contact { id, x, y, tip, confidence: true };
+        let one = |id, x, y, tip| Contact {
+            id,
+            x,
+            y,
+            tip,
+            confidence: true,
+        };
         let two = |a: Contact, b: Contact| Frame {
             contacts: vec![a, b],
             scan_time_100us: 0,
@@ -3086,10 +3505,7 @@ mod tests {
             button: false,
         };
         // Touchdown 2F.
-        s.on_frame_at(
-            two(one(0, 20.0, 30.0, true), one(1, 35.0, 30.0, true)),
-            t0,
-        );
+        s.on_frame_at(two(one(0, 20.0, 30.0, true), one(1, 35.0, 30.0, true)), t0);
         // Scroll a clearly-not-a-tap distance to lock TwoFingerPan.
         s.on_frame_at(
             two(one(0, 20.0, 33.0, true), one(1, 35.0, 33.0, true)),
@@ -3108,7 +3524,8 @@ mod tests {
         s.on_frame_at(single(one(1, 35.0, 36.0, false)), at(t0, 60));
         let log = r.pop();
         assert!(
-            log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
+            log.iter()
+                .any(|l| l.starts_with("scroll") && l.contains("Began")),
             "expected scroll to begin ({log:?})",
         );
         assert!(
@@ -3136,8 +3553,20 @@ mod tests {
         // each finger's max_move ~0.5 mm (under TAP_MAX_MOVE_MM = 1.0).
         let frame_at_mm = |a: (f64, f64), b: (f64, f64)| Frame {
             contacts: vec![
-                Contact { id: 0, x: a.0, y: a.1, tip: true, confidence: true },
-                Contact { id: 1, x: b.0, y: b.1, tip: true, confidence: true },
+                Contact {
+                    id: 0,
+                    x: a.0,
+                    y: a.1,
+                    tip: true,
+                    confidence: true,
+                },
+                Contact {
+                    id: 1,
+                    x: b.0,
+                    y: b.1,
+                    tip: true,
+                    confidence: true,
+                },
             ],
             scan_time_100us: 0,
             button: false,
@@ -3146,7 +3575,14 @@ mod tests {
         s.on_frame_at(frame_at_mm((20.15, 30.15), (35.15, 30.15)), at(t0, 17));
         s.on_frame_at(frame_at_mm((20.30, 30.30), (35.30, 30.30)), at(t0, 34));
         s.on_frame_at(frame_at_mm((20.45, 30.45), (35.45, 30.45)), at(t0, 51));
-        s.on_frame_at(Frame { contacts: vec![], scan_time_100us: 0, button: false }, at(t0, 75));
+        s.on_frame_at(
+            Frame {
+                contacts: vec![],
+                scan_time_100us: 0,
+                button: false,
+            },
+            at(t0, 75),
+        );
 
         let log = r.pop();
         assert!(
@@ -3154,7 +3590,8 @@ mod tests {
             "tap-eligible 2F drift must not lock pan ({log:?})",
         );
         assert!(
-            !log.iter().any(|l| l.starts_with("pinch") || l.starts_with("rotate")),
+            !log.iter()
+                .any(|l| l.starts_with("pinch") || l.starts_with("rotate")),
             "tap-eligible 2F drift must not lock pinch/rotate ({log:?})",
         );
         assert!(
@@ -3176,7 +3613,13 @@ mod tests {
         let r = Recorder::default();
         let mut s = State::new(&r, test_accel());
         let t0 = Timestamp::now();
-        let one = |id, x, y, tip| Contact { id, x, y, tip, confidence: true };
+        let one = |id, x, y, tip| Contact {
+            id,
+            x,
+            y,
+            tip,
+            confidence: true,
+        };
         let two = |a: Contact, b: Contact| Frame {
             contacts: vec![a, b],
             scan_time_100us: 0,
@@ -3231,7 +3674,13 @@ mod tests {
         let r = Recorder::default();
         let mut s = State::new(&r, test_accel());
         let t0 = Timestamp::now();
-        let one = |id, x, y, tip| Contact { id, x, y, tip, confidence: true };
+        let one = |id, x, y, tip| Contact {
+            id,
+            x,
+            y,
+            tip,
+            confidence: true,
+        };
         let two = |a: Contact, b: Contact| Frame {
             contacts: vec![a, b],
             scan_time_100us: 0,
@@ -3269,11 +3718,18 @@ mod tests {
     /// intuition (`--sensitivity` = pixels/mm at ref) breaks.
     #[test]
     fn cursor_curve_anchored_at_reference_velocity() {
-        let cfg = CursorAccel { px_per_mm_at_ref: 25.0, exponent: 1.5, ref_mm_per_sec: 80.0 };
+        let cfg = CursorAccel {
+            px_per_mm_at_ref: 25.0,
+            exponent: 1.5,
+            ref_mm_per_sec: 80.0,
+        };
         let v = 80.0; // == ref
         let pixels_per_sec = accelerate_cursor(v, cfg);
         // Linear feel at ref: 25 px/mm × 80 mm/s = 2000 px/s.
-        assert!((pixels_per_sec - 2000.0).abs() < 1e-6, "got {pixels_per_sec}");
+        assert!(
+            (pixels_per_sec - 2000.0).abs() < 1e-6,
+            "got {pixels_per_sec}"
+        );
     }
 
     /// Exponent > 1: slow movements get sub-linear gain (more
@@ -3282,13 +3738,23 @@ mod tests {
     /// regression in the formula direction is caught.
     #[test]
     fn cursor_curve_exponent_gt_one_amplifies_at_speed() {
-        let cfg = CursorAccel { px_per_mm_at_ref: 10.0, exponent: 1.4, ref_mm_per_sec: 80.0 };
+        let cfg = CursorAccel {
+            px_per_mm_at_ref: 10.0,
+            exponent: 1.4,
+            ref_mm_per_sec: 80.0,
+        };
         let gain_at = |v: f64| accelerate_cursor(v, cfg) / v;
         let slow = gain_at(20.0);
         let anchor = gain_at(80.0);
         let fast = gain_at(320.0);
-        assert!(slow < anchor, "slow gain {slow} should be < anchor {anchor}");
-        assert!(fast > anchor, "fast gain {fast} should be > anchor {anchor}");
+        assert!(
+            slow < anchor,
+            "slow gain {slow} should be < anchor {anchor}"
+        );
+        assert!(
+            fast > anchor,
+            "fast gain {fast} should be > anchor {anchor}"
+        );
         // Anchor invariant.
         assert!((anchor - 10.0).abs() < 1e-6, "got {anchor}");
     }
@@ -3297,11 +3763,18 @@ mod tests {
     /// site for power curves applied to signed values).
     #[test]
     fn cursor_curve_preserves_sign() {
-        let cfg = CursorAccel { px_per_mm_at_ref: 25.0, exponent: 1.3, ref_mm_per_sec: 80.0 };
+        let cfg = CursorAccel {
+            px_per_mm_at_ref: 25.0,
+            exponent: 1.3,
+            ref_mm_per_sec: 80.0,
+        };
         let pos = accelerate_cursor(50.0, cfg);
         let neg = accelerate_cursor(-50.0, cfg);
         assert!(pos > 0.0 && neg < 0.0, "pos={pos} neg={neg}");
-        assert!((pos + neg).abs() < 1e-9, "magnitudes should match: {pos} vs {neg}");
+        assert!(
+            (pos + neg).abs() < 1e-9,
+            "magnitudes should match: {pos} vs {neg}"
+        );
     }
 
     /// Fractional residual must roll over across frames — without it,
@@ -3376,15 +3849,28 @@ mod tests {
         s.on_frame_at(frame(&[]), at(t0, 96));
 
         let log = r.pop();
-        let scroll_began = log.iter().filter(|l| l.starts_with("scroll") && l.contains("Began")).count();
-        let scroll_ended = log.iter().filter(|l| l.starts_with("scroll") && l.contains("Ended")).count();
+        let scroll_began = log
+            .iter()
+            .filter(|l| l.starts_with("scroll") && l.contains("Began"))
+            .count();
+        let scroll_ended = log
+            .iter()
+            .filter(|l| l.starts_with("scroll") && l.contains("Ended"))
+            .count();
         // One pair before the lift, one after the rejoin: two complete
         // Began/Ended brackets. The point is that the rejoin resumed
         // scroll rather than locking pinch/rotate.
-        assert_eq!(scroll_began, 2, "expected scroll Began x2 (initial + rejoin), got: {log:?}");
-        assert_eq!(scroll_ended, 2, "expected scroll Ended x2 (lift gap + final lift), got: {log:?}");
+        assert_eq!(
+            scroll_began, 2,
+            "expected scroll Began x2 (initial + rejoin), got: {log:?}"
+        );
+        assert_eq!(
+            scroll_ended, 2,
+            "expected scroll Ended x2 (lift gap + final lift), got: {log:?}"
+        );
         assert!(
-            !log.iter().any(|l| l.starts_with("pinch") || l.starts_with("rotate")),
+            !log.iter()
+                .any(|l| l.starts_with("pinch") || l.starts_with("rotate")),
             "rejoin must not produce pinch/rotate events: {log:?}"
         );
     }
@@ -3422,15 +3908,18 @@ mod tests {
 
         let log = r.pop();
         assert!(
-            log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
+            log.iter()
+                .any(|l| l.starts_with("scroll") && l.contains("Began")),
             "expected scroll to lock after rejoin: {log:?}"
         );
         assert!(
-            !log.iter().any(|l| l.starts_with("pinch") && l.contains("Began")),
+            !log.iter()
+                .any(|l| l.starts_with("pinch") && l.contains("Began")),
             "rejoin must not lock pinch: {log:?}"
         );
         assert!(
-            !log.iter().any(|l| l.starts_with("rotate") && l.contains("Began")),
+            !log.iter()
+                .any(|l| l.starts_with("rotate") && l.contains("Began")),
             "rejoin must not lock rotate: {log:?}"
         );
     }
@@ -3465,8 +3954,14 @@ mod tests {
         // resume log isn't expected either — what we check is that
         // there are TWO separate scroll Began emits, one per
         // independent gesture).
-        let scroll_began = log.iter().filter(|l| l.starts_with("scroll") && l.contains("Began")).count();
-        assert_eq!(scroll_began, 2, "expected two independent scroll sessions: {log:?}");
+        let scroll_began = log
+            .iter()
+            .filter(|l| l.starts_with("scroll") && l.contains("Began"))
+            .count();
+        assert_eq!(
+            scroll_began, 2,
+            "expected two independent scroll sessions: {log:?}"
+        );
     }
 
     /// Surviving finger that drifts further than
@@ -3495,8 +3990,14 @@ mod tests {
         let log = r.pop();
         // Two separate scroll sessions: one before the drop, one
         // after the (rejected) rejoin treated as fresh.
-        let scroll_began = log.iter().filter(|l| l.starts_with("scroll") && l.contains("Began")).count();
-        assert_eq!(scroll_began, 2, "drift should force a fresh 2F session: {log:?}");
+        let scroll_began = log
+            .iter()
+            .filter(|l| l.starts_with("scroll") && l.contains("Began"))
+            .count();
+        assert_eq!(
+            scroll_began, 2,
+            "drift should force a fresh 2F session: {log:?}"
+        );
     }
 
     /// Carry must reset on lift so a fresh OneFinger session can't
