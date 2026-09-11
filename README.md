@@ -19,7 +19,6 @@ learned into a nice spec and develop a high-quality codebase from it.
 ## Build & run
 
 ```sh
-cd companion
 cargo build --release
 ./target/release/companion -v
 ```
@@ -95,6 +94,10 @@ backend = "synthetic"         # synthetic | notification | off
 [gestures.swipe.vertical]     # up/down 3F/4F → Mission Control / App Exposé
 enable  = "on"
 backend = "synthetic"
+
+[overlay]                     # on-screen HUD naming each gesture as it locks
+enable      = false
+duration_ms = 600             # how long the flash stays up
 ```
 
 ## Permissions
@@ -204,7 +207,14 @@ on separate interfaces.
 | `gesture.rs` | Pure state machine — classifies 1F/2F/3F/4F gestures, locks 2F mode on first significant motion. Tested without I/O. |
 | `output.rs` | macOS event synthesis. Public CGEvent for cursor/click/scroll, private CGEvent type/field IDs for pinch/rotate/swipe. |
 | `hid.rs` | IOHIDManager FFI: device matching, descriptor + input-report subscription, run-loop pumping. |
+| `config.rs` | TOML config loading and defaults. Unknown keys are rejected. |
+| `app_context.rs` | Resolves the bundle ID of the app under the cursor, for the per-gesture `only` / `except` filters. |
+| `overlay.rs` | Optional click-through `NSPanel` HUD that flashes the gesture name at lock time. |
+| `scan_clock.rs` | Maps the device's wrapping 100 µs scan-time counter onto host `CLOCK_UPTIME_RAW` timestamps. |
+| `time.rs` | Monotonic `Timestamp` shared by the gesture engine and the event synthesizer. |
+| `instance_lock.rs` | `flock(2)` single-instance guard — two companions racing one trackpad is destructive. |
 | `main.rs` | CLI parsing, logging, wiring. |
+| `bin/gesture_tap.rs` | Separate `gesture-tap` binary: read-only event tap that dumps the gesture events macOS routes, for comparing against a real trackpad. |
 
 ## Caveats
 
@@ -213,10 +223,12 @@ on separate interfaces.
   20, 30, 31) and field IDs (110, 113, 115, 132). These are stable on
   recent macOS versions and used by BetterTouchTool, Karabiner-Elements,
   and similar tools — but they're not in any public Apple header and
-  could break on a future macOS update. Pass `--no-private-gestures` to
-  disable them; cursor / click / phased scroll all use public CGEvent
-  APIs and won't be affected.
+  could break on a future macOS update. To turn them off, set
+  `enable = "off"` under `[gestures.pinch]` / `[gestures.rotate]` and
+  `backend = "off"` under each `[gestures.swipe.*]` axis; cursor /
+  click / phased scroll all use public CGEvent APIs and won't be
+  affected.
 - **Two-finger ambiguity is resolved by first-significant-motion lock.**
-  Once the centroid moves, the distance changes by 4%, or the angle
-  changes by 6°, that mode wins for the duration of the touch. The
-  thresholds in `gesture.rs` may need tuning once we have hardware.
+  Once the centroid travels 0.4 mm, the inter-finger distance changes
+  by 4%, or the angle changes by 4°, that mode wins for the duration of
+  the touch. The thresholds live at the top of `gesture.rs`.

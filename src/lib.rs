@@ -1,7 +1,7 @@
 //! Library facade so binaries beyond the main `companion` daemon can
 //! reuse the gesture/output stack. Shared between `src/main.rs` (the
-//! daemon) and `src/bin/scroll_replay.rs` (the captured-stream
-//! playback tool).
+//! daemon) and `src/bin/gesture_tap.rs` (the read-only event tap used
+//! to characterize real-trackpad event streams).
 
 pub mod app_context;
 pub mod config;
