@@ -6,18 +6,34 @@
 # `target/release/companion` binary still runs from a terminal for
 # debugging, but it has nowhere to hang an icon.
 #
-# TCC WARNING: macOS keys Input Monitoring and Accessibility grants to
-# code identity. This script ad-hoc signs (`--sign -`), and an ad-hoc
-# signature's designated requirement embeds the binary's cdhash — which
-# changes on every rebuild. Expect to re-grant both permissions after
-# each `bundle.sh` run. To make grants stick across builds, sign with a
-# self-signed certificate in the login keychain and pass its name as
-# SIGN_IDENTITY (see README).
+# SIGNING: macOS keys Input Monitoring and Accessibility grants to code
+# identity, so the signature decides whether permissions survive a
+# rebuild. With a real certificate the designated requirement is based
+# on the team and bundle id, and grants persist. Ad-hoc (`--sign -`)
+# embeds the binary's cdhash instead, so every rebuild looks like a new
+# app and re-prompts for both permissions.
+#
+# Identity is picked automatically: Developer ID Application, else Apple
+# Development, else ad-hoc. Override with SIGN_IDENTITY.
+#
+# Hardened runtime is opt-in (HARDENED=1). It's required for
+# notarization, but it also strips get-task-allow, which blocks lldb
+# from attaching — not what you want day to day. TCC stability does not
+# depend on it.
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 APP="$ROOT/target/companion.app"
-BUNDLE_ID=${BUNDLE_ID:-io.github.gguemez.macos-trackpad-companion}
+BUNDLE_ID=${BUNDLE_ID:-net.guemez.trackpad-companion}
+
+if [ -z "${SIGN_IDENTITY:-}" ]; then
+	SIGN_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
+		| awk -F'"' '/Developer ID Application/ { print $2; exit }')
+fi
+if [ -z "$SIGN_IDENTITY" ]; then
+	SIGN_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
+		| awk -F'"' '/Apple Development/ { print $2; exit }')
+fi
 SIGN_IDENTITY=${SIGN_IDENTITY:--}
 VERSION=$(awk -F'"' '/^version *=/ { print $2; exit }' "$ROOT/Cargo.toml")
 
@@ -52,13 +68,20 @@ PLIST
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
 
 # --force so a rebuild replaces the previous signature rather than failing.
-codesign --force --sign "$SIGN_IDENTITY" --identifier "$BUNDLE_ID" "$APP"
+if [ "${HARDENED:-0}" = "1" ] && [ "$SIGN_IDENTITY" != "-" ]; then
+	codesign --force --sign "$SIGN_IDENTITY" --identifier "$BUNDLE_ID" \
+		--options runtime "$APP"
+else
+	codesign --force --sign "$SIGN_IDENTITY" --identifier "$BUNDLE_ID" "$APP"
+fi
 codesign --verify --deep --strict "$APP"
 
 echo "built $APP"
 echo "  bundle id : $BUNDLE_ID"
 echo "  version   : $VERSION"
 echo "  signed by : $SIGN_IDENTITY"
+# The designated requirement is what TCC matches on across rebuilds.
+codesign -d -r- "$APP" 2>&1 | sed -n 's/^designated => /  requirement: /p'
 echo
 echo "run it:  open $APP"
 echo "or CLI:  $ROOT/target/release/companion -v"

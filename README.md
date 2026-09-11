@@ -38,16 +38,32 @@ cargo build --release
 ./target/release/companion -v
 ```
 
-**Permissions are keyed to code identity.** `bundle.sh` ad-hoc signs, and
-an ad-hoc signature's designated requirement embeds the binary's cdhash
-— so every rebuild looks like a brand-new app to macOS, and Input
-Monitoring / Accessibility have to be granted again. To make grants
-stick across builds, sign with a self-signed certificate from the login
-keychain:
+**Permissions are keyed to code identity.** macOS matches TCC grants
+against the signature's *designated requirement*, so how the bundle is
+signed decides whether Input Monitoring and Accessibility survive a
+rebuild. `bundle.sh` picks the best identity it finds — Developer ID
+Application, else Apple Development, else ad-hoc — and prints the
+resulting requirement:
+
+```
+identifier "net.guemez.trackpad-companion" and anchor apple generic
+  and certificate leaf[subject.OU] = <TEAMID>
+```
+
+That names the bundle id and the signing team, with no cdhash, so the
+grants persist across rebuilds. Ad-hoc signing (the fallback when no
+certificate is installed) pins the cdhash instead, which changes every
+build and re-prompts for both permissions each time.
 
 ```sh
-SIGN_IDENTITY="My Dev Cert" ./scripts/bundle.sh
+SIGN_IDENTITY="Developer ID Application: …" ./scripts/bundle.sh  # override
+HARDENED=1 ./scripts/bundle.sh                                   # notarization prep
 ```
+
+Hardened runtime is opt-in because it strips `get-task-allow`, which
+stops `lldb` attaching; it is required for notarization but irrelevant
+to TCC. Changing `BUNDLE_ID` resets the grants — it is part of the
+requirement.
 
 CLI flags (intentionally tiny — everything else lives in the config file):
 
