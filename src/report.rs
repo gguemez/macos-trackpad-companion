@@ -46,10 +46,32 @@ pub fn decode(layout: &Layout, report: &[u8]) -> Option<Frame> {
         if off + layout.bytes_per_contact > report.len() {
             break;
         }
+
         let flags = report[off];
-        let id = report[off + 1];
-        let x = u16::from_le_bytes([report[off + 2], report[off + 3]]) as i32;
-        let y = u16::from_le_bytes([report[off + 4], report[off + 5]]) as i32;
+
+        let (id, x, y) = match layout.bytes_per_contact {
+            5 => {
+                // Packed PTP layout:
+                // bit 0 = confidence
+                // bit 1 = tip switch
+                // bits 2..7 = 6-bit contact ID
+                // followed by little-endian X and Y.
+                let id = (flags >> 2) & 0x3f;
+                let x = u16::from_le_bytes([report[off + 1], report[off + 2]]) as i32;
+                let y = u16::from_le_bytes([report[off + 3], report[off + 4]]) as i32;
+                (id, x, y)
+            }
+
+            6 => {
+                // Existing companion layout.
+                let id = report[off + 1];
+                let x = u16::from_le_bytes([report[off + 2], report[off + 3]]) as i32;
+                let y = u16::from_le_bytes([report[off + 4], report[off + 5]]) as i32;
+                (id, x, y)
+            }
+
+            _ => unreachable!(),
+        };
 
         let confidence = (flags & 0x01) != 0;
         let tip = (flags & 0x02) != 0;
@@ -67,8 +89,7 @@ pub fn decode(layout: &Layout, report: &[u8]) -> Option<Frame> {
         report[layout.scan_time_offset],
         report[layout.scan_time_offset + 1],
     ]);
-    let button =
-        (report[layout.button_offset] & (1 << layout.button_bit)) != 0;
+    let button = (report[layout.button_offset] & (1 << layout.button_bit)) != 0;
 
     Some(Frame {
         contacts,
@@ -96,6 +117,9 @@ mod tests {
             physical_x_max_mm: 65.0,
             physical_y_max_mm: 40.0,
             total_payload_bytes: 35,
+            input_mode_report_id: None,
+            selective_reporting_report_id: None,
+            latency_mode_report_id: None,
         }
     }
 
@@ -123,8 +147,91 @@ mod tests {
         assert_eq!(frame.contacts.len(), 2);
         assert_eq!(frame.contacts[0].id, 7);
         // Midpoint chip pixel → midpoint mm.
-        assert!((frame.contacts[0].x - 32.5).abs() < 0.05, "{}", frame.contacts[0].x);
-        assert!((frame.contacts[0].y - 20.0).abs() < 0.05, "{}", frame.contacts[0].y);
+        assert!(
+            (frame.contacts[0].x - 32.5).abs() < 0.05,
+            "{}",
+            frame.contacts[0].x
+        );
+        assert!(
+            (frame.contacts[0].y - 20.0).abs() < 0.05,
+            "{}",
+            frame.contacts[0].y
+        );
+        assert_eq!(frame.scan_time_100us, 0x1234);
+        assert!(frame.button);
+    }
+
+    #[test]
+    fn decodes_packed_five_byte_contacts() {
+        let layout = Layout {
+            report_id: 0x1e,
+            contact_slots: 5,
+            bytes_per_contact: 5,
+            fingers_offset: 1,
+            scan_time_offset: 26,
+            contact_count_offset: 28,
+            button_offset: 29,
+            button_bit: 0,
+            logical_x_max: 2160,
+            logical_y_max: 1600,
+            physical_x_max_mm: 209.8,
+            physical_y_max_mm: 119.1,
+            total_payload_bytes: 30,
+
+            input_mode_report_id: Some(0x25),
+            selective_reporting_report_id: Some(0x22),
+            latency_mode_report_id: Some(0x23),
+        };
+
+        let mut buf = vec![0u8; 30];
+
+        // Report ID.
+        buf[0] = 0x1e;
+
+        // Contact 0:
+        // confidence=1, tip=1, id=7
+        // packed flags = (7 << 2) | 0b11 = 0x1f
+        buf[1] = (7 << 2) | 0x03;
+
+        // X = 1080, Y = 800 (logical midpoint).
+        buf[2..4].copy_from_slice(&1080u16.to_le_bytes());
+        buf[4..6].copy_from_slice(&800u16.to_le_bytes());
+
+        // Contact 1:
+        // confidence=1, tip=1, id=8
+        buf[6] = (8 << 2) | 0x03;
+        buf[7..9].copy_from_slice(&1620u16.to_le_bytes());
+        buf[9..11].copy_from_slice(&400u16.to_le_bytes());
+
+        // Trailing PTP fields.
+        buf[26..28].copy_from_slice(&0x1234u16.to_le_bytes());
+        buf[28] = 2; // contact count
+        buf[29] = 0x01; // button
+
+        let frame = decode(&layout, &buf).expect("decode");
+
+        assert_eq!(frame.contacts.len(), 2);
+
+        assert_eq!(frame.contacts[0].id, 7);
+        assert!(frame.contacts[0].tip);
+        assert!(frame.contacts[0].confidence);
+
+        // Logical midpoint should map to physical midpoint.
+        assert!(
+            (frame.contacts[0].x - 104.9).abs() < 0.1,
+            "{}",
+            frame.contacts[0].x
+        );
+        assert!(
+            (frame.contacts[0].y - 59.55).abs() < 0.1,
+            "{}",
+            frame.contacts[0].y
+        );
+
+        assert_eq!(frame.contacts[1].id, 8);
+        assert!(frame.contacts[1].tip);
+        assert!(frame.contacts[1].confidence);
+
         assert_eq!(frame.scan_time_100us, 0x1234);
         assert!(frame.button);
     }

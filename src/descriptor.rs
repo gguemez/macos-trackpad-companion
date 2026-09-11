@@ -24,6 +24,11 @@ const USAGE_DIG_CONTACT_ID: u16 = 0x51;
 const USAGE_DIG_CONTACT_COUNT: u16 = 0x54;
 const USAGE_DIG_SCAN_TIME: u16 = 0x56;
 
+const USAGE_DIG_INPUT_MODE: u16 = 0x52;
+const USAGE_DIG_SURFACE_SWITCH: u16 = 0x57;
+const USAGE_DIG_BUTTON_SWITCH: u16 = 0x58;
+const USAGE_DIG_LATENCY_MODE: u16 = 0x60;
+
 const FINGER_USAGE: u32 = ((PAGE_DIGITIZER as u32) << 16) | (USAGE_DIG_FINGER as u32);
 
 #[derive(Debug, Clone)]
@@ -46,6 +51,11 @@ pub struct Layout {
     pub physical_x_max_mm: f64,
     pub physical_y_max_mm: f64,
     pub total_payload_bytes: usize,
+
+    // PTP Extensions
+    pub input_mode_report_id: Option<u8>,
+    pub selective_reporting_report_id: Option<u8>,
+    pub latency_mode_report_id: Option<u8>,
 }
 
 impl Layout {
@@ -63,9 +73,9 @@ impl Layout {
 
 impl Layout {
     pub fn validate(&self) -> Result<()> {
-        if self.bytes_per_contact != 6 {
+        if self.bytes_per_contact != 5 && self.bytes_per_contact != 6 {
             bail!(
-                "non-standard contact layout: {} bytes/contact (expected 6)",
+                "unsupported contact layout: {} bytes/contact (expected 5 or 6)",
                 self.bytes_per_contact
             );
         }
@@ -131,6 +141,11 @@ struct Walker<'a> {
     logical_y_max: Option<i32>,
     physical_x_max_mm: Option<f64>,
     physical_y_max_mm: Option<f64>,
+
+    // PTP Extensions
+    input_mode_report_id: Option<u8>,
+    selective_reporting_report_id: Option<u8>,
+    latency_mode_report_id: Option<u8>,
 }
 
 #[derive(Debug)]
@@ -189,6 +204,9 @@ impl<'a> Walker<'a> {
             logical_y_max: None,
             physical_x_max_mm: None,
             physical_y_max_mm: None,
+            input_mode_report_id: None,
+            selective_reporting_report_id: None,
+            latency_mode_report_id: None,
         }
     }
 
@@ -235,19 +253,49 @@ impl<'a> Walker<'a> {
         Ok(())
     }
 
+    fn handle_feature(&mut self) {
+        let usages = self.expanded_usages(self.report_count as usize);
+
+        for usage32 in usages {
+            let page = (usage32 >> 16) as u16;
+            let usage = (usage32 & 0xffff) as u16;
+
+            if page != PAGE_DIGITIZER {
+                continue;
+            }
+
+            match usage {
+                USAGE_DIG_INPUT_MODE => {
+                    self.input_mode_report_id.get_or_insert(self.report_id);
+                }
+
+                USAGE_DIG_SURFACE_SWITCH | USAGE_DIG_BUTTON_SWITCH => {
+                    self.selective_reporting_report_id
+                        .get_or_insert(self.report_id);
+                }
+
+                USAGE_DIG_LATENCY_MODE => {
+                    self.latency_mode_report_id.get_or_insert(self.report_id);
+                }
+
+                _ => {}
+            }
+        }
+    }
+
     fn handle_main(&mut self, tag: u8, udata: u32) -> Result<()> {
         match tag {
             0b1000 => self.handle_input(udata),
+            0b1011 => self.handle_feature(),
             0b1010 => self.open_collection(udata),
             0b1100 => self.close_collection(),
-            // Output / Feature / others — we don't decode features at the
-            // input-layout level, so ignore.
             _ => {}
         }
-        // Local state resets after every Main item.
+
         self.usages.clear();
         self.usage_min = None;
         self.usage_max = None;
+
         Ok(())
     }
 
@@ -259,7 +307,10 @@ impl<'a> Walker<'a> {
             .copied()
             .unwrap_or(((self.usage_page as u32) << 16) | 0);
 
-        self.collections.push(Collection { kind, primary_usage });
+        self.collections.push(Collection {
+            kind,
+            primary_usage,
+        });
 
         if kind == 0x02 && primary_usage == FINGER_USAGE {
             let cursor = *self.bit_cursor.entry(self.report_id).or_insert(8);
@@ -300,7 +351,10 @@ impl<'a> Walker<'a> {
         let total_bits = (bit_size * count) as usize;
 
         let cursor_initial = if self.report_id != 0 { 8 } else { 0 };
-        let cursor = self.bit_cursor.entry(self.report_id).or_insert(cursor_initial);
+        let cursor = self
+            .bit_cursor
+            .entry(self.report_id)
+            .or_insert(cursor_initial);
         let start_bit = *cursor;
         *cursor += total_bits;
 
@@ -459,20 +513,18 @@ impl<'a> Walker<'a> {
         let contact_count = self
             .contact_count
             .ok_or_else(|| anyhow!("descriptor missing Contact Count field"))?;
-        let button = self
-            .buttons
-            .get(&report_id)
-            .copied()
-            .ok_or_else(|| anyhow!("descriptor missing Button 1 field in touch report {report_id:#04x}"))?;
+        let button = self.buttons.get(&report_id).copied().ok_or_else(|| {
+            anyhow!("descriptor missing Button 1 field in touch report {report_id:#04x}")
+        })?;
 
         let total_bits = self.bit_cursor.get(&report_id).copied().unwrap_or(0);
 
-        let physical_x_max_mm = self
-            .physical_x_max_mm
-            .ok_or_else(|| anyhow!("descriptor missing Physical Max + Unit (cm/in length) for X"))?;
-        let physical_y_max_mm = self
-            .physical_y_max_mm
-            .ok_or_else(|| anyhow!("descriptor missing Physical Max + Unit (cm/in length) for Y"))?;
+        let physical_x_max_mm = self.physical_x_max_mm.ok_or_else(|| {
+            anyhow!("descriptor missing Physical Max + Unit (cm/in length) for X")
+        })?;
+        let physical_y_max_mm = self.physical_y_max_mm.ok_or_else(|| {
+            anyhow!("descriptor missing Physical Max + Unit (cm/in length) for Y")
+        })?;
         let layout = Layout {
             report_id,
             contact_slots: self.finger_blocks.len(),
@@ -487,6 +539,9 @@ impl<'a> Walker<'a> {
             physical_x_max_mm,
             physical_y_max_mm,
             total_payload_bytes: total_bits.div_ceil(8),
+            input_mode_report_id: self.input_mode_report_id,
+            selective_reporting_report_id: self.selective_reporting_report_id,
+            latency_mode_report_id: self.latency_mode_report_id,
         };
         layout.validate()?;
         Ok(layout)
@@ -509,13 +564,17 @@ fn physical_to_mm(physical: i32, unit: u32, unit_exponent: i32) -> Option<f64> {
     }
     let system = unit & 0xF;
     let length_nib = ((unit >> 4) & 0xF) as i32;
-    let length_exp = if length_nib & 0x8 != 0 { length_nib - 16 } else { length_nib };
+    let length_exp = if length_nib & 0x8 != 0 {
+        length_nib - 16
+    } else {
+        length_nib
+    };
     if length_exp != 1 {
         return None;
     }
     let scale_to_mm = match system {
-        1 => 10.0,   // SI Linear: cm → mm
-        3 => 25.4,   // English Linear: in → mm
+        1 => 10.0, // SI Linear: cm → mm
+        3 => 25.4, // English Linear: in → mm
         _ => return None,
     };
     Some((physical as f64) * 10f64.powi(unit_exponent) * scale_to_mm)
@@ -601,19 +660,18 @@ mod tests {
     fn wpt_descriptor_with_mouse_tlc() -> Vec<u8> {
         // ===== Mouse TLC (Report ID 0x01) — declares Button 0x01..0x02 =====
         let mut d = vec![
-            0x05, 0x01,                         // Usage Page (Generic Desktop)
-            0x09, 0x02,                         // Usage (Mouse)
-            0xA1, 0x01,                         // Collection (Application)
-                0x85, 0x01,                         //   Report ID (1)
-                0x09, 0x01,                         //   Usage (Pointer)
-                0xA1, 0x00,                         //   Collection (Physical)
-                    0x05, 0x09, 0x19, 0x01, 0x29, 0x02, 0x15, 0x00, 0x25, 0x01,
-                    0x75, 0x01, 0x95, 0x02, 0x81, 0x02,     // 2 buttons (1 bit each)
-                    0x95, 0x06, 0x81, 0x03,                 // 6 bits padding
-                    0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x81, 0x25, 0x7F,
-                    0x75, 0x08, 0x95, 0x02, 0x81, 0x06,     // 2x 8-bit X/Y deltas
-                0xC0,
-            0xC0,
+            0x05, 0x01, // Usage Page (Generic Desktop)
+            0x09, 0x02, // Usage (Mouse)
+            0xA1, 0x01, // Collection (Application)
+            0x85, 0x01, //   Report ID (1)
+            0x09, 0x01, //   Usage (Pointer)
+            0xA1, 0x00, //   Collection (Physical)
+            0x05, 0x09, 0x19, 0x01, 0x29, 0x02, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x02,
+            0x81, 0x02, // 2 buttons (1 bit each)
+            0x95, 0x06, 0x81, 0x03, // 6 bits padding
+            0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x02,
+            0x81, 0x06, // 2x 8-bit X/Y deltas
+            0xC0, 0xC0,
         ];
 
         // ===== Touchpad TLC (Report ID 0x05) — five fingers + scan + count + button =====

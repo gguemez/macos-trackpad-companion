@@ -44,9 +44,6 @@ const kIOHIDReportTypeFeature: IOHIDReportType = 2;
 /// Universal — every PTP device exposes it. 1 byte: 0 = mouse,
 /// 3 = multi-touch. We use this for third-party PTP devices and as a
 /// fallback when the RMK vendor 0x10 path is unavailable.
-const PTP_INPUT_MODE_REPORT_ID: isize = 0x08;
-const PTP_INPUT_MODE_PTP: u8 = 0x03;
-const PTP_INPUT_MODE_MOUSE: u8 = 0x00;
 
 /// Vendor Feature Report ID exposed by RMK firmware. One byte:
 /// low nibble = mode (0 = mouse, 3 = PTP), bit 7 = heartbeat-required.
@@ -60,19 +57,21 @@ const PTP_CONTROL_REPORT_ID: isize = 0x10;
 const PTP_CONTROL_PTP_HEARTBEAT: u8 = 0x83; // mode=3 + bit7
 const PTP_CONTROL_MOUSE: u8 = 0x00;
 
-/// `IOReturn` value for "the device's HID interface doesn't carry this
-/// report ID" — what we get when sending Report 0x10 to a standard PTP
-/// device. Differentiated from other failures so we can fall back
-/// silently rather than warn.
-const kIOReturnUnsupported: IOReturn = 0xE00002C7u32 as IOReturn;
-
 /// How often to re-assert `PTP_CONTROL_PTP_HEARTBEAT` on devices that
 /// accepted the vendor path. Sized comfortably under the firmware's
 /// 12-s timeout (`PTP_HEARTBEAT_TIMEOUT_TICKS`); a couple of skipped
 /// pulses (process pause, USB stack hiccup) still leaves headroom.
-/// Devices on the spec 0x08 path don't get pulsed — there's nothing
-/// for them to honor.
+// Standard PTP devices don't get heartbeat pulses; there is no
+// equivalent heartbeat mechanism in the standard Input Mode path.
 const HEARTBEAT_INTERVAL_SECS: f64 = 5.0;
+const PTP_SELECTIVE_REPORT_ALL: u8 = 0x03;
+const PTP_LATENCY_NORMAL: u8 = 0x00;
+
+/// Microsoft Precision Touchpad Input Mode feature values.
+/// The report ID is device-specific and is discovered from the
+/// HID descriptor via Digitizer Usage 0x52.
+const PTP_INPUT_MODE_PTP: u8 = 0x03;
+const PTP_INPUT_MODE_MOUSE: u8 = 0x00;
 
 const KEY_VENDOR_ID: &str = "VendorID";
 const KEY_PRODUCT_ID: &str = "ProductID";
@@ -141,6 +140,12 @@ unsafe extern "C" {
         report: *const u8,
         report_length: isize,
     ) -> IOReturn;
+
+    fn IOHIDDeviceScheduleWithRunLoop(
+        device: IOHIDDeviceRef,
+        run_loop: *mut c_void,
+        run_loop_mode: *const c_void,
+    );
 }
 
 // ---- Public API ----
@@ -205,7 +210,11 @@ impl Drop for DeviceState {
         // watchdog catches that case independently.
         match self.control_path {
             ControlPath::Vendor => set_ptp_control(self.device, PTP_CONTROL_MOUSE),
-            ControlPath::SpecInputMode => set_input_mode(self.device, PTP_INPUT_MODE_MOUSE),
+            ControlPath::SpecInputMode => {
+                if let Some(report_id) = self.layout.input_mode_report_id {
+                    set_input_mode(self.device, report_id, PTP_INPUT_MODE_MOUSE);
+                }
+            }
         }
     }
 }
@@ -448,8 +457,10 @@ unsafe extern "C" fn on_device_matched(
     log::info!(
         "matched \"{product}\" (vid={} pid={}): {} contacts, logical max {}×{} \
          ({:.1}×{:.1} mm), {} bytes/contact, payload {} bytes total",
-        vid.map(|v| format!("{:#06x}", v as u16)).unwrap_or_else(|| "?".into()),
-        pid.map(|v| format!("{:#06x}", v as u16)).unwrap_or_else(|| "?".into()),
+        vid.map(|v| format!("{:#06x}", v as u16))
+            .unwrap_or_else(|| "?".into()),
+        pid.map(|v| format!("{:#06x}", v as u16))
+            .unwrap_or_else(|| "?".into()),
         layout.contact_slots,
         layout.logical_x_max,
         layout.logical_y_max,
@@ -470,11 +481,10 @@ unsafe extern "C" fn on_device_matched(
         desc.len(),
     );
 
-    // Try the RMK vendor 0x10 path first. If the device doesn't expose
-    // it (third-party PTP touchpad), fall back to the spec 0x08 path
-    // and skip heartbeat pulses for this device — there's no protocol
-    // for the firmware to honor them anyway.
-    let control_path = enter_ptp_mode(device, &product);
+    // Prefer the RMK vendor control path when supported. For standard
+    // Precision Touchpads, discover the Input Mode and optional configuration
+    // feature report IDs from the HID descriptor.
+    let control_path = enter_ptp_mode(device, &product, &layout);
 
     let buf_len = layout.total_payload_bytes.max(64);
     let mut state = Box::pin(DeviceState {
@@ -491,6 +501,13 @@ unsafe extern "C" fn on_device_matched(
         let buf_ptr = s.buf.as_mut_ptr();
         let buf_len_isize = s.buf.len() as isize;
         let ctx_ptr = s as *mut DeviceState as *mut c_void;
+
+        IOHIDDeviceScheduleWithRunLoop(
+            device,
+            CFRunLoop::get_current().as_concrete_TypeRef() as *mut _,
+            kCFRunLoopDefaultMode as *const _,
+        );
+
         IOHIDDeviceRegisterInputReportCallback(
             device,
             buf_ptr,
@@ -510,35 +527,63 @@ unsafe extern "C" fn on_device_matched(
 /// errors fall back too but are logged: typical case is a USB hiccup,
 /// no point bailing the match flow when the spec path is universally
 /// implemented.
-fn enter_ptp_mode(device: IOHIDDeviceRef, product: &str) -> ControlPath {
+fn enter_ptp_mode(device: IOHIDDeviceRef, product: &str, layout: &Layout) -> ControlPath {
+    // Prefer the RMK vendor control path when available. It provides
+    // heartbeat protection and preserves the original companion behavior.
     let rv = set_feature_byte(device, PTP_CONTROL_REPORT_ID, PTP_CONTROL_PTP_HEARTBEAT);
+
     if rv == kIOReturnSuccess {
-        log::info!(
-            "\"{product}\": entered PTP via vendor Report 0x10 (heartbeat-protected)"
-        );
+        log::info!("\"{product}\": entered PTP via vendor Report 0x10 (heartbeat-protected)");
         return ControlPath::Vendor;
     }
-    if rv != kIOReturnUnsupported {
+
+    // Otherwise use the standard PTP feature reports discovered from
+    // the device's HID descriptor.
+    let Some(input_mode_id) = layout.input_mode_report_id else {
+        log::warn!("\"{product}\": descriptor has no Input Mode feature report");
+        return ControlPath::SpecInputMode;
+    };
+
+    let rv = set_feature_byte(device, input_mode_id as isize, PTP_INPUT_MODE_PTP);
+
+    if rv != kIOReturnSuccess {
         log::warn!(
-            "\"{product}\": vendor Report 0x10 SET failed ({:#x}), falling back to spec 0x08",
+            "\"{product}\": Input Mode report {:#04x} SET failed ({:#x})",
+            input_mode_id,
             rv as u32,
         );
+        return ControlPath::SpecInputMode;
     }
-    let rv = set_feature_byte(device, PTP_INPUT_MODE_REPORT_ID, PTP_INPUT_MODE_PTP);
-    if rv == kIOReturnSuccess {
-        log::info!(
-            "\"{product}\": entered PTP via spec Report 0x08 (no heartbeat — companion crash will leave PTP stuck on)"
-        );
-    } else {
-        // Even a third-party PTP device should accept 0x08; if this
-        // fails we won't get any PTP reports at all. Log loudly and
-        // proceed — the user might still get something useful from the
-        // legacy mouse path the firmware/device falls back to.
-        log::warn!(
-            "\"{product}\": spec Report 0x08 SET failed ({:#x}); device likely won't publish PTP reports",
-            rv as u32,
-        );
+
+    if let Some(id) = layout.selective_reporting_report_id {
+        let rv = set_feature_byte(device, id as isize, PTP_SELECTIVE_REPORT_ALL);
+
+        if rv != kIOReturnSuccess {
+            log::warn!(
+                "\"{product}\": Selective Reporting {:#04x} SET failed ({:#x})",
+                id,
+                rv as u32,
+            );
+        }
     }
+
+    if let Some(id) = layout.latency_mode_report_id {
+        let rv = set_feature_byte(device, id as isize, PTP_LATENCY_NORMAL);
+
+        if rv != kIOReturnSuccess {
+            log::warn!(
+                "\"{product}\": Latency Mode {:#04x} SET failed ({:#x})",
+                id,
+                rv as u32,
+            );
+        }
+    }
+
+    log::info!(
+        "\"{product}\": entered standard PTP mode via report {:#04x}",
+        input_mode_id,
+    );
+
     ControlPath::SpecInputMode
 }
 
@@ -560,13 +605,15 @@ fn set_ptp_control(device: IOHIDDeviceRef, byte: u8) {
 
 /// SET_FEATURE wrapper around a 1-byte spec Input Mode write. Used on
 /// the third-party-device fallback path; no heartbeat semantics.
-fn set_input_mode(device: IOHIDDeviceRef, mode: u8) {
-    let rv = set_feature_byte(device, PTP_INPUT_MODE_REPORT_ID, mode);
+fn set_input_mode(device: IOHIDDeviceRef, report_id: u8, mode: u8) {
+    let rv = set_feature_byte(device, report_id as isize, mode);
+
     if rv == kIOReturnSuccess {
-        log::debug!("PTP input mode (0x08) set to {:#04x}", mode);
+        log::debug!("Input Mode report {:#04x} set to {:#04x}", report_id, mode);
     } else {
         log::warn!(
-            "SET_FEATURE InputMode={:#04x} failed: {:#x}",
+            "SET_FEATURE Input Mode report {:#04x}={:#04x} failed: {:#x}",
+            report_id,
             mode,
             rv as u32,
         );
@@ -617,6 +664,7 @@ unsafe extern "C" fn on_input_report(
     let state = unsafe { &mut *(context as *mut DeviceState) };
     let bridge = unsafe { &mut *state.bridge };
     let bytes = unsafe { std::slice::from_raw_parts(report, report_length as usize) };
+
     if log::log_enabled!(log::Level::Trace) {
         log::trace!("input report ({} bytes): {}", bytes.len(), hex(bytes));
     }
