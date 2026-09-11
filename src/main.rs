@@ -23,8 +23,10 @@ mod descriptor;
 mod gesture;
 mod hid;
 mod instance_lock;
+mod onboarding;
 mod output;
 mod overlay;
+mod permissions;
 mod report;
 mod scan_clock;
 mod status_item;
@@ -109,6 +111,20 @@ fn main() -> Result<()> {
     let lock = instance_lock::acquire()?;
     log::debug!("acquired instance lock at {}", lock.path.display());
 
+    let perms = permissions::State::current();
+    log::info!(
+        "permissions: input monitoring = {:?}, accessibility = {}",
+        perms.input_monitoring,
+        perms.accessibility
+    );
+    if !perms.accessibility {
+        log::warn!(
+            "Accessibility is NOT granted — CGEvents will be posted and silently \
+             discarded by macOS. Gestures will appear to work in the logs while \
+             nothing moves on screen."
+        );
+    }
+
     let out_cfg = output::Config {
         scroll_accel: cfg.scroll.sensitivity,
         natural_scroll: cfg.scroll.natural,
@@ -132,9 +148,14 @@ fn main() -> Result<()> {
     // Install the menu-bar icon before the event loop starts. Bound to
     // a named guard: dropping a `StatusItem` pulls it out of the menu
     // bar, so it has to live as long as `main` does.
-    let _status_item = objc2::MainThreadMarker::new()
-        .map(status_item::StatusItem::install)
+    let mtm = objc2::MainThreadMarker::new()
         .ok_or_else(|| anyhow::anyhow!("main() must run on the main thread"))?;
+    let _status_item = status_item::StatusItem::install(mtm);
+
+    // Auto-open when either grant is missing: without Accessibility the
+    // companion fails silently, and a first-run user has no reason to
+    // go hunting in the menu.
+    onboarding::show_if_needed(mtm);
 
     if cfg.overlay.enable {
         let overlay = overlay::Overlay::new(cfg.overlay.duration_ms);

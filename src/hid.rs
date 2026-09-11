@@ -282,8 +282,19 @@ impl Manager {
         if rv == kIOReturnSuccess {
             crate::status_item::set_status("Waiting for device…");
         } else {
-            log::error!("IOHIDManagerOpen failed: {}", describe_open_failure(rv));
-            crate::status_item::set_status(short_open_failure(rv));
+            // Ask the permission API directly rather than inferring from
+            // the return code: a denial and an unrelated failure such as
+            // kIOReturnExclusiveAccess are indistinguishable otherwise.
+            let access = crate::permissions::input_monitoring();
+            log::error!(
+                "IOHIDManagerOpen failed: {} (input monitoring: {access:?})",
+                describe_open_failure(rv)
+            );
+            crate::status_item::set_status(if access.is_granted() {
+                short_open_failure(rv)
+            } else {
+                "Needs Input Monitoring"
+            });
             open_retry_timer = Some(install_open_retry_timer(self.raw));
         }
         // Held so the CFRunLoopTimer stays retained for the life of the
@@ -425,12 +436,28 @@ fn install_open_retry_timer(manager: IOHIDManagerRef) -> CFRunLoopTimer {
 extern "C" fn on_open_retry(timer: CFRunLoopTimerRef, info: *mut c_void) {
     let manager = unsafe { *(info as *const IOHIDManagerRef) };
     let rv = unsafe { IOHIDManagerOpen(manager, kIOHIDOptionsTypeNone) };
-    if rv == kIOReturnSuccess {
+    if rv != kIOReturnSuccess {
+        log::debug!("IOHIDManagerOpen retry: {:#x}", rv as u32);
+        return;
+    }
+
+    // A success here is not proof of access. IOHIDManagerOpen returns
+    // success on an already-open manager, and the first call can leave
+    // it open even when it reported kIOReturnExclusiveAccess (which it
+    // does when *any* matched device can't be opened — the internal
+    // Apple trackpad matches the digitizer filter and is held by the
+    // system). Report what the permission API says rather than
+    // implying we can read the device.
+    let access = crate::permissions::input_monitoring();
+    if access.is_granted() {
         log::info!("IOHIDManagerOpen succeeded on retry");
         crate::status_item::set_status("Waiting for device…");
         unsafe { CFRunLoopTimerInvalidate(timer) };
     } else {
-        log::debug!("IOHIDManagerOpen retry: {:#x}", rv as u32);
+        log::warn!(
+            "IOHIDManagerOpen returned success but Input Monitoring is {access:?} —              input reports will not arrive; continuing to retry"
+        );
+        crate::status_item::set_status("Needs Input Monitoring");
     }
 }
 
@@ -460,6 +487,21 @@ pub fn block_shutdown_signals() {
         libc::sigaddset(&mut set, libc::SIGTERM);
         libc::pthread_sigmask(libc::SIG_BLOCK, &set, ptr::null_mut());
     }
+}
+
+/// Ask the process to shut down, exactly as Ctrl+C does.
+///
+/// Must be `kill(getpid(), …)` and NOT `raise(…)`. [`block_shutdown_signals`]
+/// blocks SIGTERM in every thread, and `raise` is *thread-directed*: it
+/// targets the calling thread, where the signal is blocked, so it stays
+/// pending on that thread forever and the `sigwait` worker — parked on a
+/// different thread — never receives it. The UI appears to do nothing.
+///
+/// `kill` on our own pid is process-directed, so the kernel hands it to
+/// any thread that isn't blocking it, which is precisely the sigwait
+/// worker.
+pub fn request_shutdown() {
+    unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
 }
 
 /// Spawn a sigwait worker that stops the main run loop when SIGINT /

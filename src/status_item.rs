@@ -59,13 +59,21 @@ define_class!(
     struct MenuTarget;
 
     impl MenuTarget {
+        #[unsafe(method(openSetup:))]
+        fn open_setup(&self, _sender: Option<&AnyObject>) {
+            // Menu actions always arrive on the main thread.
+            if let Some(mtm) = MainThreadMarker::new() {
+                crate::onboarding::show(mtm);
+            }
+        }
+
         #[unsafe(method(quit:))]
         fn quit(&self, _sender: Option<&AnyObject>) {
             log::info!("quit requested from menu");
             // Straight into the sigwait worker installed by
             // `hid::Manager::run`, which stops the event loop and lets
             // `main` unwind so the firmware gets reverted.
-            unsafe { libc::raise(libc::SIGTERM) };
+            crate::hid::request_shutdown();
         }
     }
 );
@@ -150,6 +158,19 @@ impl StatusItem {
         STATUS_LINE.with(|cell| *cell.borrow_mut() = Some(status));
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+        // Reopening matters: the setup window auto-opens once at launch,
+        // and without this there is no way back to it.
+        let setup = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                mtm.alloc::<NSMenuItem>(),
+                &NSString::from_str("Setup…"),
+                Some(sel!(openSetup:)),
+                &NSString::from_str(""),
+            )
+        };
+        unsafe { setup.setTarget(Some(target.as_ref() as &AnyObject)) };
+        menu.addItem(&setup);
 
         let quit = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
