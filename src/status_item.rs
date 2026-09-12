@@ -302,13 +302,19 @@ impl StatusItem {
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 
-        // An agent has no application menu, so this is the only "About
-        // <App>" there is. Grouped with Quit rather than with the
-        // working items, which is where the application menu puts it.
+        // An agent has no application menu, so this is the only About
+        // there is. Grouped with Quit rather than with the working
+        // items, which is where the application menu puts it.
+        //
+        // "About", not "About Trackpad Companion": the application menu
+        // names the app because it is the menu's own title, but here the
+        // header three items up already says it — and the version too.
+        // The window it opens keeps the full name, since a window title
+        // has no such header to lean on.
         let about = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 mtm.alloc::<NSMenuItem>(),
-                &NSString::from_str("About Trackpad Companion"),
+                &NSString::from_str("About"),
                 Some(sel!(openAbout:)),
                 &NSString::from_str(""),
             )
