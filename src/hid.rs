@@ -161,6 +161,19 @@ unsafe extern "C" {
 /// that reverts them automatically, so they don't need the warning.
 static SPEC_PATH_DEVICE: AtomicBool = AtomicBool::new(false);
 
+thread_local! {
+    /// Description of the active device, for "Copy Diagnostics". Set on
+    /// match, cleared on removal. Thread-local because every HID
+    /// callback and the menu both run on the main thread.
+    static DEVICE_SUMMARY: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// One-line description of the attached device, if any.
+pub fn device_summary() -> Option<String> {
+    DEVICE_SUMMARY.with(|d| d.borrow().clone())
+}
+
 /// Whether a built-in (internal) HID device has been seen. Used to
 /// decide whether there is any fallback pointer at all — on a desktop
 /// Mac there isn't, so quitting strands the user regardless of how
@@ -687,6 +700,20 @@ unsafe extern "C" fn on_device_matched(
 
     crate::status_item::set_status(&format!("Connected — {product}"));
 
+    DEVICE_SUMMARY.with(|d| {
+        *d.borrow_mut() = Some(format!(
+            "{product} vid={:#06x} pid={:#06x}, {} contacts, {:.1}x{:.1} mm, \
+             {} bytes/contact, payload {} bytes",
+            vid.unwrap_or(0) as u16,
+            pid.unwrap_or(0) as u16,
+            layout.contact_slots,
+            layout.physical_x_max_mm,
+            layout.physical_y_max_mm,
+            layout.bytes_per_contact,
+            layout.total_payload_bytes,
+        ))
+    });
+
     // Prefer the RMK vendor control path when supported. For standard
     // Precision Touchpads, discover the Input Mode and optional configuration
     // feature report IDs from the HID descriptor.
@@ -870,6 +897,7 @@ unsafe extern "C" fn on_device_removed(
     );
     log::info!("device removed");
     if bridge.devices.is_empty() {
+        DEVICE_SUMMARY.with(|d| *d.borrow_mut() = None);
         crate::status_item::set_status("Waiting for device…");
     }
 }

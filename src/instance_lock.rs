@@ -17,6 +17,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Another instance already holds the lock.
 ///
@@ -45,6 +46,11 @@ impl std::fmt::Display for AlreadyRunning {
 
 impl std::error::Error for AlreadyRunning {}
 
+/// How long to keep trying for the lock before deciding another
+/// instance really does hold it.
+const ACQUIRE_TIMEOUT: Duration = Duration::from_millis(1500);
+const ACQUIRE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+
 #[derive(Debug)]
 pub struct InstanceLock {
     // Held purely for its Drop side effect: closing the fd releases the
@@ -69,7 +75,37 @@ fn acquire_at(path: &Path) -> Result<InstanceLock> {
         .open(path)
         .with_context(|| format!("open lock file {}", path.display()))?;
 
-    let rv = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    // Retry briefly rather than concluding on the first refusal.
+    //
+    // Two reasons. The practical one: a replacement instance routinely
+    // starts while its predecessor is still shutting down — the
+    // Relaunch button spawns one after a second, and launchd restarts
+    // faster than that — and HID teardown is not instant. Giving up
+    // immediately would have the replacement exit as a duplicate,
+    // leaving nothing running at all, which is exactly the recovery
+    // path start-at-login depends on.
+    //
+    // The other: flock has been observed returning EWOULDBLOCK
+    // transiently right after a release under load. That showed up as a
+    // test failing about one run in five, where a lock re-acquired
+    // immediately after being dropped in the same process was refused.
+    let mut rv;
+    let deadline = std::time::Instant::now() + ACQUIRE_TIMEOUT;
+    loop {
+        rv = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rv == 0 {
+            break;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(ACQUIRE_RETRY_INTERVAL);
+    }
+
     if rv != 0 {
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
@@ -125,6 +161,8 @@ mod tests {
         let path = dir.join("instance.lock");
 
         let first = acquire_at(&path).expect("first acquire");
+        // Held throughout, so this waits out ACQUIRE_TIMEOUT and then
+        // reports contention — the behaviour a real second instance sees.
         let err = acquire_at(&path).expect_err("second acquire must fail");
         let msg = format!("{err:#}");
         assert!(
@@ -159,9 +197,17 @@ mod tests {
     }
 
     fn tempdir() -> PathBuf {
+        // A counter, not just a timestamp: these tests run in parallel
+        // threads and macOS's clock granularity is coarser than a
+        // nanosecond, so two of them starting together could land on
+        // the same directory and then fight over one lock file. That
+        // made `second_acquire_fails_while_first_held` fail about one
+        // run in five.
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let base = std::env::temp_dir().join(format!(
-            "mtc-instance-lock-test-{}-{}",
+            "mtc-instance-lock-test-{}-{}-{}",
             std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

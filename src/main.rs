@@ -29,6 +29,7 @@ mod launch_agent;
 mod onboarding;
 mod output;
 mod overlay;
+mod pause;
 mod permissions;
 mod report;
 mod scan_clock;
@@ -210,8 +211,27 @@ fn run<O: output::Output + 'static>(
             .apply_config(cursor_accel(new_cfg), output_config(new_cfg));
     });
 
+    // Pausing feeds one empty frame so anything in flight ends cleanly,
+    // rather than leaving the engine mid-gesture.
+    let settle_state = Rc::clone(&state);
+    pause::set_settle_hook(move || {
+        settle_state.borrow_mut().on_frame_at(
+            report::Frame {
+                contacts: Vec::new(),
+                scan_time_100us: 0,
+                button: false,
+            },
+            time::Timestamp::now(),
+        );
+    });
+
     let frame_state = Rc::clone(&state);
-    manager.run(move |frame, ts| frame_state.borrow_mut().on_frame_at(frame, ts))
+    manager.run(move |frame, ts| {
+        if pause::is_paused() {
+            return;
+        }
+        frame_state.borrow_mut().on_frame_at(frame, ts)
+    })
 }
 
 /// Flatten the TOML config into the emitter's runtime settings. Called

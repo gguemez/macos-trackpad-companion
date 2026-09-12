@@ -21,8 +21,8 @@ use objc2::runtime::{AnyObject, NSObject};
 use objc2::{AnyThread, MainThreadMarker, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSAlertThirdButtonReturn,
-    NSControlStateValueOff, NSControlStateValueOn, NSImage, NSMenu, NSMenuItem, NSStatusBar,
-    NSStatusItem, NSVariableStatusItemLength,
+    NSControlStateValueOff, NSControlStateValueOn, NSImage, NSMenu, NSMenuItem, NSPasteboard,
+    NSPasteboardTypeString, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
 };
 use objc2_foundation::{NSData, NSSize, NSString};
 
@@ -66,6 +66,45 @@ define_class!(
             // Menu actions always arrive on the main thread.
             if let Some(mtm) = MainThreadMarker::new() {
                 crate::onboarding::show(mtm);
+            }
+        }
+
+        #[unsafe(method(togglePause:))]
+        fn toggle_pause(&self, sender: Option<&AnyObject>) {
+            // Pausing has the same consequence as quitting for a pad
+            // that only works while we drive it — except you also need
+            // a pointer to un-pause. Ask first.
+            if !crate::pause::is_paused() && no_pointer_fallback() {
+                if let Some(mtm) = MainThreadMarker::new() {
+                    if !confirm_pointer_loss(mtm, "Pause and lose the trackpad?", "Pause Anyway") {
+                        return;
+                    }
+                }
+            }
+            let paused = crate::pause::toggle();
+            if let Some(item) = sender.and_then(|s| s.downcast_ref::<NSMenuItem>()) {
+                item.setTitle(&NSString::from_str(if paused {
+                    "Resume"
+                } else {
+                    "Pause"
+                }));
+            }
+            set_status(if paused { "Paused" } else { "Running" });
+        }
+
+        #[unsafe(method(copyDiagnostics:))]
+        fn copy_diagnostics(&self, _sender: Option<&AnyObject>) {
+            let text = diagnostics();
+            let pb = NSPasteboard::generalPasteboard();
+            pb.clearContents();
+            let ok = unsafe {
+                pb.setString_forType(&NSString::from_str(&text), NSPasteboardTypeString)
+            };
+            if ok {
+                log::info!("diagnostics copied to the clipboard");
+                set_status("Diagnostics copied");
+            } else {
+                log::error!("failed to write diagnostics to the clipboard");
             }
         }
 
@@ -119,11 +158,9 @@ define_class!(
             // a pad that goes dormant without us, and no usable built-in
             // trackpad to fall back on — either because macOS is
             // ignoring it, or because this Mac hasn't got one.
-            let no_fallback = crate::system_prefs::builtin_trackpad_ignored()
-                || !crate::hid::builtin_trackpad_present();
-            if crate::hid::quit_would_strand_device() && no_fallback {
+            if no_pointer_fallback() {
                 if let Some(mtm) = MainThreadMarker::new() {
-                    if !confirm_quit(mtm) {
+                    if !confirm_pointer_loss(mtm, "Quit and lose the trackpad?", "Quit Anyway") {
                         log::info!("quit cancelled");
                         return;
                     }
@@ -146,29 +183,86 @@ fn set_check(item: &NSMenuItem, on: bool) {
     });
 }
 
-/// Warn before a quit that would leave no working pointer.
+/// Whether stopping now would leave the machine with no usable pointer:
+/// a pad that only responds while we drive it, and no built-in trackpad
+/// to fall back on — either because macOS is ignoring it, or because
+/// this Mac hasn't got one.
+fn no_pointer_fallback() -> bool {
+    crate::hid::quit_would_strand_device()
+        && (crate::system_prefs::builtin_trackpad_ignored()
+            || !crate::hid::builtin_trackpad_present())
+}
+
+/// Everything worth pasting into a bug report.
+fn diagnostics() -> String {
+    let perms = crate::permissions::State::current();
+    let os = std::process::Command::new("/usr/bin/sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".into());
+
+    format!(
+        "macos-trackpad-companion {version}
+         macOS: {os}
+         executable: {exe}
+         
+         input monitoring: {im:?}
+         accessibility: {ax}
+         ignores built-in trackpad when external present: {ignore}
+         built-in trackpad seen: {builtin}
+         
+         device: {device}
+         paused: {paused}
+         start at login: {login}
+         
+         config: {config}
+         log: {log}
+",
+        version = env!("CARGO_PKG_VERSION"),
+        os = os,
+        exe = std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "?".into()),
+        im = perms.input_monitoring,
+        ax = perms.accessibility,
+        ignore = crate::system_prefs::builtin_trackpad_ignored(),
+        builtin = crate::hid::builtin_trackpad_present(),
+        device = crate::hid::device_summary().unwrap_or_else(|| "none attached".into()),
+        paused = crate::pause::is_paused(),
+        login = crate::launch_agent::is_enabled(),
+        config = crate::settings::config_path_display(),
+        log = crate::config_watch::log_file_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "stderr".into()),
+    )
+}
+
+/// Warn before an action that would leave no working pointer.
 ///
 /// Returns true if the user chose to go ahead.
-fn confirm_quit(mtm: MainThreadMarker) -> bool {
+fn confirm_pointer_loss(mtm: MainThreadMarker, title: &str, proceed: &str) -> bool {
     // Bring the app forward so the alert isn't stranded behind other
     // windows — an accessory app's modal can otherwise be easy to miss.
     app_kit::activate_for_window(mtm);
 
     let alert = NSAlert::new(mtm);
     alert.setAlertStyle(NSAlertStyle::Warning);
-    alert.setMessageText(&NSString::from_str("Quit and lose the trackpad?"));
+    alert.setMessageText(&NSString::from_str(title));
     alert.setInformativeText(&NSString::from_str(concat!(
         "This trackpad stops responding while Trackpad Companion isn't running, ",
         "and macOS may be ignoring your built-in trackpad because an external ",
         "pointing device is attached — so quitting can leave you with no pointer ",
         "at all.\n\n",
-        "It works again as soon as the companion is restarted; unplugging is not ",
-        "required.\n\n",
+        "It works again as soon as the companion is driving it again; unplugging ",
+        "is not required. Control-F2 focuses the menu bar if you need to reach ",
+        "this menu without a pointer.\n\n",
         "To keep the built-in trackpad available, turn off “Ignore built-in ",
         "trackpad when mouse or wireless trackpad is present” in Accessibility > ",
         "Pointer Control.",
     )));
-    alert.addButtonWithTitle(&NSString::from_str("Quit Anyway"));
+    alert.addButtonWithTitle(&NSString::from_str(proceed));
     alert.addButtonWithTitle(&NSString::from_str("Cancel"));
     alert.addButtonWithTitle(&NSString::from_str("Open Accessibility Settings…"));
 
@@ -286,6 +380,28 @@ impl StatusItem {
         };
         unsafe { settings.setTarget(Some(target.as_ref() as &AnyObject)) };
         menu.addItem(&settings);
+
+        let pause_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                mtm.alloc::<NSMenuItem>(),
+                &NSString::from_str(if crate::pause::is_paused() { "Resume" } else { "Pause" }),
+                Some(sel!(togglePause:)),
+                &NSString::from_str(""),
+            )
+        };
+        unsafe { pause_item.setTarget(Some(target.as_ref() as &AnyObject)) };
+        menu.addItem(&pause_item);
+
+        let diag = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                mtm.alloc::<NSMenuItem>(),
+                &NSString::from_str("Copy Diagnostics"),
+                Some(sel!(copyDiagnostics:)),
+                &NSString::from_str(""),
+            )
+        };
+        unsafe { diag.setTarget(Some(target.as_ref() as &AnyObject)) };
+        menu.addItem(&diag);
 
         let login = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(

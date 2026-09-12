@@ -68,6 +68,13 @@ pub fn set_config_path(path: PathBuf) {
     CONFIG_PATH.with(|p| *p.borrow_mut() = Some(path));
 }
 
+/// The config file being edited, for diagnostics output.
+pub fn config_path_display() -> String {
+    config_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "unknown".into())
+}
+
 fn config_path() -> Option<PathBuf> {
     CONFIG_PATH.with(|p| p.borrow().clone())
 }

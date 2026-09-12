@@ -16,6 +16,7 @@ pub mod launch_agent;
 pub mod onboarding;
 pub mod output;
 pub mod overlay;
+pub mod pause;
 pub mod permissions;
 pub mod report;
 pub mod scan_clock;
