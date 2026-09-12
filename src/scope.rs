@@ -127,6 +127,8 @@ pub struct Tuning {
     pub cursor_accel_exponent: f64,
     pub cursor_accel_ref: f64,
     pub scroll_sensitivity: f64,
+    pub scroll_accel_exponent: f64,
+    pub scroll_accel_ref: f64,
 }
 
 impl Tuning {
@@ -138,12 +140,23 @@ impl Tuning {
         Self::from_config(&crate::config::Config::default())
     }
 
+    /// The four scroll numbers in the shape the emitter's curve wants.
+    fn scroll_curve(&self) -> crate::output::ScrollAccel {
+        crate::output::ScrollAccel {
+            px_per_mm_at_ref: self.scroll_sensitivity,
+            exponent: self.scroll_accel_exponent,
+            ref_mm_per_sec: self.scroll_accel_ref,
+        }
+    }
+
     fn from_config(cfg: &crate::config::Config) -> Self {
         Self {
             cursor_sensitivity: cfg.cursor.sensitivity,
             cursor_accel_exponent: cfg.cursor.accel_exponent,
             cursor_accel_ref: cfg.cursor.accel_ref,
             scroll_sensitivity: cfg.scroll.sensitivity,
+            scroll_accel_exponent: cfg.scroll.accel_exponent,
+            scroll_accel_ref: cfg.scroll.accel_ref,
         }
     }
 }
@@ -393,6 +406,9 @@ define_class!(
                 Some('\u{F703}') => {
                     with_transport(|t| t.step(stride));
                 }
+                // Escape. A diagnostic window you opened to glance at
+                // should close without aiming at anything.
+                Some('\u{1b}') => close(),
                 _ => handled = false,
             }
             if !handled {
@@ -443,6 +459,21 @@ define_class!(
             slider_moved();
         }
 
+        #[unsafe(method(tuneScrollExponent:))]
+        fn tune_scroll_exponent(&self, _s: Option<&AnyObject>) {
+            slider_moved();
+        }
+
+        #[unsafe(method(tuneScrollAccelRef:))]
+        fn tune_scroll_accel_ref(&self, _s: Option<&AnyObject>) {
+            slider_moved();
+        }
+
+        #[unsafe(method(closeScope:))]
+        fn close_scope(&self, _s: Option<&AnyObject>) {
+            close();
+        }
+
         #[unsafe(method(scrub:))]
         fn scrub(&self, _s: Option<&AnyObject>) {
             WINDOW.with(|cell| {
@@ -455,8 +486,20 @@ define_class!(
     }
 );
 
+/// Close the window the same way the title bar's own button does, so
+/// the teardown path — flushing a pending write, dropping the redraw
+/// timer, releasing the activation policy — is the one already proven
+/// by the red button rather than a second copy of it.
+fn close() {
+    WINDOW.with(|cell| {
+        if let Some(w) = cell.borrow().as_ref() {
+            w.window.performClose(None);
+        }
+    });
+}
+
 /// Every tuning slider lands here; which one moved doesn't matter,
-/// since all four are written together.
+/// since all are written together.
 fn slider_moved() {
     WINDOW.with(|cell| {
         if let Some(w) = cell.borrow_mut().as_mut() {
@@ -493,6 +536,10 @@ struct TuneUi {
     accel_ref_value: Retained<NSTextField>,
     scroll: Retained<NSSlider>,
     scroll_value: Retained<NSTextField>,
+    scroll_exponent: Retained<NSSlider>,
+    scroll_exponent_value: Retained<NSTextField>,
+    scroll_accel_ref: Retained<NSSlider>,
+    scroll_accel_ref_value: Retained<NSTextField>,
 }
 
 impl TuneUi {
@@ -504,6 +551,8 @@ impl TuneUi {
             cursor_accel_exponent: crate::settings::round2(self.exponent.doubleValue()),
             cursor_accel_ref: crate::settings::round1(self.accel_ref.doubleValue()),
             scroll_sensitivity: crate::settings::round1(self.scroll.doubleValue()),
+            scroll_accel_exponent: crate::settings::round2(self.scroll_exponent.doubleValue()),
+            scroll_accel_ref: crate::settings::round1(self.scroll_accel_ref.doubleValue()),
         }
     }
 
@@ -512,6 +561,8 @@ impl TuneUi {
         self.exponent.setDoubleValue(t.cursor_accel_exponent);
         self.accel_ref.setDoubleValue(t.cursor_accel_ref);
         self.scroll.setDoubleValue(t.scroll_sensitivity);
+        self.scroll_exponent.setDoubleValue(t.scroll_accel_exponent);
+        self.scroll_accel_ref.setDoubleValue(t.scroll_accel_ref);
         self.relabel(t);
     }
 
@@ -524,6 +575,10 @@ impl TuneUi {
             .setStringValue(&NSString::from_str(&format!("{:.0} mm/s", t.cursor_accel_ref)));
         self.scroll_value
             .setStringValue(&NSString::from_str(&format!("{:.1} px/mm", t.scroll_sensitivity)));
+        self.scroll_exponent_value
+            .setStringValue(&NSString::from_str(&format!("{:.2}", t.scroll_accel_exponent)));
+        self.scroll_accel_ref_value
+            .setStringValue(&NSString::from_str(&format!("{:.0} mm/s", t.scroll_accel_ref)));
     }
 }
 
@@ -533,6 +588,7 @@ struct Window {
     timer: Option<CFRunLoopTimer>,
     transport: Option<TransportUi>,
     tune: Option<TuneUi>,
+    _close: Option<Retained<NSButton>>,
     /// Pending debounced write of the four tunables. The engine already
     /// has them; this is only about not rewriting the file sixty times
     /// a second during a drag.
@@ -620,12 +676,12 @@ impl Window {
             };
             slider.setFrame(NSRect::new(
                 NSPoint::new(192.0, 8.0),
-                NSSize::new(CANVAS_W - 192.0 - 180.0, 24.0),
+                NSSize::new(CANVAS_W - 192.0 - 292.0, 24.0),
             ));
             slider.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
             let label = NSTextField::labelWithString(&NSString::from_str(""), mtm);
             label.setFrame(NSRect::new(
-                NSPoint::new(CANVAS_W - 172.0, 10.0),
+                NSPoint::new(CANVAS_W - 284.0, 10.0),
                 NSSize::new(160.0, 18.0),
             ));
             label.setFont(Some(&NSFont::monospacedSystemFontOfSize_weight(11.0, 0.0)));
@@ -644,18 +700,54 @@ impl Window {
 
         let tune = has_tuning.then(|| Self::build_tuning(mtm, &content, &actions));
 
+        // Bottom of the tuning column when there is one, otherwise the
+        // right-hand end of the transport row. Both are the window's
+        // bottom-right, which is where a dismiss lives on this
+        // platform; it just depends which row is down there.
+        let close_btn = if has_tuning {
+            Some(push(
+                mtm,
+                "Close",
+                &actions,
+                sel!(closeScope:),
+                CANVAS_W + TUNE_W - 16.0 - 88.0,
+                16.0,
+                88.0,
+            ))
+        } else if has_transport {
+            Some(push(
+                mtm,
+                "Close",
+                &actions,
+                sel!(closeScope:),
+                CANVAS_W - 104.0,
+                8.0,
+                88.0,
+            ))
+        } else {
+            // Neither row exists, so there is nowhere to put a button
+            // that wouldn't sit on top of the canvas. The title bar's
+            // own close button still works.
+            None
+        };
+        if let Some(b) = close_btn.as_ref() {
+            b.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
+            content.addSubview(b);
+        }
+
         let mut me = Self {
             window,
             view,
             timer: None,
             transport,
             tune,
+            _close: close_btn,
             flush_timer: None,
             seen_mtime: None,
             last_config_poll: 0.0,
             _actions: actions,
         };
-        me.reload_from_file();
+        me.adopt_file(false);
         me
     }
 
@@ -759,6 +851,22 @@ impl Window {
             sel!(tuneScroll:),
             &mut y,
         );
+        let (scroll_exponent, scroll_exponent_value) = row(
+            mtm,
+            "Acceleration",
+            crate::settings::EXPONENT_MIN,
+            crate::settings::EXPONENT_MAX,
+            sel!(tuneScrollExponent:),
+            &mut y,
+        );
+        let (scroll_accel_ref, scroll_accel_ref_value) = row(
+            mtm,
+            "Accel reference",
+            crate::settings::ACCEL_REF_MIN,
+            crate::settings::ACCEL_REF_MAX,
+            sel!(tuneScrollAccelRef:),
+            &mut y,
+        );
 
         for f in [&cursor_header, &scroll_header, &title, &note] {
             f.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
@@ -775,6 +883,10 @@ impl Window {
             accel_ref_value,
             scroll,
             scroll_value,
+            scroll_exponent,
+            scroll_exponent_value,
+            scroll_accel_ref,
+            scroll_accel_ref_value,
         }
     }
 
@@ -826,14 +938,28 @@ impl Window {
             return;
         };
         let v = ui.values();
-        crate::settings::edit(|c| {
+        let written = crate::settings::edit(|c| {
             c.set_f64(&["cursor"], "sensitivity", v.cursor_sensitivity)?;
             c.set_f64(&["cursor"], "accel_exponent", v.cursor_accel_exponent)?;
             c.set_f64(&["cursor"], "accel_ref", v.cursor_accel_ref)?;
             c.set_f64(&["scroll"], "sensitivity", v.scroll_sensitivity)?;
+            c.set_f64(&["scroll"], "accel_exponent", v.scroll_accel_exponent)?;
+            c.set_f64(&["scroll"], "accel_ref", v.scroll_accel_ref)?;
             Ok(())
         });
-        self.seen_mtime = Self::config_mtime();
+        if written {
+            self.seen_mtime = Self::config_mtime();
+            return;
+        }
+        // The engine is running on a value the file refused. Applying
+        // it first is what makes the slider feel instant; leaving it
+        // applied after the write failed would be a divergence nobody
+        // could see — the scope would show one thing, the file another,
+        // and the next reload would silently undo whatever you tuned.
+        // Put the slider and the engine back on what is actually on
+        // disk instead.
+        log::warn!("gesture scope: tuning write failed, reverting to the config file");
+        self.adopt_file(true);
     }
 
     fn config_mtime() -> Option<std::time::SystemTime> {
@@ -844,17 +970,30 @@ impl Window {
 
     /// Adopt what is on disk. Also runs at build time, which is how the
     /// sliders start on the right values.
-    fn reload_from_file(&mut self) {
+    ///
+    /// `to_engine` pushes the values on to the engine as well. Normally
+    /// false: the file watcher is already doing that, and doing it
+    /// twice is only noise. True on the revert path, where the engine
+    /// is the thing that needs correcting and waiting up to a second
+    /// for the watcher would leave it wrong in the meantime.
+    fn adopt_file(&mut self, to_engine: bool) {
         let values = tuning_from_file();
         TUNING.with(|t| t.set(values));
         if let Some(ui) = self.tune.as_ref() {
             ui.show(values);
         }
+        if to_engine {
+            LIVE_APPLY.with(|h| {
+                if let Some(f) = h.borrow().as_ref() {
+                    f(values);
+                }
+            });
+        }
         self.seen_mtime = Self::config_mtime();
     }
 
     fn present(&mut self, mtm: MainThreadMarker) {
-        self.reload_from_file();
+        self.adopt_file(false);
         app_kit::activate_for_window(mtm);
         self.window.center();
         self.window.makeKeyAndOrderFront(None);
@@ -903,7 +1042,7 @@ impl Window {
         if self.flush_timer.is_none() && now - self.last_config_poll >= CONFIG_POLL_SECS {
             self.last_config_poll = now;
             if Self::config_mtime() != self.seen_mtime {
-                self.reload_from_file();
+                self.adopt_file(false);
             }
         }
 
@@ -1575,14 +1714,15 @@ fn draw_two_finger(area: NSRect, top: f64, m: &TwoFingerMetrics, mono: &NSFont) 
         // copy of the formula — the same rule as everything else here.
         let t = current_tuning();
         let px_per_sec =
-            crate::output::accelerate_scroll(m.scroll_speed_mm_per_sec, t.scroll_sensitivity);
+            crate::output::accelerate_scroll(m.scroll_speed_mm_per_sec, t.scroll_curve());
         text(
             &format!(
-                "scroll  {:5.0} mm/s → {:6.0} px/s    effective {:5.1} px/mm   (set {:.1} px/mm)",
+                "scroll  {:5.0} mm/s → {:6.0} px/s    effective {:5.1} px/mm   (set {:.1} px/mm at {:.0} mm/s)",
                 m.scroll_speed_mm_per_sec,
                 px_per_sec,
                 px_per_sec / m.scroll_speed_mm_per_sec,
                 t.scroll_sensitivity,
+                t.scroll_accel_ref,
             ),
             x,
             y,
@@ -1768,4 +1908,225 @@ fn draw_lock(area: NSRect, top: f64, lock: &LockRecord, past: bool, mono: &NSFon
         mono,
         &body_color,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gesture::PadGeometry;
+
+    // The drawing can't be tested without a screen, but the state it
+    // draws from can — and this is where a wrong answer is invisible.
+    // The ghost flag in particular: if it ever inverted, the lock
+    // banner would claim a finished gesture is still live, which is
+    // exactly the thing it was added to stop doing.
+
+    fn snap(kind: GestureKind, contacts: &[(u8, f64, f64)]) -> Snapshot {
+        Snapshot {
+            pad: Some(PadGeometry {
+                width_mm: 200.0,
+                height_mm: 120.0,
+            }),
+            kind,
+            button: false,
+            physical_drag: false,
+            contacts: contacts
+                .iter()
+                .map(|&(id, x, y)| ContactTrack {
+                    id,
+                    x_mm: x,
+                    y_mm: y,
+                    down_x_mm: x,
+                    down_y_mm: y,
+                    max_move_mm: 0.0,
+                    age: Duration::from_millis(10),
+                    confidence: true,
+                })
+                .collect(),
+            since_start: Duration::from_millis(120),
+            max_move_mm: 2.0,
+            tap_window_open: false,
+            two_finger: None,
+            multi: None,
+            cursor_accel: crate::gesture::CursorAccel::default(),
+            cursor_speed_mm_per_sec: None,
+        }
+    }
+
+    fn metrics() -> TwoFingerMetrics {
+        TwoFingerMetrics {
+            distance_mm: 24.0,
+            initial_distance_mm: 20.0,
+            angle_rad: 0.1,
+            angle_delta_rad: 0.02,
+            common_mm: 0.2,
+            differential_mm: 2.0,
+            alignment: -0.9,
+            balance: 0.8,
+            travel_mm: (2.0, 2.1),
+            pan_raw: 0.5,
+            pinch_raw: 5.0,
+            rot_raw: 0.3,
+            pan: 0.0,
+            pinch: 5.0,
+            rot: 0.3,
+            margin_ok: false,
+            balance_ok: true,
+            aligned: false,
+            pan_qualified: false,
+            pinch_rot_admissible: true,
+            pinch_admitted: true,
+            rotate_admitted: true,
+            lock_deferred: false,
+            scroll_speed_mm_per_sec: 0.0,
+        }
+    }
+
+    #[test]
+    fn a_track_follows_its_contact() {
+        let mut st = ScopeState::default();
+        st.ingest(&snap(GestureKind::OneFinger, &[(3, 10.0, 10.0)]));
+        st.ingest(&snap(GestureKind::OneFinger, &[(3, 12.0, 10.0)]));
+        st.ingest(&snap(GestureKind::OneFinger, &[(3, 14.0, 10.0)]));
+        assert_eq!(st.tracks.len(), 1);
+        assert_eq!(st.tracks[0].id, 3);
+        assert_eq!(st.tracks[0].points.len(), 3);
+    }
+
+    #[test]
+    fn a_resting_contact_does_not_fill_its_track() {
+        let mut st = ScopeState::default();
+        st.ingest(&snap(GestureKind::OneFinger, &[(0, 10.0, 10.0)]));
+        for i in 0..50 {
+            // Well under TRACK_MIN_STEP_MM: chip noise, not motion.
+            let jitter = if i % 2 == 0 { 0.01 } else { -0.01 };
+            st.ingest(&snap(GestureKind::OneFinger, &[(0, 10.0 + jitter, 10.0)]));
+        }
+        assert_eq!(st.tracks[0].points.len(), 1, "noise is not a path");
+    }
+
+    #[test]
+    fn a_track_is_capped_rather_than_growing_without_bound() {
+        let mut st = ScopeState::default();
+        for i in 0..(TRACK_POINTS_MAX + 200) {
+            let x = 10.0 + i as f64 * 0.1;
+            st.ingest(&snap(GestureKind::OneFinger, &[(0, x, 10.0)]));
+        }
+        assert_eq!(st.tracks[0].points.len(), TRACK_POINTS_MAX);
+        // The cap drops the oldest, so the live end of the path is
+        // always what stays on screen.
+        let last = *st.tracks[0].points.last().unwrap();
+        assert!(last.0 > 80.0, "{last:?}");
+    }
+
+    #[test]
+    fn lifting_ghosts_the_tracks_and_the_next_touch_clears_them() {
+        let mut st = ScopeState::default();
+        st.ingest(&snap(GestureKind::OneFinger, &[(0, 10.0, 10.0)]));
+        st.ingest(&snap(GestureKind::OneFinger, &[(0, 20.0, 10.0)]));
+        assert!(!st.ghost, "fingers are still down");
+
+        st.ingest(&snap(GestureKind::Idle, &[]));
+        assert!(st.ghost, "the gesture is over but still worth reading");
+        assert_eq!(st.tracks.len(), 1, "a lift must not erase what happened");
+
+        st.ingest(&snap(GestureKind::OneFinger, &[(1, 50.0, 50.0)]));
+        assert!(!st.ghost);
+        assert_eq!(st.tracks.len(), 1, "the new touch starts a clean slate");
+        assert_eq!(st.tracks[0].id, 1);
+    }
+
+    #[test]
+    fn idle_frames_before_any_touch_do_not_ghost() {
+        let mut st = ScopeState::default();
+        st.ingest(&snap(GestureKind::Idle, &[]));
+        st.ingest(&snap(GestureKind::Idle, &[]));
+        assert!(!st.ghost, "nothing has happened yet to be in the past");
+    }
+
+    #[test]
+    fn a_lock_is_latched_with_the_scores_of_the_frame_it_fired() {
+        let mut st = ScopeState::default();
+        st.ingest(&snap(GestureKind::TwoFingerUnclassified, &[(0, 10.0, 10.0), (1, 30.0, 10.0)]));
+        assert!(st.lock.is_none(), "nothing has locked yet");
+
+        let mut locking = snap(GestureKind::TwoFingerPinchAndRotate, &[(0, 8.0, 10.0), (1, 32.0, 10.0)]);
+        locking.two_finger = Some(metrics());
+        st.ingest(&locking);
+
+        let lock = st.lock.as_ref().expect("the lock is latched");
+        assert_eq!(lock.kind, GestureKind::TwoFingerPinchAndRotate);
+        assert_eq!(lock.metrics.pinch_raw, 5.0);
+        assert_eq!(lock.after, Duration::from_millis(120));
+
+        // Scores keep climbing after the lock; the banner must keep
+        // showing what actually crossed, not the latest reading.
+        let mut later = snap(GestureKind::TwoFingerPinchAndRotate, &[(0, 2.0, 10.0), (1, 38.0, 10.0)]);
+        let mut grown = metrics();
+        grown.pinch_raw = 40.0;
+        later.two_finger = Some(grown);
+        st.ingest(&later);
+        assert_eq!(st.lock.as_ref().unwrap().metrics.pinch_raw, 5.0);
+    }
+
+    #[test]
+    fn a_lock_resumed_after_a_partial_lift_is_latched_too() {
+        // The engine can re-enter a locked kind straight from OneFinger
+        // when a dropped contact comes back inside the rejoin window.
+        // That is a lock the scope has to show, and it arrives by a
+        // different transition than a fresh one.
+        let mut st = ScopeState::default();
+        st.ingest(&snap(GestureKind::OneFinger, &[(0, 10.0, 10.0)]));
+        let mut rejoined = snap(GestureKind::TwoFingerPan, &[(0, 10.0, 12.0), (1, 30.0, 12.0)]);
+        rejoined.two_finger = Some(metrics());
+        st.ingest(&rejoined);
+
+        let lock = st.lock.as_ref().expect("a resumed lock still latches");
+        assert_eq!(lock.kind, GestureKind::TwoFingerPan);
+    }
+
+    #[test]
+    fn a_new_gesture_clears_the_previous_lock() {
+        let mut st = ScopeState::default();
+        let mut locking = snap(GestureKind::TwoFingerPan, &[(0, 10.0, 10.0), (1, 30.0, 10.0)]);
+        locking.two_finger = Some(metrics());
+        st.ingest(&locking);
+        assert!(st.lock.is_some());
+
+        st.ingest(&snap(GestureKind::Idle, &[]));
+        assert!(st.lock.is_some(), "still readable after the fingers lift");
+
+        st.ingest(&snap(GestureKind::OneFinger, &[(2, 60.0, 60.0)]));
+        assert!(st.lock.is_none(), "a new gesture is not the old one");
+    }
+
+    #[test]
+    fn the_fallback_tuning_is_the_documented_defaults() {
+        // The canvas draws a curve before the config file has been
+        // read; if this drifted from `Config::default()` it would draw
+        // a curve nobody is running.
+        let t = Tuning::fallback();
+        let cfg = crate::config::Config::default();
+        assert_eq!(t.cursor_sensitivity, cfg.cursor.sensitivity);
+        assert_eq!(t.cursor_accel_exponent, cfg.cursor.accel_exponent);
+        assert_eq!(t.cursor_accel_ref, cfg.cursor.accel_ref);
+        assert_eq!(t.scroll_sensitivity, cfg.scroll.sensitivity);
+        assert_eq!(t.scroll_accel_exponent, cfg.scroll.accel_exponent);
+        assert_eq!(t.scroll_accel_ref, cfg.scroll.accel_ref);
+    }
+
+    #[test]
+    fn the_scroll_curve_crosses_linear_at_its_reference() {
+        // The property the readout claims: at `accel_ref`, effective
+        // px/mm equals the sensitivity slider's value.
+        let t = Tuning::fallback();
+        let v = t.scroll_accel_ref;
+        let px_per_sec = crate::output::accelerate_scroll(v, t.scroll_curve());
+        assert!(
+            (px_per_sec / v - t.scroll_sensitivity).abs() < 1e-9,
+            "{} vs {}",
+            px_per_sec / v,
+            t.scroll_sensitivity
+        );
+    }
 }

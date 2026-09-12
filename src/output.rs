@@ -79,11 +79,40 @@ const MOMENTUM_SEED_MM_PER_SEC: f64 = 25.0;
 /// scroll speed). Below the reference, curve is sub-linear → slow
 /// motion is slower than linear. Above it, super-linear → fast motion
 /// gets amplified.
+/// Defaults for [`ScrollAccel`]. The reference velocity is ~1 mm per
+/// chip frame on a 60 Hz pad, which feels "typical" during deliberate
+/// panning; at that velocity the curve's pixel rate equals
+/// `sensitivity × velocity`.
 const SCROLL_CURVE_EXPONENT: f64 = 1.3;
-/// Reference velocity (mm/s). At this velocity, the curve's pixel rate
-/// equals `scroll_accel × velocity`; ~1 mm per chip frame on a 60 Hz
-/// pad, which feels "typical" to the user during deliberate panning.
 const SCROLL_CURVE_REF_MM_PER_SEC: f64 = 60.0;
+
+/// The scroll-acceleration curve, shaped exactly like
+/// [`crate::gesture::CursorAccel`].
+///
+/// These two shape parameters used to be constants while the cursor's
+/// equivalents were settings — the same curve, the same rationale in
+/// both comments, exposed on one side only. A value described in its
+/// own comment as what "feels typical to the user" is a preference,
+/// and preferences belong in the config.
+#[derive(Clone, Copy, Debug)]
+pub struct ScrollAccel {
+    /// Screen pixels per millimetre of finger motion, at
+    /// [`Self::ref_mm_per_sec`].
+    pub px_per_mm_at_ref: f64,
+    pub exponent: f64,
+    /// Velocity at which the curve crosses the plain linear feel.
+    pub ref_mm_per_sec: f64,
+}
+
+impl Default for ScrollAccel {
+    fn default() -> Self {
+        Self {
+            px_per_mm_at_ref: 20.0,
+            exponent: SCROLL_CURVE_EXPONENT,
+            ref_mm_per_sec: SCROLL_CURVE_REF_MM_PER_SEC,
+        }
+    }
+}
 
 /// Bounds of the display containing `point`, falling back to the main
 /// display if the point isn't on any (e.g. just past a screen edge —
@@ -105,15 +134,15 @@ fn display_bounds_for(point: CGPoint) -> CGRect {
 /// Public so the gesture scope can show what `scroll.sensitivity` is
 /// doing to a real scroll, rather than reimplementing the curve and
 /// being wrong about it later.
-pub fn accelerate_scroll(v_mm_per_sec: f64, scroll_accel: f64) -> f64 {
+pub fn accelerate_scroll(v_mm_per_sec: f64, curve: ScrollAccel) -> f64 {
     let mag = v_mm_per_sec.abs();
     if mag == 0.0 {
         return 0.0;
     }
-    // LINEAR = scroll_accel × REF^(1 - EXPONENT). At v == REF this gives
-    // pixels_per_sec = scroll_accel × REF (matches linear feel).
-    let linear = scroll_accel * SCROLL_CURVE_REF_MM_PER_SEC.powf(1.0 - SCROLL_CURVE_EXPONENT);
-    v_mm_per_sec.signum() * linear * mag.powf(SCROLL_CURVE_EXPONENT)
+    // LINEAR = sensitivity × REF^(1 - EXPONENT). At v == REF this gives
+    // pixels_per_sec = sensitivity × REF (matches linear feel).
+    let linear = curve.px_per_mm_at_ref * curve.ref_mm_per_sec.powf(1.0 - curve.exponent);
+    v_mm_per_sec.signum() * linear * mag.powf(curve.exponent)
 }
 
 // ---------- Public CGEvent constants (mirrored from CGEventTypes.h) ----------
@@ -760,8 +789,10 @@ fn synthesize_gesture_event(
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Screen pixels emitted per millimeter of finger motion in scroll mode.
-    pub scroll_accel: f64,
+    /// The scroll-acceleration curve: pixels per millimetre, the
+    /// exponent that shapes it, and the velocity at which the two
+    /// agree.
+    pub scroll_accel: ScrollAccel,
     /// Natural scrolling: finger-down on the pad scrolls content down on
     /// the screen (the macOS default since 10.7). False for the legacy
     /// "wheel" convention where finger-down moves the scrollbar down /
@@ -1105,7 +1136,7 @@ struct Momentum {
     /// Mirror of `Config::scroll_accel` — the only Config field the
     /// momentum integrator reads. Narrowed so Momentum doesn't have to
     /// hold the whole (now `Vec<String>`-bearing) Config.
-    scroll_accel: Cell<f64>,
+    scroll_accel: Cell<ScrollAccel>,
     /// Same persistent CGEventSource the Emitter holds. Aliased here
     /// (not retained separately) because the timer callback needs to
     /// post events but doesn't have the Emitter handy. Lifetime is the

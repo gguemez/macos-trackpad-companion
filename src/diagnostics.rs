@@ -29,7 +29,9 @@ pub fn text() -> String {
          start at login: {login}\n\
          \n\
          config: {config}\n\
-         log: {log}\n",
+         log: {log}\n\
+         \n\
+         {settings}",
         version = env!("CARGO_PKG_VERSION"),
         os = os,
         exe = std::env::current_exe()
@@ -46,5 +48,50 @@ pub fn text() -> String {
         log = crate::config_watch::log_file_path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "stderr".into()),
+        settings = settings(),
+    )
+}
+
+/// The config values themselves, not just the path to them.
+///
+/// Load-bearing since the gesture scope started changing four of these
+/// while you gesture: someone can tune by feel, hit something odd and
+/// paste this, and without the values there is no way to tell whether
+/// they were running anything like the defaults. Read from the file,
+/// which is where they settle — the scope hands a slider to the engine
+/// first, but writes it behind and reverts if the write fails.
+fn settings() -> String {
+    let Some(path) = crate::settings::config_path() else {
+        return "settings: no config path registered".into();
+    };
+    let cfg = match crate::config::load(Some(&path)) {
+        Ok((cfg, _)) => cfg,
+        Err(e) => return format!("settings: config unreadable: {e:#}"),
+    };
+    format!(
+        "cursor: sensitivity {} exponent {} ref {} mm/s\n\
+         scroll: sensitivity {} exponent {} ref {} mm/s natural {}\n\
+         gestures: pinch {:?} rotate {:?}\n\
+         swipe: horizontal {:?} via {:?}, vertical {:?} via {:?}\n\
+         overlay: {}\n\
+         device filter: vid {:?} pid {:?}\n\
+         log level: {}",
+        cfg.cursor.sensitivity,
+        cfg.cursor.accel_exponent,
+        cfg.cursor.accel_ref,
+        cfg.scroll.sensitivity,
+        cfg.scroll.accel_exponent,
+        cfg.scroll.accel_ref,
+        cfg.scroll.natural,
+        cfg.gestures.pinch.enable,
+        cfg.gestures.rotate.enable,
+        cfg.gestures.swipe.horizontal.enable,
+        cfg.gestures.swipe.horizontal.backend,
+        cfg.gestures.swipe.vertical.enable,
+        cfg.gestures.swipe.vertical.backend,
+        cfg.overlay.enable,
+        cfg.device.vid,
+        cfg.device.pid,
+        cfg.log.level,
     )
 }

@@ -42,7 +42,7 @@ use crate::config::{self, Config, GestureEnable};
 use crate::config_edit::ConfigFile;
 
 const WINDOW_W: f64 = 520.0;
-const WINDOW_H: f64 = 596.0;
+const WINDOW_H: f64 = 656.0;
 const POLL_SECS: f64 = 1.0;
 /// Quiet period after the last slider movement before the file is
 /// written. Long enough to coalesce a drag, short enough that letting
@@ -91,18 +91,30 @@ pub(crate) fn config_path() -> Option<PathBuf> {
 ///
 /// Shared with the gesture scope, whose sliders write the same keys —
 /// one implementation of "patch the file without eating the comments".
-pub(crate) fn edit(f: impl FnOnce(&mut ConfigFile) -> anyhow::Result<()>) {
+/// Returns whether the file actually took the edit. The settings
+/// window can ignore that — its controls were only ever a view of the
+/// file, so a failed write leaves nothing inconsistent. The gesture
+/// scope cannot: it has already handed the value to the engine, and a
+/// failure there means the engine is running on something the file
+/// never accepted.
+pub(crate) fn edit(f: impl FnOnce(&mut ConfigFile) -> anyhow::Result<()>) -> bool {
     let Some(path) = config_path() else {
         log::error!("settings: no config path registered");
-        return;
+        return false;
     };
     let result = ConfigFile::load(&path).and_then(|mut doc| {
         f(&mut doc)?;
         doc.save()
     });
     match result {
-        Ok(()) => log::debug!("settings written to {}", path.display()),
-        Err(e) => log::error!("settings write failed: {e:#}"),
+        Ok(()) => {
+            log::debug!("settings written to {}", path.display());
+            true
+        }
+        Err(e) => {
+            log::error!("settings write failed: {e:#}");
+            false
+        }
     }
 }
 
@@ -116,6 +128,10 @@ struct Window {
     cursor_accel_ref_value: Retained<NSTextField>,
     scroll_sensitivity: Retained<NSSlider>,
     scroll_sensitivity_value: Retained<NSTextField>,
+    scroll_exponent: Retained<NSSlider>,
+    scroll_exponent_value: Retained<NSTextField>,
+    scroll_accel_ref: Retained<NSSlider>,
+    scroll_accel_ref_value: Retained<NSTextField>,
     natural: Retained<NSButton>,
     pinch: Retained<NSButton>,
     rotate: Retained<NSButton>,
@@ -174,11 +190,29 @@ define_class!(
             });
         }
 
+        #[unsafe(method(scrollExponent:))]
+        fn scroll_exponent(&self, _s: Option<&AnyObject>) {
+            with_window_mut(|w| {
+                let v = round2(w.scroll_exponent.doubleValue());
+                w.scroll_exponent_value.setStringValue(&fmt(v));
+                w.schedule_flush();
+            });
+        }
+
+        #[unsafe(method(scrollAccelRef:))]
+        fn scroll_accel_ref(&self, _s: Option<&AnyObject>) {
+            with_window_mut(|w| {
+                let v = round1(w.scroll_accel_ref.doubleValue());
+                w.scroll_accel_ref_value.setStringValue(&fmt(v));
+                w.schedule_flush();
+            });
+        }
+
         #[unsafe(method(naturalScroll:))]
         fn natural_scroll(&self, _s: Option<&AnyObject>) {
             with_window(|w| {
                 let on = checked(&w.natural);
-                edit(|c| c.set_bool(&["scroll"], "natural", on));
+                let _ = edit(|c| c.set_bool(&["scroll"], "natural", on));
             });
         }
 
@@ -186,7 +220,7 @@ define_class!(
         fn toggle_pinch(&self, _s: Option<&AnyObject>) {
             with_window(|w| {
                 let on = checked(&w.pinch);
-                edit(|c| c.set_str(&["gestures", "pinch"], "enable", on_off(on)));
+                let _ = edit(|c| c.set_str(&["gestures", "pinch"], "enable", on_off(on)));
             });
         }
 
@@ -194,7 +228,7 @@ define_class!(
         fn toggle_rotate(&self, _s: Option<&AnyObject>) {
             with_window(|w| {
                 let on = checked(&w.rotate);
-                edit(|c| c.set_str(&["gestures", "rotate"], "enable", on_off(on)));
+                let _ = edit(|c| c.set_str(&["gestures", "rotate"], "enable", on_off(on)));
             });
         }
 
@@ -202,7 +236,7 @@ define_class!(
         fn toggle_swipe_h(&self, _s: Option<&AnyObject>) {
             with_window(|w| {
                 let on = checked(&w.swipe_h);
-                edit(|c| {
+                let _ = edit(|c| {
                     c.set_str(&["gestures", "swipe", "horizontal"], "enable", on_off(on))
                 });
             });
@@ -212,7 +246,7 @@ define_class!(
         fn toggle_swipe_v(&self, _s: Option<&AnyObject>) {
             with_window(|w| {
                 let on = checked(&w.swipe_v);
-                edit(|c| c.set_str(&["gestures", "swipe", "vertical"], "enable", on_off(on)));
+                let _ = edit(|c| c.set_str(&["gestures", "swipe", "vertical"], "enable", on_off(on)));
             });
         }
 
@@ -220,7 +254,7 @@ define_class!(
         fn toggle_overlay(&self, _s: Option<&AnyObject>) {
             with_window(|w| {
                 let on = checked(&w.overlay);
-                edit(|c| c.set_bool(&["overlay"], "enable", on));
+                let _ = edit(|c| c.set_bool(&["overlay"], "enable", on));
             });
         }
 
@@ -382,63 +416,79 @@ impl Window {
         let actions = Actions::new(mtm);
         let content = window.contentView().expect("NSWindow auto-creates a contentView");
 
-        let title = label(mtm, "Settings", 24.0, 554.0, 300.0, 22.0);
+        let title = label(mtm, "Settings", 24.0, 614.0, 300.0, 22.0);
         title.setFont(Some(&NSFont::boldSystemFontOfSize(15.0)));
         content.addSubview(&title);
         let blurb = label(
             mtm,
             "Saved to the config file and applied within a second.",
             24.0,
-            532.0,
+            592.0,
             472.0,
             18.0,
         );
         blurb.setFont(Some(&NSFont::systemFontOfSize(11.0)));
         content.addSubview(&blurb);
 
-        content.addSubview(&section(mtm, "Cursor", 500.0));
-        content.addSubview(&label(mtm, "Sensitivity", 24.0, 472.0, 120.0, 18.0));
+        content.addSubview(&section(mtm, "Cursor", 560.0));
+        content.addSubview(&label(mtm, "Sensitivity", 24.0, 532.0, 120.0, 18.0));
         let cursor_sensitivity = slider(
-            mtm, 25.0, CURSOR_MIN, CURSOR_MAX, &actions, sel!(cursorSensitivity:), 150.0, 468.0,
+            mtm, 25.0, CURSOR_MIN, CURSOR_MAX, &actions, sel!(cursorSensitivity:), 150.0, 528.0,
         );
         content.addSubview(&cursor_sensitivity);
-        let cursor_sensitivity_value = label(mtm, "", 400.0, 472.0, 90.0, 18.0);
+        let cursor_sensitivity_value = label(mtm, "", 400.0, 532.0, 90.0, 18.0);
         content.addSubview(&cursor_sensitivity_value);
 
-        content.addSubview(&label(mtm, "Acceleration", 24.0, 442.0, 120.0, 18.0));
+        content.addSubview(&label(mtm, "Acceleration", 24.0, 502.0, 120.0, 18.0));
         let cursor_exponent = slider(
-            mtm, 1.0, EXPONENT_MIN, EXPONENT_MAX, &actions, sel!(cursorExponent:), 150.0, 438.0,
+            mtm, 1.0, EXPONENT_MIN, EXPONENT_MAX, &actions, sel!(cursorExponent:), 150.0, 498.0,
         );
         content.addSubview(&cursor_exponent);
-        let cursor_exponent_value = label(mtm, "", 400.0, 442.0, 90.0, 18.0);
+        let cursor_exponent_value = label(mtm, "", 400.0, 502.0, 90.0, 18.0);
         content.addSubview(&cursor_exponent_value);
 
-        content.addSubview(&label(mtm, "Accel reference", 24.0, 412.0, 120.0, 18.0));
+        content.addSubview(&label(mtm, "Accel reference", 24.0, 472.0, 120.0, 18.0));
         let cursor_accel_ref = slider(
-            mtm, 80.0, ACCEL_REF_MIN, ACCEL_REF_MAX, &actions, sel!(cursorAccelRef:), 150.0, 408.0,
+            mtm, 80.0, ACCEL_REF_MIN, ACCEL_REF_MAX, &actions, sel!(cursorAccelRef:), 150.0, 468.0,
         );
         content.addSubview(&cursor_accel_ref);
-        let cursor_accel_ref_value = label(mtm, "", 400.0, 412.0, 90.0, 18.0);
+        let cursor_accel_ref_value = label(mtm, "", 400.0, 472.0, 90.0, 18.0);
         content.addSubview(&cursor_accel_ref_value);
         let accel_note = label(
             mtm,
             "mm/s at which sensitivity is the plain linear feel",
             150.0,
-            390.0,
+            450.0,
             340.0,
             14.0,
         );
         accel_note.setFont(Some(&NSFont::systemFontOfSize(10.0)));
         content.addSubview(&accel_note);
 
-        content.addSubview(&section(mtm, "Scroll", 358.0));
-        content.addSubview(&label(mtm, "Sensitivity", 24.0, 330.0, 120.0, 18.0));
+        content.addSubview(&section(mtm, "Scroll", 418.0));
+        content.addSubview(&label(mtm, "Sensitivity", 24.0, 390.0, 120.0, 18.0));
         let scroll_sensitivity = slider(
-            mtm, 20.0, SCROLL_MIN, SCROLL_MAX, &actions, sel!(scrollSensitivity:), 150.0, 326.0,
+            mtm, 20.0, SCROLL_MIN, SCROLL_MAX, &actions, sel!(scrollSensitivity:), 150.0, 386.0,
         );
         content.addSubview(&scroll_sensitivity);
-        let scroll_sensitivity_value = label(mtm, "", 400.0, 330.0, 90.0, 18.0);
+        let scroll_sensitivity_value = label(mtm, "", 400.0, 390.0, 90.0, 18.0);
         content.addSubview(&scroll_sensitivity_value);
+
+        content.addSubview(&label(mtm, "Acceleration", 24.0, 360.0, 120.0, 18.0));
+        let scroll_exponent = slider(
+            mtm, 1.3, EXPONENT_MIN, EXPONENT_MAX, &actions, sel!(scrollExponent:), 150.0, 356.0,
+        );
+        content.addSubview(&scroll_exponent);
+        let scroll_exponent_value = label(mtm, "", 400.0, 360.0, 90.0, 18.0);
+        content.addSubview(&scroll_exponent_value);
+
+        content.addSubview(&label(mtm, "Accel reference", 24.0, 330.0, 120.0, 18.0));
+        let scroll_accel_ref = slider(
+            mtm, 60.0, ACCEL_REF_MIN, ACCEL_REF_MAX, &actions, sel!(scrollAccelRef:), 150.0, 326.0,
+        );
+        content.addSubview(&scroll_accel_ref);
+        let scroll_accel_ref_value = label(mtm, "", 400.0, 330.0, 90.0, 18.0);
+        content.addSubview(&scroll_accel_ref_value);
 
         let natural = checkbox(
             mtm, "Natural scrolling", &actions, sel!(naturalScroll:), 150.0, 300.0, 240.0,
@@ -509,6 +559,10 @@ impl Window {
             cursor_accel_ref_value,
             scroll_sensitivity,
             scroll_sensitivity_value,
+            scroll_exponent,
+            scroll_exponent_value,
+            scroll_accel_ref,
+            scroll_accel_ref_value,
             natural,
             pinch,
             rotate,
@@ -570,6 +624,10 @@ impl Window {
         self.cursor_accel_ref_value.setStringValue(&fmt(cfg.cursor.accel_ref));
         self.scroll_sensitivity.setDoubleValue(cfg.scroll.sensitivity);
         self.scroll_sensitivity_value.setStringValue(&fmt(cfg.scroll.sensitivity));
+        self.scroll_exponent.setDoubleValue(cfg.scroll.accel_exponent);
+        self.scroll_exponent_value.setStringValue(&fmt(cfg.scroll.accel_exponent));
+        self.scroll_accel_ref.setDoubleValue(cfg.scroll.accel_ref);
+        self.scroll_accel_ref_value.setStringValue(&fmt(cfg.scroll.accel_ref));
         set_checked(&self.natural, cfg.scroll.natural);
         set_checked(&self.overlay, cfg.overlay.enable);
         // Not a config value — read the actual agent state each time.
@@ -609,18 +667,22 @@ impl Window {
         self.flush_timer = Some(timer);
     }
 
-    /// Write all three slider values in a single edit.
+    /// Write every slider value in a single edit.
     fn flush(&mut self) {
         self.flush_timer = None;
         let cursor = round1(self.cursor_sensitivity.doubleValue());
         let exponent = round2(self.cursor_exponent.doubleValue());
         let accel_ref = round1(self.cursor_accel_ref.doubleValue());
         let scroll = round1(self.scroll_sensitivity.doubleValue());
-        edit(|c| {
+        let scroll_exponent = round2(self.scroll_exponent.doubleValue());
+        let scroll_accel_ref = round1(self.scroll_accel_ref.doubleValue());
+        let _ = edit(|c| {
             c.set_f64(&["cursor"], "sensitivity", cursor)?;
             c.set_f64(&["cursor"], "accel_exponent", exponent)?;
             c.set_f64(&["cursor"], "accel_ref", accel_ref)?;
             c.set_f64(&["scroll"], "sensitivity", scroll)?;
+            c.set_f64(&["scroll"], "accel_exponent", scroll_exponent)?;
+            c.set_f64(&["scroll"], "accel_ref", scroll_accel_ref)?;
             Ok(())
         });
     }
@@ -649,11 +711,13 @@ impl Window {
             log::info!("reset: leaving app-list gesture policies untouched");
         }
 
-        edit(|c| {
+        let _ = edit(|c| {
             c.set_f64(&["cursor"], "sensitivity", defaults.cursor.sensitivity)?;
             c.set_f64(&["cursor"], "accel_exponent", defaults.cursor.accel_exponent)?;
             c.set_f64(&["cursor"], "accel_ref", defaults.cursor.accel_ref)?;
             c.set_f64(&["scroll"], "sensitivity", defaults.scroll.sensitivity)?;
+            c.set_f64(&["scroll"], "accel_exponent", defaults.scroll.accel_exponent)?;
+            c.set_f64(&["scroll"], "accel_ref", defaults.scroll.accel_ref)?;
             c.set_bool(&["scroll"], "natural", defaults.scroll.natural)?;
             c.set_bool(&["overlay"], "enable", defaults.overlay.enable)?;
             if pinch_simple {

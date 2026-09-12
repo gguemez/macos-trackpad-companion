@@ -983,7 +983,6 @@ impl<O: Output> State<O> {
         let max_move_mm = self.max_move_sq.sqrt();
         let since_start = now.saturating_duration_since(self.started_at);
         obs.frame(&Snapshot {
-            at: now,
             pad: self.pad,
             kind: self.kind,
             button,
@@ -2082,7 +2081,6 @@ pub trait Observer {
 /// One frame of engine state, as the engine saw it.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
-    pub at: Timestamp,
     /// Pad size, when a device has reported one. `None` means the
     /// engine is running on its unscaled defaults.
     pub pad: Option<PadGeometry>,

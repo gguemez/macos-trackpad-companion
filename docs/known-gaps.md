@@ -57,6 +57,19 @@ instead of breaking; never re-tune mid-gesture. Continuously drifting
 thresholds make behaviour irreproducible and every bug report
 unfalsifiable.
 
+### Scroll's curve is configurable ✅
+
+`SCROLL_CURVE_EXPONENT` (1.3) and `SCROLL_CURVE_REF_MM_PER_SEC` (60)
+were constants while `cursor.accel_exponent` and `cursor.accel_ref`
+were settings — the same curve, the same rationale in both comments,
+exposed on one side only. A value whose own comment described it as
+what "feels typical to the user" is a preference, and preferences
+belong in the config.
+
+They are now `scroll.accel_exponent` and `scroll.accel_ref`, with the
+curve parameters gathered into an `output::ScrollAccel` shaped exactly
+like `gesture::CursorAccel`. Both windows carry all six sliders.
+
 ### Only one real device has ever been tested
 
 There is one third-party pad (vid `0x258a` pid `0x0010`) plus the
@@ -225,10 +238,12 @@ device nobody here owns can be watched, not just summarised. Seeking
 backwards rebuilds the engine and replays from the start rather than
 undoing frames, which is sound only because replays are deterministic.
 
-The scope also carries a live-tuning column: `cursor.sensitivity`,
-`cursor.accel_exponent`, `cursor.accel_ref` and `scroll.sensitivity`,
-applied to the engine on the drag with the config file written behind
-them debounced. The inverted order (engine first, file second) is the
+The scope also carries a live-tuning column — the cursor curve
+(`sensitivity`, `accel_exponent`, `accel_ref`) and now the scroll curve
+to match — applied to the engine on the drag with the config file
+written behind it, debounced. A write that fails reverts both the
+slider and the engine to what is on disk rather than leaving the engine
+running on a value the file never accepted. The inverted order (engine first, file second) is the
 one place the "file is the single source of truth" rule bends, and it
 bends on purpose: routing a slider through the file costs a 0.25 s
 debounce plus a 1 s watcher poll, and a slider you feel 1.25 s later is

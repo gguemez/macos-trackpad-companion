@@ -281,6 +281,8 @@ fn run<O: output::Output + 'static>(
         cfg.cursor.accel_exponent = t.cursor_accel_exponent;
         cfg.cursor.accel_ref = t.cursor_accel_ref;
         cfg.scroll.sensitivity = t.scroll_sensitivity;
+        cfg.scroll.accel_exponent = t.scroll_accel_exponent;
+        cfg.scroll.accel_ref = t.scroll_accel_ref;
         tune_state
             .borrow_mut()
             .apply_config(cursor_accel(&cfg), output_config(&cfg));
@@ -367,7 +369,11 @@ fn run<O: output::Output + 'static>(
 /// at startup and again on every reload.
 fn output_config(cfg: &config::Config) -> output::Config {
     output::Config {
-        scroll_accel: cfg.scroll.sensitivity,
+        scroll_accel: output::ScrollAccel {
+            px_per_mm_at_ref: cfg.scroll.sensitivity,
+            exponent: cfg.scroll.accel_exponent,
+            ref_mm_per_sec: cfg.scroll.accel_ref,
+        },
         natural_scroll: cfg.scroll.natural,
         pinch: enable_to_policy(&cfg.gestures.pinch.enable),
         rotate: enable_to_policy(&cfg.gestures.rotate.enable),

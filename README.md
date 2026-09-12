@@ -134,8 +134,10 @@ accel_exponent = 1.0        # 1.0 = linear; >1 boosts fast flicks
 accel_ref     = 80.0        # mm/s — velocity at which sensitivity is the linear feel
 
 [scroll]
-sensitivity = 20.0          # px per mm
-natural     = true          # finger-down → content-down (macOS default since 10.7)
+sensitivity    = 20.0       # px per mm at accel_ref
+accel_exponent = 1.3        # 1.0 = linear; above it, fast scrolls amplify more
+accel_ref      = 60.0       # mm/s at which sensitivity is the plain linear feel
+natural        = true       # finger-down → content-down (macOS default since 10.7)
 
 # Each gesture has an `enable` key with three forms:
 #   enable = "on"                                  # always
@@ -287,8 +289,8 @@ something still happening. The next touch clears both.
 
 ### Tuning while you gesture
 
-A column down the right-hand side carries the four settings you can
-only judge by feel, live:
+A column down the right-hand side carries the settings you can only
+judge by feel, live:
 
 | | |
 | --- | --- |
@@ -296,6 +298,8 @@ only judge by feel, live:
 | **Cursor — Acceleration** | `cursor.accel_exponent` |
 | **Cursor — Accel reference** | `cursor.accel_ref` |
 | **Scroll — Speed** | `scroll.sensitivity` |
+| **Scroll — Acceleration** | `scroll.accel_exponent` |
+| **Scroll — Accel reference** | `scroll.accel_ref` |
 
 A drag reaches the engine on the spot and the config file is written
 behind it, debounced. That inverts what the settings window does — it
@@ -326,10 +330,12 @@ formula.
 
 The section headers brighten for whichever group your current gesture
 exercises, because you cannot feel cursor acceleration with two fingers
-down.
+down. **Close** (or <kbd>esc</kbd>) dismisses the window; a pending
+write lands first, so closing mid-drag never loses the value the engine
+is already running on.
 
-**Only these four, deliberately.** They are *feel* — nothing here moves
-a recognition threshold. A slider on `PAN_BALANCE_MIN` or
+**Feel only, deliberately.** Nothing here moves a recognition
+threshold. A slider on `PAN_BALANCE_MIN` or
 `ANCHORED_FINGER_FLOOR_MM` would let you fix the gesture in front of
 you while silently breaking one you made yesterday, and with a single
 test device there is no way to notice; `docs/known-gaps.md` has the
@@ -468,6 +474,16 @@ on separate interfaces.
 | `main.rs` | CLI parsing, logging, wiring. |
 | `bin/gesture_tap.rs` | Separate `gesture-tap` binary: read-only event tap that dumps the gesture events macOS routes, for comparing against a real trackpad. |
 | `bin/replay.rs` | Separate `replay` binary: feeds a capture back through the same engine offline, printing what would have been emitted or drawing it in the scope. |
+
+## Testing
+
+`cargo test` covers the parser, the gesture engine, the capture format
+and the scope's own state — everything that can be checked without a
+screen or a hand.
+
+The rest can't be. [docs/scope-test-plan.md](docs/scope-test-plan.md)
+is the manual pass for the gesture scope: what to do, what should
+happen, numbered so a failure can be reported as "4.2".
 
 ## Known gaps
 
