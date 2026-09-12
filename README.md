@@ -81,12 +81,15 @@ The companion's only UI is a status-bar icon.
 | --- | --- |
 | *(status line)* | Device state — waiting, connected, paused, or what's missing. |
 | **Pause / Resume** | Suspends synthesis without stopping the daemon. The device stays acquired, so it doesn't go dormant the way it does when nothing is driving it, and resuming is instant. |
-| **Copy Diagnostics** | Versions, both permission states, the pointer policy, the attached device's geometry, and the config and log paths — onto the clipboard. |
-| **Start at Login** | Installs a LaunchAgent (see below). |
-| **Reveal Log…** | Opens Finder on the log file, when `[log].file` is set. |
-| **Setup…** | Reopens the permissions window. |
 | **Settings…** (⌘,) | Sliders and toggles that write the config file. |
+| **Gesture Scope…** (⌘G) | Live view of the contacts and the 2F lock decision. See below. |
 | **Quit** (⌘Q) | Warns first if it would leave no working pointer. |
+
+Everything else lives in the settings window: **Start at Login**, and a
+**Troubleshooting** row with **Permissions…**, **Copy Diagnostics**
+(versions, both permission states, the pointer policy, the attached
+device's geometry, and the config and log paths, onto the clipboard),
+**Reveal Log…**, **Reveal Config File…** and **Reset to Defaults**.
 
 Settings written from that window go through the same file the daemon
 watches, so the file stays the single source of truth and the window
@@ -254,6 +257,124 @@ Trailing fields:
 For the contrasting case, `2F lock=scroll` uses the same format with
 `pan` first.
 
+## The gesture scope
+
+The log line above is the decision after the fact. **Gesture Scope…**
+(⌘G in the menu) is the same decision while your fingers are still on
+the pad:
+
+- the pad drawn to its real aspect ratio, with each contact, where it
+  landed, and the path it has taken since;
+- the lever arm between two fingers — its length is the pinch signal,
+  its angle is the rotate signal — and the centroid, which is what pan
+  and the swipe axis lock on;
+- the three normalized scores as bars against their shared 1.0 lock
+  threshold, with the raw score as a ghost behind the score the lock
+  actually selects on, so a gate that zeroed a signal is visible as the
+  gap between them;
+- every gate that is deciding the outcome: margin, alignment, balance,
+  the noise band, the under-cursor app's policy, and the tap window
+  that is the usual reason nothing has happened yet;
+- the lock itself, frozen at the frame it fired, in the same field
+  order as the log line.
+
+Tracks and the lock banner outlive the gesture on purpose — you look up
+after your fingers have left the pad, and a view that cleared on lift
+would be blank exactly when you went to read it. Once the fingers are
+off, the tracks ghost and the banner dims to *last gesture · … ·
+fingers lifted*, so a record of something finished never reads as
+something still happening. The next touch clears both.
+
+### Tuning while you gesture
+
+A column down the right-hand side carries the four settings you can
+only judge by feel, live:
+
+| | |
+| --- | --- |
+| **Cursor — Speed** | `cursor.sensitivity` |
+| **Cursor — Acceleration** | `cursor.accel_exponent` |
+| **Cursor — Accel reference** | `cursor.accel_ref` |
+| **Scroll — Speed** | `scroll.sensitivity` |
+
+A drag reaches the engine on the spot and the config file is written
+behind it, debounced. That inverts what the settings window does — it
+writes the file and lets the watcher apply it — because going through
+the file costs a debounce plus a poll, and over a second between
+dragging a slider and feeling the change makes the slider useless. The
+file still ends up authoritative: when the watcher notices it, it
+re-applies the identical values. Editing the file by hand, or from the
+settings window, updates the scope's sliders the same way — except
+while a drag is in flight, which is the one moment a refresh would yank
+the slider out from under you.
+
+The canvas shows what the curve is doing to the speed your hand is
+actually producing:
+
+```
+cursor    212 mm/s →   1043 px/s    effective  4.9 px/mm   (set 25.0 px/mm at 80 mm/s)
+```
+
+`accel_exponent` and `accel_ref` shape a curve you can otherwise only
+feel. *Effective px/mm* is in the same unit as the Speed slider, so the
+gap between the two numbers is exactly how far acceleration has carried
+you from where you set it — and you can watch it pass through the
+slider's value as you cross `accel_ref`. Scroll gets the same line
+while panning. Both are computed by calling the engine's own
+`accelerate_cursor` / `accelerate_scroll`, not a second copy of the
+formula.
+
+The section headers brighten for whichever group your current gesture
+exercises, because you cannot feel cursor acceleration with two fingers
+down.
+
+**Only these four, deliberately.** They are *feel* — nothing here moves
+a recognition threshold. A slider on `PAN_BALANCE_MIN` or
+`ANCHORED_FINGER_FLOOR_MM` would let you fix the gesture in front of
+you while silently breaking one you made yesterday, and with a single
+test device there is no way to notice; `docs/known-gaps.md` has the
+argument in full. The scope makes those thresholds *visible*, which is
+the useful half.
+
+The scope reads a snapshot the engine hands to an optional observer
+alongside its event sink. `gesture.rs` has no idea the window exists,
+which is what keeps it unit-testable — and the observer declines
+frames while the window is closed, so a companion whose scope has
+never been opened does no extra work per frame.
+
+### Capture and replay
+
+The same window will render a recording, which is how a trackpad
+nobody here owns gets diagnosed:
+
+```sh
+companion --record ~/scroll-misfires.txt   # use the pad, then quit
+replay ~/scroll-misfires.txt               # what the engine would have done
+replay ~/scroll-misfires.txt --scope       # ...and watch it
+```
+
+A capture is plain text — one line per frame, contacts in millimetres —
+so it survives being pasted into an issue and a human can read what
+the pad reported. Replaying it uses no HID, no CGEvents and no
+permissions, and is deterministic: the same file produces byte-identical
+output every time, which makes a capture a usable regression fixture.
+
+Under `--scope` the transport below the canvas plays, pauses, steps and
+scrubs. A misclassification is usually decided in a single frame, and
+stepping is how you stop on it:
+
+| Key | |
+| --- | --- |
+| <kbd>space</kbd> | play / pause |
+| <kbd>←</kbd> <kbd>→</kbd> | step one frame |
+| <kbd>shift</kbd>+<kbd>←</kbd> <kbd>→</kbd> | step ten |
+
+Seeking backwards rebuilds the engine and replays from the start rather
+than trying to undo frames — which is only sound because replays are
+deterministic, and is why frame N is the same frame N however you got
+there. `--speed N` scales playback; `--pad WxH` overrides the recorded
+pad size.
+
 ## Wire-format contract
 
 The companion parses the device's HID report descriptor at runtime, so
@@ -339,11 +460,14 @@ on separate interfaces.
 | `system_prefs.rs` | Reads whether macOS is set to ignore the built-in trackpad while an external pointer is attached. |
 | `app_context.rs` | Resolves the bundle ID of the app under the cursor, for the per-gesture `only` / `except` filters. |
 | `overlay.rs` | Optional click-through `NSPanel` HUD that flashes the gesture name at lock time. |
+| `scope.rs` | The gesture scope window: draws a `gesture::Snapshot`. Reads engine state, never asks it anything. |
+| `capture.rs` | Records the device's frame stream as plain text, and reads it back. |
 | `scan_clock.rs` | Maps the device's wrapping 100 µs scan-time counter onto host `CLOCK_UPTIME_RAW` timestamps. |
 | `time.rs` | Monotonic `Timestamp` shared by the gesture engine and the event synthesizer. |
 | `instance_lock.rs` | `flock(2)` single-instance guard — two companions racing one trackpad is destructive. |
 | `main.rs` | CLI parsing, logging, wiring. |
 | `bin/gesture_tap.rs` | Separate `gesture-tap` binary: read-only event tap that dumps the gesture events macOS routes, for comparing against a real trackpad. |
+| `bin/replay.rs` | Separate `replay` binary: feeds a capture back through the same engine offline, printing what would have been emitted or drawing it in the scope. |
 
 ## Known gaps
 

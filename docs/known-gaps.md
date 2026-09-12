@@ -196,14 +196,63 @@ Still not exposed, deliberately:
   than being flattened to on/off and silently losing the list. A proper
   list editor is the real answer.
 
-### No gesture scope
+### The gesture scope ✅
 
-The engine computes lock scores and contact geometry that are currently
-only observable by reading log lines. A live view of contacts and the
-2F lock decision is the one remaining piece aimed at what this project
-is actually for — refining recognition.
+Lock scores and contact geometry used to be observable only by reading
+log lines after the fact. Menu > **Gesture Scope…** draws them live:
+contacts and their tracks on a pad drawn to its real aspect ratio, the
+three normalized scores as bars against their shared 1.0 threshold,
+every gate that is deciding the outcome, and the lock frozen at the
+frame it fired.
 
-The seam to build it on: keep `gesture.rs` pure. It depends only on
-`Frame` and an `Output` sink, which is what makes it unit-testable. A
-second optional observer alongside `Output`, fed what the engine already
-computes, keeps the engine honest and the scope additive.
+`gesture.rs` stayed pure. The engine hands a `Snapshot` to an optional
+`Observer` alongside `Output`; `scope.rs` renders it, `main.rs` does the
+wiring, and the 59 engine tests leave the observer unset. The observer
+declines frames while the window is closed, so a companion whose scope
+has never been opened pays one `Cell` read per frame and builds no
+snapshot at all.
+
+What made it worth doing properly rather than dumping more fields into
+the log line: `TwoFingerBaseline::metrics` is now the single
+implementation of the decision vector. The lock decision, the log line
+and the scope all read the same value. A scope that derived the numbers
+a second way would be worthless at exactly the moment it disagreed with
+the engine.
+
+`replay FILE --scope` renders a capture through the same window, with a
+transport that plays, pauses, steps a frame at a time and scrubs — so a
+device nobody here owns can be watched, not just summarised. Seeking
+backwards rebuilds the engine and replays from the start rather than
+undoing frames, which is sound only because replays are deterministic.
+
+The scope also carries a live-tuning column: `cursor.sensitivity`,
+`cursor.accel_exponent`, `cursor.accel_ref` and `scroll.sensitivity`,
+applied to the engine on the drag with the config file written behind
+them debounced. The inverted order (engine first, file second) is the
+one place the "file is the single source of truth" rule bends, and it
+bends on purpose: routing a slider through the file costs a 0.25 s
+debounce plus a 1 s watcher poll, and a slider you feel 1.25 s later is
+not a slider you can tune with. The file still converges — the watcher
+re-applies the identical values — and both windows round through the
+same helpers so neither can produce a value the other wouldn't.
+
+Deliberately *not* exposed: any recognition threshold. Those trade two
+failure modes against each other, and the scope only ever shows the
+gesture in front of you, never the one a looser gate would have broken.
+With one test device that failure is invisible. Making the thresholds
+visible is the useful half; making them adjustable would reintroduce
+exactly the unfalsifiability this file argues against above.
+
+Also not done, deliberately: nothing in the scope is recorded. Watching
+is not capturing — `--record` already exists for that, and a scope that
+quietly wrote files would be a surprise.
+
+The obvious next thing, if recognition tuning is ever picked up again:
+a capture records what the pad reported, never what you *meant*. Label
+a capture with its intent and the pieces already here — deterministic
+replay, one `metrics` implementation, the scope to check each label by
+eye — become a corpus you can sweep a threshold across and count
+misclassifications on. That is what
+`docs/gesture-tuning-ideas.md` #3 asks for when it says "compute
+balance distributions for each, look for separation", and it is the
+only honest way to settle #3 and #4 with a single device.

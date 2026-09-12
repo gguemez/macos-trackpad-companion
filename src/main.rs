@@ -33,6 +33,7 @@ use macos_trackpad_companion::{
     pause,
     permissions,
     report,
+    scope,
     settings,
     status_item,
     system_prefs,
@@ -257,7 +258,36 @@ fn run<O: output::Output + 'static>(
 ) -> Result<()> {
     let state = Rc::new(RefCell::new(gesture::State::new(out, cursor_accel(cfg))));
 
+    // The gesture scope's feed, installed unconditionally. It refuses
+    // frames until the window is open, so a daemon whose scope has
+    // never been opened pays one `Cell` read per frame — and the engine
+    // still knows nothing about the window, exactly as with pad
+    // geometry below.
+    state.borrow_mut().set_observer(Some(Box::new(scope::Feed)));
+
+    // The config currently in force. The scope's tuning sliders change
+    // four of its fields and hand the result straight to the engine;
+    // the file watcher below replaces the whole thing when the file
+    // changes. Both paths end at the same `apply_config`, so a slider
+    // is felt immediately and the file — which the slider also writes,
+    // debounced — stays the shape of truth.
+    let live_cfg = Rc::new(RefCell::new(cfg.clone()));
+
+    let tune_state = Rc::clone(&state);
+    let tune_cfg = Rc::clone(&live_cfg);
+    scope::set_live_apply(move |t: scope::Tuning| {
+        let mut cfg = tune_cfg.borrow_mut();
+        cfg.cursor.sensitivity = t.cursor_sensitivity;
+        cfg.cursor.accel_exponent = t.cursor_accel_exponent;
+        cfg.cursor.accel_ref = t.cursor_accel_ref;
+        cfg.scroll.sensitivity = t.scroll_sensitivity;
+        tune_state
+            .borrow_mut()
+            .apply_config(cursor_accel(&cfg), output_config(&cfg));
+    });
+
     let reload_state = Rc::clone(&state);
+    let reload_cfg = Rc::clone(&live_cfg);
     // Held until `run` returns: dropping the timer stops the watching.
     let _watch = config_watch::start(cfg_path, cfg, move |new_cfg| {
         log::debug!(
@@ -268,6 +298,7 @@ fn run<O: output::Output + 'static>(
             new_cfg.scroll.sensitivity,
             new_cfg.scroll.natural,
         );
+        *reload_cfg.borrow_mut() = new_cfg.clone();
         reload_state
             .borrow_mut()
             .apply_config(cursor_accel(new_cfg), output_config(new_cfg));

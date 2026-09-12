@@ -33,6 +33,12 @@ const MOTION_DEAD_ZONE_MM: f64 = 0.04;
 
 /// Centroid pan distance needed to lock 2F mode = pan.
 const PAN_LOCK_MM: f64 = 0.4;
+/// Floor on the per-finger balance ratio (slower contact's travel over
+/// the faster one's) for the participation half of the pan gate. 0.3
+/// means a pan is accepted when both fingers contributed, even
+/// unequally; below it, one finger is carrying the gesture and the
+/// alignment branch has to vouch for it instead.
+const PAN_BALANCE_MIN: f64 = 0.3;
 /// Cosine-of-angle floor for the per-finger motion-direction gate in
 /// `pan_qualified`. Above this, both fingers are moving in essentially
 /// the same direction (within ~14°) and we treat the gesture as pan
@@ -190,7 +196,10 @@ impl Default for CursorAccel {
 /// Apply the cursor-acceleration curve to a per-axis velocity, returning
 /// pixels per second. Caller multiplies by per-frame `dt` for the
 /// per-frame pixel delta.
-fn accelerate_cursor(v_mm_per_sec: f64, cfg: CursorAccel) -> f64 {
+/// Public so the gesture scope can plot the curve the engine is
+/// actually using. Same rule as the 2F metrics: one implementation, or
+/// the readout is worthless the moment it disagrees.
+pub fn accelerate_cursor(v_mm_per_sec: f64, cfg: CursorAccel) -> f64 {
     let mag = v_mm_per_sec.abs();
     if mag == 0.0 {
         return 0.0;
@@ -212,7 +221,7 @@ struct Tracked {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GestureKind {
+pub enum GestureKind {
     Idle,
     OneFinger,
     TwoFingerUnclassified,
@@ -303,6 +312,191 @@ struct TwoFingerBaseline {
     /// scroll. With both `false`, only TwoFingerPan is reachable.
     pinch_admitted: bool,
     rotate_admitted: bool,
+}
+
+impl TwoFingerBaseline {
+    /// Everything the 2F lock decision is made of, for one frame.
+    ///
+    /// Pure: same baseline and same pair of contacts always give the
+    /// same answer. That is what lets the lock decision, the log line
+    /// it prints, and the gesture scope all read one implementation of
+    /// the formula instead of three — a scope showing numbers derived
+    /// a second way would be a scope you can't trust when it disagrees
+    /// with the engine.
+    ///
+    /// Decomposes per-finger motion into common (centroid drift,
+    /// a.k.a. pan) and differential (relative motion, the pinch+rotate
+    /// signal) components, looked up by contact ID so order swaps in
+    /// `active` don't matter. Pan only locks if the common component
+    /// strictly dominates the differential — otherwise the gesture is
+    /// asymmetric pinch/rotate where one finger contributes most of
+    /// the motion, and the centroid drift is a *side effect* of that
+    /// asymmetry, not a real pan. Without that gate, an anchored-finger
+    /// pinch (especially a slow one with contacts far apart, where 4%
+    /// distance change in mm is larger than the 0.4 mm pan threshold)
+    /// locks pan before the distance ratio crosses `PINCH_LOCK_RATIO`.
+    /// The strictly-greater comparison correctly rejects the boundary
+    /// case of a fully-anchored finger (|common| = |differential|).
+    fn metrics(&self, a: Contact, b: Contact) -> TwoFingerMetrics {
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let dist = (dx * dx + dy * dy).sqrt().max(1e-9);
+        let ang = dy.atan2(dx);
+
+        let (init_a, init_b) = if a.id == self.initial_a.0 {
+            (self.initial_a.1, self.initial_b.1)
+        } else {
+            (self.initial_b.1, self.initial_a.1)
+        };
+        let da = (a.x - init_a.0, a.y - init_a.1);
+        let db = (b.x - init_b.0, b.y - init_b.1);
+        let common = ((da.0 + db.0) * 0.5, (da.1 + db.1) * 0.5);
+        let differential = ((da.0 - db.0) * 0.5, (da.1 - db.1) * 0.5);
+        let common_mag = (common.0.powi(2) + common.1.powi(2)).sqrt();
+        let differential_mag = (differential.0.powi(2) + differential.1.powi(2)).sqrt();
+        // Pan requires both fingers to participate in roughly the
+        // same translation. Two gates filter pinch/rotate signals
+        // that masquerade as pan:
+        //
+        // A. Margin: |common| must beat |differential| by 20%, not
+        //    just by epsilon. Near-perpendicular motion where the
+        //    common-vs-differential test is right on the boundary
+        //    isn't really "translation."
+        // B. Per-finger participation, satisfied by *either*:
+        //    - Balance: slower contact moves ≥ 30% of the faster.
+        //      Catches symmetric pan where both fingers contribute.
+        //    - Alignment: motion vectors point in nearly the same
+        //      direction (cos > PAN_ALIGNMENT_COS_MIN ≈ 14°). Catches
+        //      a slow scroll where one finger lags the other —
+        //      common when fingers are crammed close on a small
+        //      trackpad. Without this branch, the user's slow
+        //      careful scrolls on the SoflePLUS2 misclassified as
+        //      pinch+rotate (cf. /tmp/companion-logs ~2026-05-02:
+        //      one finger moved 2.3 mm while the other moved 0.3 mm
+        //      in the same direction; cos = 0.997, balance = 0.13).
+        //
+        // Both gates ride on top of the strict `common > differential`
+        // test, which alone passes anchored-finger rotates where the
+        // "anchored" finger drifts a few hundredths of a mm in the
+        // same direction as the sweeper.
+        let da_mag = (da.0.powi(2) + da.1.powi(2)).sqrt();
+        let db_mag = (db.0.powi(2) + db.1.powi(2)).sqrt();
+        let min_per_finger = da_mag.min(db_mag);
+        let max_per_finger = da_mag.max(db_mag);
+        // Cosine of the angle between the two motion vectors.
+        // Undefined when either is zero — fall through to balance.
+        let alignment = if da_mag > 0.0 && db_mag > 0.0 {
+            (da.0 * db.0 + da.1 * db.1) / (da_mag * db_mag)
+        } else {
+            -1.0
+        };
+        let margin_ok = common_mag > differential_mag * 1.2;
+        let balance = if max_per_finger > 0.0 {
+            min_per_finger / max_per_finger
+        } else {
+            0.0
+        };
+        let balance_ok = balance >= PAN_BALANCE_MIN;
+        let aligned = alignment > PAN_ALIGNMENT_COS_MIN;
+        let pan_qualified = margin_ok && (balance_ok || aligned);
+
+        // Always-computed raw scores for the lock-decision log: a 0
+        // there should mean "didn't accumulate," not "qualification
+        // gate zeroed it." The selection scores below still gate on
+        // qualification so suppressed signals can't win.
+        let pan_raw = common_mag / PAN_LOCK_MM;
+        let pinch_raw = (dist / self.initial_distance - 1.0).abs() / PINCH_LOCK_RATIO;
+        let angle_delta_rad = angle_delta(ang, self.initial_angle);
+        let rot_raw = angle_delta_rad.abs() / ROTATE_LOCK_RAD;
+
+        let pan = if pan_qualified { pan_raw } else { 0.0 };
+        // Pinch/rotate scoring is hypersensitive to per-finger noise on
+        // a long lever arm: with fingers ~20 mm apart, sub-mm jitter
+        // accumulated over a few hundred ms can drift the inter-finger
+        // angle past ROTATE_LOCK_RAD (4°) without the user actually
+        // rotating. Two patterns produce trustworthy pinch/rot signal:
+        //
+        //   (a) Both fingers committed past tap-jitter
+        //       (min_per_finger >= TAP_MAX_MOVE_MM). Real bimanual
+        //       rotation/pinch.
+        //   (b) One finger essentially anchored (sub-noise floor) and
+        //       the other moving. Anchored-rotate / anchored-pinch.
+        //
+        // In between — one finger committed, the other drifting in the
+        // ~0.3..1.0 mm noise band — the differential's direction is
+        // dominated by the drifting finger's noise, which from contact
+        // data alone is indistinguishable from a real anti-parallel
+        // rotation. Defer the lock until either the trailer commits or
+        // pan locks on coherent centroid motion. Reproduces user's
+        // 2026-05-04 logs:
+        //   * 485 ms quiet hold (max=0.89 mm, min=0.67 mm) → both
+        //     fingers in noise band, defer.
+        //   * 570 ms quiet then leader heads south (max=1.27 mm,
+        //     min=0.47 mm) → leader committed but trailer's 0.47 mm
+        //     of opposite-y noise looks anti-parallel; defer until
+        //     trailer commits.
+        let pinch_rot_admissible =
+            min_per_finger >= TAP_MAX_MOVE_MM || min_per_finger < ANCHORED_FINGER_FLOOR_MM;
+        // Penalize pinch/rot selection scores when the two finger-
+        // motion vectors are roughly parallel (high positive
+        // alignment cosine). Real pinch and real rotate have
+        // anti-parallel or truly-anchored geometry — anti-parallel
+        // gives cos ≤ 0 (penalty 1.0, no effect) and truly-anchored
+        // gives cos = -1 by the code's fallback (penalty 1.0).
+        // Positive alignment is a "both fingers want the same
+        // direction" signal: most likely a slow scroll whose
+        // trailing finger lags. On the SoflePLUS2's small off-center
+        // trackpad the user's wrist offset systematically makes one
+        // finger drag less than the other, fooling the per-finger
+        // gates and locking pinch+rotate when scroll was intended.
+        // Linear falloff (1 - cos) clipped at 0; see gesture-tuning
+        // -ideas.md idea #2.
+        let align_penalty = (1.0 - alignment).clamp(0.0, 1.0);
+        // Zero out modes the under-cursor app's policy doesn't admit
+        // (sampled at gesture start in `transition`). With both
+        // zeroed, only `pan` can ever cross — a 2F gesture in an
+        // app that doesn't allow pinch/rotate falls through to
+        // scroll instead of locking pinch+rotate-but-suppressed.
+        let pinch = if pinch_rot_admissible && self.pinch_admitted {
+            pinch_raw * align_penalty
+        } else {
+            0.0
+        };
+        let rot = if pinch_rot_admissible && self.rotate_admitted {
+            rot_raw * align_penalty
+        } else {
+            0.0
+        };
+
+        TwoFingerMetrics {
+            distance_mm: dist,
+            initial_distance_mm: self.initial_distance,
+            angle_rad: ang,
+            angle_delta_rad,
+            common_mm: common_mag,
+            differential_mm: differential_mag,
+            alignment,
+            balance,
+            travel_mm: (da_mag, db_mag),
+            pan_raw,
+            pinch_raw,
+            rot_raw,
+            pan,
+            pinch,
+            rot,
+            margin_ok,
+            balance_ok,
+            aligned,
+            pan_qualified,
+            pinch_rot_admissible,
+            pinch_admitted: self.pinch_admitted,
+            rotate_admitted: self.rotate_admitted,
+            lock_deferred: self.pinch_rot_lock_pending,
+            scroll_speed_mm_per_sec: (self.scroll_velocity.0.powi(2)
+                + self.scroll_velocity.1.powi(2))
+            .sqrt(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -489,6 +683,11 @@ pub struct State<O: Output> {
     /// Kept separate from `pending_motion`, whose lifecycle belongs to the
     /// normal OneFinger gesture state.
     physical_drag_pending_motion: Option<(f64, f64, Duration)>,
+
+    /// Optional second sink for the engine's reasoning. See the
+    /// Observation section at the bottom of this file. `None` in every
+    /// unit test, and in the daemon whenever nothing is watching.
+    observer: Option<Box<dyn Observer>>,
 }
 
 impl<O: Output> State<O> {
@@ -553,7 +752,21 @@ impl<O: Output> State<O> {
             prev_button: false,
             physical_drag_contact_id: None,
             physical_drag_pending_motion: None,
+            observer: None,
         }
+    }
+
+    /// Attach (or detach) the observer that receives a [`Snapshot`] per
+    /// frame. Wired by `main` exactly like pad geometry is — the engine
+    /// doesn't know or care what is on the other end.
+    pub fn set_observer(&mut self, observer: Option<Box<dyn Observer>>) {
+        self.observer = observer;
+    }
+
+    /// The sink the engine is driving. Used by `replay`, which owns its
+    /// printer through the engine rather than alongside it.
+    pub fn output(&self) -> &O {
+        &self.out
     }
 
     /// Convenience wrapper that stamps the frame with the current
@@ -664,6 +877,7 @@ impl<O: Output> State<O> {
             }
 
             self.dispatch_physical_drag(&active, frame_dt);
+            self.observe(&active, now, frame.button, true);
             return;
         }
 
@@ -674,6 +888,115 @@ impl<O: Output> State<O> {
         if !active.is_empty() {
             self.dispatch(&active, now, frame_dt);
         }
+        self.observe(&active, now, frame.button, false);
+    }
+
+    /// Hand the observer what this frame's dispatch was decided from.
+    ///
+    /// Runs after dispatch, so what it reports is the state the engine
+    /// ended the frame in. The 2F and multi-finger metrics are
+    /// recomputed here from the same baselines and the same functions
+    /// the decision used, rather than being stashed during dispatch:
+    /// recomputing costs a few multiplications on frames where someone
+    /// is watching, and stashing would have put a field on the engine
+    /// that exists only for the benefit of a UI.
+    fn observe(&self, active: &[Contact], now: Timestamp, button: bool, physical_drag: bool) {
+        let Some(obs) = self.observer.as_ref() else {
+            return;
+        };
+        if !obs.wants_frames() {
+            return;
+        }
+
+        let contacts = active
+            .iter()
+            .map(|c| {
+                let tracked = self.contacts.get(&c.id);
+                ContactTrack {
+                    id: c.id,
+                    x_mm: c.x,
+                    y_mm: c.y,
+                    down_x_mm: tracked.map_or(c.x, |t| t.down_x),
+                    down_y_mm: tracked.map_or(c.y, |t| t.down_y),
+                    max_move_mm: tracked.map_or(0.0, |t| t.max_move_sq.sqrt()),
+                    age: tracked.map_or(Duration::ZERO, |t| now.saturating_duration_since(t.down_at)),
+                    confidence: c.confidence,
+                }
+            })
+            .collect();
+
+        // Only while the 2F pipeline actually owns the frame: a
+        // physical-button drag can have two contacts down with a
+        // baseline left over from before, and reporting that would be
+        // showing reasoning the engine isn't doing.
+        let two_finger = match (self.kind, self.two_baseline, active.len()) {
+            (
+                GestureKind::TwoFingerUnclassified
+                | GestureKind::TwoFingerPan
+                | GestureKind::TwoFingerPinchAndRotate,
+                Some(base),
+                2,
+            ) if !physical_drag => Some(base.metrics(active[0], active[1])),
+            _ => None,
+        };
+
+        let multi = match (self.kind, self.multi_baseline) {
+            (GestureKind::ThreeFingerLive | GestureKind::FourFingerLive, Some(base))
+                if !active.is_empty() && !physical_drag =>
+            {
+                let cx: f64 = active.iter().map(|c| c.x).sum::<f64>() / active.len() as f64;
+                let cy: f64 = active.iter().map(|c| c.y).sum::<f64>() / active.len() as f64;
+                let travel = (cx - base.initial_centroid.0, cy - base.initial_centroid.1);
+                let axis = base.axis;
+                let progress_ref_mm =
+                    self.swipe_ref_mm(axis.unwrap_or(crate::output::SwipeAxis::Horizontal));
+                Some(MultiMetrics {
+                    fingers: active.len(),
+                    travel_mm: travel,
+                    axis,
+                    axis_lock_mm: SWIPE_AXIS_LOCK_MM,
+                    progress: axis.map(|ax| match ax {
+                        SwipeAxis::Horizontal => travel.0 / progress_ref_mm,
+                        SwipeAxis::Vertical => travel.1 / progress_ref_mm,
+                    }),
+                    progress_ref_mm,
+                    velocity_mm_per_sec: base.velocity,
+                    horizontal_admitted: base.swipe_horizontal_admitted,
+                    vertical_admitted: base.swipe_vertical_admitted,
+                })
+            }
+            _ => None,
+        };
+
+        // Taken from the motion staged for the next frame rather than
+        // stashed when it was emitted: the emitted value is gone by the
+        // time this runs, and a field on the engine that exists only
+        // for a UI is exactly what this seam is meant to avoid.
+        let cursor_speed_mm_per_sec = self
+            .pending_motion
+            .or(self.physical_drag_pending_motion)
+            .and_then(|(dx, dy, dt)| {
+                let secs = dt.as_secs_f64();
+                (secs > 0.0).then(|| (dx * dx + dy * dy).sqrt() / secs)
+            });
+
+        let max_move_mm = self.max_move_sq.sqrt();
+        let since_start = now.saturating_duration_since(self.started_at);
+        obs.frame(&Snapshot {
+            at: now,
+            pad: self.pad,
+            kind: self.kind,
+            button,
+            physical_drag,
+            contacts,
+            since_start,
+            max_move_mm,
+            tap_window_open: max_move_mm < TAP_MAX_MOVE_MM && since_start < TAP_MAX_DURATION,
+            two_finger,
+            multi,
+            cursor_accel: self.cursor_accel,
+            cursor_speed_mm_per_sec,
+        });
     }
 
     fn classify(&self, n: usize) -> GestureKind {
@@ -1394,10 +1717,15 @@ impl<O: Output> State<O> {
         let a = active[0];
         let b = active[1];
         let centroid = ((a.x + b.x) / 2.0, (a.y + b.y) / 2.0);
-        let dx = b.x - a.x;
-        let dy = b.y - a.y;
-        let dist = (dx * dx + dy * dy).sqrt().max(1e-9);
-        let ang = dy.atan2(dx);
+        // Everything the 2F decision is made of, in one place: the
+        // geometry, the common/differential decomposition, the
+        // participation gates and the three normalized scores. The
+        // lock decision below, the log line it prints, and the gesture
+        // scope all read this one value — three views of the same
+        // numbers rather than three implementations of the formula.
+        let m = base.metrics(a, b);
+        let dist = m.distance_mm;
+        let ang = m.angle_rad;
 
         // Lock mode if not yet locked. Same could-still-tap gate as
         // dispatch_one: PAN_LOCK_MM (0.4) sits below TAP_MAX_MOVE_MM
@@ -1422,145 +1750,23 @@ impl<O: Output> State<O> {
                 self.two_baseline = Some(base);
                 return;
             }
-            // Decompose per-finger motion into common (centroid drift,
-            // a.k.a. pan) and differential (relative-motion, the
-            // pinch+rotate signal) components, looked up by contact ID
-            // so order swaps in `active` don't matter. Pan only locks
-            // if the common component strictly dominates the
-            // differential — otherwise the gesture is asymmetric
-            // pinch/rotate where one finger contributes most of the
-            // motion, and the centroid drift is a *side effect* of
-            // that asymmetry, not a real pan. Without this gate, an
-            // anchored-finger pinch (especially a slow one with
-            // contacts far apart, where 4% distance change in mm is
-            // larger than the 0.4mm pan threshold) locks pan before
-            // the distance ratio crosses `PINCH_LOCK_RATIO`. The
-            // strictly-greater comparison correctly rejects the
-            // boundary case of a fully-anchored finger
-            // (|common| = |differential|).
-            let (init_a, init_b) = if a.id == base.initial_a.0 {
-                (base.initial_a.1, base.initial_b.1)
-            } else {
-                (base.initial_b.1, base.initial_a.1)
-            };
-            let da = (a.x - init_a.0, a.y - init_a.1);
-            let db = (b.x - init_b.0, b.y - init_b.1);
-            let common = ((da.0 + db.0) * 0.5, (da.1 + db.1) * 0.5);
-            let differential = ((da.0 - db.0) * 0.5, (da.1 - db.1) * 0.5);
-            let common_mag = (common.0.powi(2) + common.1.powi(2)).sqrt();
-            let differential_mag = (differential.0.powi(2) + differential.1.powi(2)).sqrt();
-            // Pan requires both fingers to participate in roughly the
-            // same translation. Two gates filter pinch/rotate signals
-            // that masquerade as pan:
-            //
-            // A. Margin: |common| must beat |differential| by 20%, not
-            //    just by epsilon. Near-perpendicular motion where the
-            //    common-vs-differential test is right on the boundary
-            //    isn't really "translation."
-            // B. Per-finger participation, satisfied by *either*:
-            //    - Balance: slower contact moves ≥ 30% of the faster.
-            //      Catches symmetric pan where both fingers contribute.
-            //    - Alignment: motion vectors point in nearly the same
-            //      direction (cos > PAN_ALIGNMENT_COS_MIN ≈ 14°). Catches
-            //      a slow scroll where one finger lags the other —
-            //      common when fingers are crammed close on a small
-            //      trackpad. Without this branch, the user's slow
-            //      careful scrolls on the SoflePLUS2 misclassified as
-            //      pinch+rotate (cf. /tmp/companion-logs ~2026-05-02:
-            //      one finger moved 2.3 mm while the other moved 0.3 mm
-            //      in the same direction; cos = 0.997, balance = 0.13).
-            //
-            // Both gates ride on top of the strict `common > differential`
-            // test, which alone passes anchored-finger rotates where the
-            // "anchored" finger drifts a few hundredths of a mm in the
-            // same direction as the sweeper.
-            let da_mag = (da.0.powi(2) + da.1.powi(2)).sqrt();
-            let db_mag = (db.0.powi(2) + db.1.powi(2)).sqrt();
-            let min_per_finger = da_mag.min(db_mag);
-            let max_per_finger = da_mag.max(db_mag);
-            // Cosine of the angle between the two motion vectors.
-            // Undefined when either is zero — fall through to balance.
-            let alignment = if da_mag > 0.0 && db_mag > 0.0 {
-                (da.0 * db.0 + da.1 * db.1) / (da_mag * db_mag)
-            } else {
-                -1.0
-            };
-            let margin_ok = common_mag > differential_mag * 1.2;
-            let balance = if max_per_finger > 0.0 {
-                min_per_finger / max_per_finger
-            } else {
-                0.0
-            };
-            let balance_ok = balance >= 0.3;
-            let aligned = alignment > PAN_ALIGNMENT_COS_MIN;
-            let pan_qualified = margin_ok && (balance_ok || aligned);
-
-            // Always-computed raw scores for the lock-decision log: a 0
-            // there should mean "didn't accumulate," not "qualification
-            // gate zeroed it." The selection scores below still gate on
-            // qualification so suppressed signals can't win.
-            let pan_raw = common_mag / PAN_LOCK_MM;
-            let pinch_raw = (dist / base.initial_distance - 1.0).abs() / PINCH_LOCK_RATIO;
-            let rot_raw = angle_delta(ang, base.initial_angle).abs() / ROTATE_LOCK_RAD;
-
-            let pan = if pan_qualified { pan_raw } else { 0.0 };
-            // Pinch/rotate scoring is hypersensitive to per-finger noise on
-            // a long lever arm: with fingers ~20 mm apart, sub-mm jitter
-            // accumulated over a few hundred ms can drift the inter-finger
-            // angle past ROTATE_LOCK_RAD (4°) without the user actually
-            // rotating. Two patterns produce trustworthy pinch/rot signal:
-            //
-            //   (a) Both fingers committed past tap-jitter
-            //       (min_per_finger >= TAP_MAX_MOVE_MM). Real bimanual
-            //       rotation/pinch.
-            //   (b) One finger essentially anchored (sub-noise floor) and
-            //       the other moving. Anchored-rotate / anchored-pinch.
-            //
-            // In between — one finger committed, the other drifting in the
-            // ~0.3..1.0 mm noise band — the differential's direction is
-            // dominated by the drifting finger's noise, which from contact
-            // data alone is indistinguishable from a real anti-parallel
-            // rotation. Defer the lock until either the trailer commits or
-            // pan locks on coherent centroid motion. Reproduces user's
-            // 2026-05-04 logs:
-            //   * 485 ms quiet hold (max=0.89 mm, min=0.67 mm) → both
-            //     fingers in noise band, defer.
-            //   * 570 ms quiet then leader heads south (max=1.27 mm,
-            //     min=0.47 mm) → leader committed but trailer's 0.47 mm
-            //     of opposite-y noise looks anti-parallel; defer until
-            //     trailer commits.
-            let pinch_rot_admissible =
-                min_per_finger >= TAP_MAX_MOVE_MM || min_per_finger < ANCHORED_FINGER_FLOOR_MM;
-            // Penalize pinch/rot selection scores when the two finger-
-            // motion vectors are roughly parallel (high positive
-            // alignment cosine). Real pinch and real rotate have
-            // anti-parallel or truly-anchored geometry — anti-parallel
-            // gives cos ≤ 0 (penalty 1.0, no effect) and truly-anchored
-            // gives cos = -1 by the code's fallback (penalty 1.0).
-            // Positive alignment is a "both fingers want the same
-            // direction" signal: most likely a slow scroll whose
-            // trailing finger lags. On the SoflePLUS2's small off-center
-            // trackpad the user's wrist offset systematically makes one
-            // finger drag less than the other, fooling the per-finger
-            // gates and locking pinch+rotate when scroll was intended.
-            // Linear falloff (1 - cos) clipped at 0; see gesture-tuning
-            // -ideas.md idea #2.
-            let align_penalty = (1.0 - alignment).clamp(0.0, 1.0);
-            // Zero out modes the under-cursor app's policy doesn't admit
-            // (sampled at gesture start in `transition`). With both
-            // zeroed, only `pan` can ever cross — a 2F gesture in an
-            // app that doesn't allow pinch/rotate falls through to
-            // scroll instead of locking pinch+rotate-but-suppressed.
-            let pinch = if pinch_rot_admissible && base.pinch_admitted {
-                pinch_raw * align_penalty
-            } else {
-                0.0
-            };
-            let rot = if pinch_rot_admissible && base.rotate_admitted {
-                rot_raw * align_penalty
-            } else {
-                0.0
-            };
+            // The scores and gates below come from
+            // `TwoFingerBaseline::metrics`, which is where the
+            // decomposition and every threshold that feeds it are
+            // explained.
+            let TwoFingerMetrics {
+                common_mm: common_mag,
+                differential_mm: differential_mag,
+                alignment,
+                balance,
+                pan_raw,
+                pinch_raw,
+                rot_raw,
+                pan,
+                pinch,
+                rot,
+                ..
+            } = m;
             if pan >= 1.0 || pinch >= 1.0 || rot >= 1.0 {
                 // Pan is mutually exclusive with pinch/rotate (matches
                 // macOS PTP behavior: a 2F gesture locks into either
@@ -1620,27 +1826,9 @@ impl<O: Output> State<O> {
                     GestureKind::TwoFingerPinchAndRotate
                 };
                 self.kind = new_kind;
-                let pan_tag = if pan_qualified {
-                    String::new()
-                } else if !margin_ok {
-                    " disq:margin".to_string()
-                } else {
-                    " disq:participation".to_string()
-                };
-                let pinch_tag = if !pinch_rot_admissible {
-                    " gated:noise"
-                } else if !base.pinch_admitted {
-                    " gated:policy"
-                } else {
-                    ""
-                };
-                let rot_tag = if !pinch_rot_admissible {
-                    " gated:noise"
-                } else if !base.rotate_admitted {
-                    " gated:policy"
-                } else {
-                    ""
-                };
+                let pan_tag = m.pan_tag();
+                let pinch_tag = m.pinch_tag();
+                let rot_tag = m.rot_tag();
                 match new_kind {
                     GestureKind::TwoFingerPan => {
                         log::info!(
@@ -1859,6 +2047,193 @@ impl<O: Output> State<O> {
             .swipe(axis, signed_progress, /* velocity */ 0.0, phase);
         self.multi_baseline = Some(base);
     }
+}
+
+// ---- Observation ----
+//
+// `Output` is where the engine's *decisions* go. This is where its
+// *reasoning* goes: the per-frame numbers the 2F lock is decided from,
+// which until now existed only inside a log line.
+//
+// It is a second, optional sink rather than an extension of `Output`
+// because the two answer to different owners — `Output` is the platform
+// the gestures are for, an `Observer` is whoever is looking. The engine
+// hands over what it already computed and knows nothing about who is
+// on the other end; `scope.rs` renders it live, `main.rs` does the
+// wiring, and the unit tests leave it unset. That is the same shape as
+// pad geometry: a setter on the engine, the knowledge of where the data
+// comes from kept in `main`.
+
+/// Receives one [`Snapshot`] per processed frame.
+///
+/// Called on the same thread and inside the same call as the gesture
+/// dispatch, so an implementation must be cheap — copy what it needs
+/// and return. Anything slow here shows up as trackpad latency.
+pub trait Observer {
+    /// Whether snapshots are wanted at all right now. Checked before
+    /// one is built, so a closed scope costs a branch per frame rather
+    /// than an allocation.
+    fn wants_frames(&self) -> bool {
+        true
+    }
+    fn frame(&self, snapshot: &Snapshot);
+}
+
+/// One frame of engine state, as the engine saw it.
+#[derive(Clone, Debug)]
+pub struct Snapshot {
+    pub at: Timestamp,
+    /// Pad size, when a device has reported one. `None` means the
+    /// engine is running on its unscaled defaults.
+    pub pad: Option<PadGeometry>,
+    pub kind: GestureKind,
+    /// Integrated button state as reported by the device.
+    pub button: bool,
+    /// True while a held physical button has taken over multi-finger
+    /// handling, which suppresses the normal gesture pipeline.
+    pub physical_drag: bool,
+    pub contacts: Vec<ContactTrack>,
+    /// Time since the current gesture session started.
+    pub since_start: Duration,
+    /// Largest displacement any contact has accumulated this session.
+    pub max_move_mm: f64,
+    /// Whether the touch could still turn out to be a tap. While this
+    /// is true the engine deliberately refuses to lock anything, which
+    /// is the usual answer to "why is nothing happening yet".
+    pub tap_window_open: bool,
+    /// The 2F decision vector, whenever two fingers are being
+    /// classified.
+    pub two_finger: Option<TwoFingerMetrics>,
+    /// The 3F/4F swipe state, whenever a multi-finger gesture is live.
+    pub multi: Option<MultiMetrics>,
+    /// The cursor-acceleration curve currently in force. Carried so a
+    /// viewer can render the curve alongside the speed going into it —
+    /// which is the only way `accel_exponent` and `accel_ref` are
+    /// legible at all, being shape parameters of something invisible.
+    pub cursor_accel: CursorAccel,
+    /// Speed of the cursor motion staged for the next frame, in mm/s.
+    /// `None` when no cursor motion is in flight. Feed it to
+    /// [`accelerate_cursor`] with `cursor_accel` for the pixels-per-second
+    /// the curve turns it into.
+    pub cursor_speed_mm_per_sec: Option<f64>,
+}
+
+/// A contact, with the part of its history the engine keeps.
+#[derive(Clone, Copy, Debug)]
+pub struct ContactTrack {
+    pub id: u8,
+    pub x_mm: f64,
+    pub y_mm: f64,
+    /// Where this contact landed.
+    pub down_x_mm: f64,
+    pub down_y_mm: f64,
+    /// Furthest this contact has been from its landing point.
+    pub max_move_mm: f64,
+    pub age: Duration,
+    pub confidence: bool,
+}
+
+/// The 2F lock decision vector. See [`TwoFingerBaseline::metrics`].
+///
+/// The three scores are normalized: 1.0 is the lock threshold for that
+/// mode, so they are directly comparable and a bar chart of them is the
+/// decision. `*_raw` is what the signal accumulated; `pan`, `pinch` and
+/// `rot` are the same values after the gates, and those are what the
+/// lock actually selects on.
+#[derive(Clone, Copy, Debug)]
+pub struct TwoFingerMetrics {
+    pub distance_mm: f64,
+    pub initial_distance_mm: f64,
+    pub angle_rad: f64,
+    /// Signed change in the inter-finger angle since the baseline.
+    pub angle_delta_rad: f64,
+    /// Magnitude of the common (translation) component.
+    pub common_mm: f64,
+    /// Magnitude of the differential (pinch+rotate) component.
+    pub differential_mm: f64,
+    /// Cosine between the two fingers' motion vectors. −1 when either
+    /// hasn't moved.
+    pub alignment: f64,
+    /// Slower finger's travel over the faster one's.
+    pub balance: f64,
+    /// Per-finger travel since the baseline, in `active` order.
+    pub travel_mm: (f64, f64),
+    pub pan_raw: f64,
+    pub pinch_raw: f64,
+    pub rot_raw: f64,
+    pub pan: f64,
+    pub pinch: f64,
+    pub rot: f64,
+    pub margin_ok: bool,
+    pub balance_ok: bool,
+    pub aligned: bool,
+    pub pan_qualified: bool,
+    pub pinch_rot_admissible: bool,
+    pub pinch_admitted: bool,
+    pub rotate_admitted: bool,
+    /// Whether a pinch/rotate lock has already been held back a frame
+    /// to let a lagging finger catch up.
+    pub lock_deferred: bool,
+    /// Magnitude of the EMA-smoothed centroid velocity sampled while
+    /// panning, in mm/s — the speed that feeds the scroll curve, and
+    /// the one that seeds inertia at lift. Zero until a pan locks.
+    pub scroll_speed_mm_per_sec: f64,
+}
+
+impl TwoFingerMetrics {
+    /// Why pan's score is not being selected on, if it isn't. Empty
+    /// when pan qualified.
+    pub fn pan_tag(&self) -> &'static str {
+        if self.pan_qualified {
+            ""
+        } else if !self.margin_ok {
+            " disq:margin"
+        } else {
+            " disq:participation"
+        }
+    }
+
+    /// Why pinch's score is zeroed, if it is.
+    pub fn pinch_tag(&self) -> &'static str {
+        if !self.pinch_rot_admissible {
+            " gated:noise"
+        } else if !self.pinch_admitted {
+            " gated:policy"
+        } else {
+            ""
+        }
+    }
+
+    /// Why rotate's score is zeroed, if it is.
+    pub fn rot_tag(&self) -> &'static str {
+        if !self.pinch_rot_admissible {
+            " gated:noise"
+        } else if !self.rotate_admitted {
+            " gated:policy"
+        } else {
+            ""
+        }
+    }
+}
+
+/// The 3F/4F swipe state.
+#[derive(Clone, Copy, Debug)]
+pub struct MultiMetrics {
+    pub fingers: usize,
+    /// Centroid travel since the gesture started.
+    pub travel_mm: (f64, f64),
+    /// Locked axis, once centroid travel crossed
+    /// [`axis_lock_mm`](Self::axis_lock_mm) on one of them.
+    pub axis: Option<SwipeAxis>,
+    pub axis_lock_mm: f64,
+    /// Signed progress along the locked axis: ±1.0 is a full swipe.
+    pub progress: Option<f64>,
+    /// Travel that counts as a full swipe on the locked axis, scaled to
+    /// the pad when its size is known.
+    pub progress_ref_mm: f64,
+    pub velocity_mm_per_sec: (f64, f64),
+    pub horizontal_admitted: bool,
+    pub vertical_admitted: bool,
 }
 
 /// Smallest signed difference between two angles, in (-π, π].
@@ -4164,5 +4539,172 @@ mod tests {
         // session starts clean.
         assert_eq!(s.cursor_carry_x_px, 0.0);
         assert_eq!(s.cursor_carry_y_px, 0.0);
+    }
+    // ---- The observer seam ----
+    //
+    // These don't test the scope (there is no AppKit here); they test
+    // that what the scope is handed is the same thing the engine
+    // decided on. A scope showing numbers that don't explain the lock
+    // would be worse than no scope at all.
+
+    /// An [`Observer`] that keeps what it is given.
+    #[derive(Default)]
+    struct Watcher {
+        snaps: RefCell<Vec<Snapshot>>,
+        accepting: std::cell::Cell<bool>,
+    }
+
+    impl Watcher {
+        fn new() -> std::rc::Rc<Self> {
+            let w = std::rc::Rc::new(Self::default());
+            w.accepting.set(true);
+            w
+        }
+        fn locked(&self) -> Option<Snapshot> {
+            self.snaps
+                .borrow()
+                .iter()
+                .find(|s| {
+                    matches!(
+                        s.kind,
+                        GestureKind::TwoFingerPan | GestureKind::TwoFingerPinchAndRotate
+                    )
+                })
+                .cloned()
+        }
+    }
+
+    impl Observer for std::rc::Rc<Watcher> {
+        fn wants_frames(&self) -> bool {
+            self.accepting.get()
+        }
+        fn frame(&self, snapshot: &Snapshot) {
+            self.snaps.borrow_mut().push(snapshot.clone());
+        }
+    }
+
+    #[test]
+    fn a_pinch_lock_is_reported_with_the_score_that_crossed() {
+        let r = Recorder::default();
+        let watcher = Watcher::new();
+        let mut s = State::new(&r, test_accel());
+        s.set_observer(Some(Box::new(std::rc::Rc::clone(&watcher))));
+        s.on_frame(frame(&[(1, 0.45, 0.5), (2, 0.55, 0.5)]));
+        s.on_frame(frame(&[(1, 0.4, 0.5), (2, 0.6, 0.5)]));
+        s.on_frame(frame(&[(1, 0.3, 0.5), (2, 0.7, 0.5)]));
+        s.on_frame(frame(&[]));
+
+        assert_eq!(
+            watcher.snaps.borrow().len(),
+            4,
+            "one snapshot per frame, the lift included"
+        );
+        let locked = watcher.locked().expect("the spread locks");
+        assert_eq!(locked.kind, GestureKind::TwoFingerPinchAndRotate);
+        let m = locked
+            .two_finger
+            .expect("a 2F frame carries the decision it was made from");
+        assert!(
+            m.pinch >= 1.0,
+            "the score that crossed has to be the one shown: {m:?}"
+        );
+        assert_eq!(m.pinch_tag(), "", "nothing gated pinch here");
+        assert!(m.differential_mm > m.common_mm, "a spread is differential");
+    }
+
+    #[test]
+    fn a_scroll_lock_is_reported_as_a_qualified_pan() {
+        let r = Recorder::default();
+        let watcher = Watcher::new();
+        let mut s = State::new(&r, test_accel());
+        s.set_observer(Some(Box::new(std::rc::Rc::clone(&watcher))));
+        s.on_frame(frame(&[(1, 0.4, 0.5), (2, 0.6, 0.5)]));
+        s.on_frame(frame(&[(1, 0.4, 0.55), (2, 0.6, 0.55)]));
+        s.on_frame(frame(&[(1, 0.4, 0.6), (2, 0.6, 0.6)]));
+        s.on_frame(frame(&[]));
+
+        let locked = watcher.locked().expect("the pan locks");
+        assert_eq!(locked.kind, GestureKind::TwoFingerPan);
+        let m = locked.two_finger.expect("metrics for a 2F frame");
+        assert!(m.pan_qualified && m.pan >= 1.0, "{m:?}");
+        assert_eq!(m.pan_tag(), "");
+        assert!(m.common_mm > m.differential_mm, "a pan is common motion");
+    }
+
+    #[test]
+    fn a_policy_gated_mode_says_so_rather_than_reading_as_no_signal() {
+        let r = Recorder::default();
+        r.deny_pinch();
+        r.deny_rotate();
+        let watcher = Watcher::new();
+        let mut s = State::new(&r, test_accel());
+        s.set_observer(Some(Box::new(std::rc::Rc::clone(&watcher))));
+        s.on_frame(frame(&[(1, 0.45, 0.5), (2, 0.55, 0.5)]));
+        s.on_frame(frame(&[(1, 0.4, 0.5), (2, 0.6, 0.5)]));
+        s.on_frame(frame(&[(1, 0.3, 0.5), (2, 0.7, 0.5)]));
+
+        let last = watcher
+            .snaps
+            .borrow()
+            .last()
+            .cloned()
+            .expect("frames were observed");
+        let m = last.two_finger.expect("metrics for a 2F frame");
+        // The distinction the scope exists to make: the signal is
+        // there, the policy is what zeroed it.
+        assert!(m.pinch_raw > 0.0, "the spread did accumulate: {m:?}");
+        assert_eq!(m.pinch, 0.0);
+        assert_eq!(m.pinch_tag(), " gated:policy");
+        assert_eq!(m.rot_tag(), " gated:policy");
+    }
+
+    #[test]
+    fn contacts_are_reported_with_where_they_landed() {
+        let r = Recorder::default();
+        let watcher = Watcher::new();
+        let mut s = State::new(&r, test_accel());
+        s.on_frame(frame(&[(7, 0.2, 0.3)]));
+        s.set_observer(Some(Box::new(std::rc::Rc::clone(&watcher))));
+        s.on_frame(frame(&[(7, 0.5, 0.3)]));
+
+        let snap = watcher.snaps.borrow().last().cloned().unwrap();
+        let c = snap.contacts.first().expect("one contact");
+        assert_eq!(c.id, 7);
+        assert!((c.x_mm - 0.5 * TEST_PAD_MM).abs() < 1e-6);
+        // The landing point survives the move, which is what every
+        // per-finger displacement in the panel is measured against.
+        assert!((c.down_x_mm - 0.2 * TEST_PAD_MM).abs() < 1e-6);
+        assert!(c.max_move_mm > 14.0);
+    }
+
+    #[test]
+    fn an_observer_that_wants_nothing_is_never_called() {
+        let r = Recorder::default();
+        let watcher = Watcher::new();
+        watcher.accepting.set(false);
+        let mut s = State::new(&r, test_accel());
+        s.set_observer(Some(Box::new(std::rc::Rc::clone(&watcher))));
+        s.on_frame(frame(&[(1, 0.4, 0.5), (2, 0.6, 0.5)]));
+        s.on_frame(frame(&[(1, 0.4, 0.6), (2, 0.6, 0.6)]));
+        assert!(
+            watcher.snaps.borrow().is_empty(),
+            "a closed scope must not cost a snapshot"
+        );
+    }
+
+    #[test]
+    fn the_tap_window_is_reported_while_it_is_holding_the_lock_back() {
+        let r = Recorder::default();
+        let watcher = Watcher::new();
+        let mut s = State::new(&r, test_accel());
+        s.set_observer(Some(Box::new(std::rc::Rc::clone(&watcher))));
+        // A touch that has barely moved: the engine refuses to classify
+        // it, and the scope has to be able to say why.
+        s.on_frame(frame(&[(1, 0.4, 0.5), (2, 0.6, 0.5)]));
+        s.on_frame(frame(&[(1, 0.401, 0.5), (2, 0.601, 0.5)]));
+
+        let snap = watcher.snaps.borrow().last().cloned().unwrap();
+        assert!(snap.tap_window_open);
+        assert_eq!(snap.kind, GestureKind::TwoFingerUnclassified);
     }
 }

@@ -49,15 +49,18 @@ const POLL_SECS: f64 = 1.0;
 /// go feels immediate.
 const FLUSH_DELAY_SECS: f64 = 0.25;
 
-const CURSOR_MIN: f64 = 5.0;
-const CURSOR_MAX: f64 = 80.0;
-const EXPONENT_MIN: f64 = 0.5;
-const EXPONENT_MAX: f64 = 2.0;
-const SCROLL_MIN: f64 = 5.0;
-const SCROLL_MAX: f64 = 80.0;
+// Slider ranges. `pub(crate)` because the gesture scope carries the
+// same four sliders and must not invent its own bounds — two windows
+// editing one key through different ranges is a bug waiting to happen.
+pub(crate) const CURSOR_MIN: f64 = 5.0;
+pub(crate) const CURSOR_MAX: f64 = 80.0;
+pub(crate) const EXPONENT_MIN: f64 = 0.5;
+pub(crate) const EXPONENT_MAX: f64 = 2.0;
+pub(crate) const SCROLL_MIN: f64 = 5.0;
+pub(crate) const SCROLL_MAX: f64 = 80.0;
 /// Velocity at which `sensitivity` is the plain linear feel, in mm/s.
-const ACCEL_REF_MIN: f64 = 20.0;
-const ACCEL_REF_MAX: f64 = 200.0;
+pub(crate) const ACCEL_REF_MIN: f64 = 20.0;
+pub(crate) const ACCEL_REF_MAX: f64 = 200.0;
 
 thread_local! {
     static SETTINGS: RefCell<Option<Window>> = const { RefCell::new(None) };
@@ -78,13 +81,17 @@ pub fn config_path_display() -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
-fn config_path() -> Option<PathBuf> {
+/// The config file both this window and the gesture scope edit.
+pub(crate) fn config_path() -> Option<PathBuf> {
     CONFIG_PATH.with(|p| p.borrow().clone())
 }
 
 /// Apply an edit to the config file. Reloads the document each time so
 /// hand edits made since the window opened are never clobbered.
-fn edit(f: impl FnOnce(&mut ConfigFile) -> anyhow::Result<()>) {
+///
+/// Shared with the gesture scope, whose sliders write the same keys —
+/// one implementation of "patch the file without eating the comments".
+pub(crate) fn edit(f: impl FnOnce(&mut ConfigFile) -> anyhow::Result<()>) {
     let Some(path) = config_path() else {
         log::error!("settings: no config path registered");
         return;
@@ -324,11 +331,14 @@ fn on_off(on: bool) -> &'static str {
     if on { "on" } else { "off" }
 }
 
-fn round1(v: f64) -> f64 {
+// Shared with the gesture scope's sliders: both windows write the same
+// four keys, and a value that rounded differently depending on which
+// window you dragged would show up as a phantom file change.
+pub(crate) fn round1(v: f64) -> f64 {
     (v * 10.0).round() / 10.0
 }
 
-fn round2(v: f64) -> f64 {
+pub(crate) fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
 }
 

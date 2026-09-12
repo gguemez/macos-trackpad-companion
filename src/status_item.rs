@@ -90,6 +90,13 @@ define_class!(
             }
         }
 
+        #[unsafe(method(openScope:))]
+        fn open_scope(&self, _sender: Option<&AnyObject>) {
+            if let Some(mtm) = MainThreadMarker::new() {
+                crate::scope::show(mtm);
+            }
+        }
+
         #[unsafe(method(quit:))]
         fn quit(&self, _sender: Option<&AnyObject>) {
             // Quitting can leave the machine with no pointer at all: a
@@ -269,6 +276,20 @@ impl StatusItem {
         };
         unsafe { settings.setTarget(Some(target.as_ref() as &AnyObject)) };
         menu.addItem(&settings);
+
+        // The live view of what the recognizer is thinking. Off until
+        // asked for: the engine skips building a snapshot while nothing
+        // is watching.
+        let scope = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                mtm.alloc::<NSMenuItem>(),
+                &NSString::from_str("Gesture Scope…"),
+                Some(sel!(openScope:)),
+                &NSString::from_str("g"),
+            )
+        };
+        unsafe { scope.setTarget(Some(target.as_ref() as &AnyObject)) };
+        menu.addItem(&scope);
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 

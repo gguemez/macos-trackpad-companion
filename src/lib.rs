@@ -22,6 +22,7 @@ pub mod pause;
 pub mod permissions;
 pub mod report;
 pub mod scan_clock;
+pub mod scope;
 pub mod settings;
 pub mod status_item;
 pub mod system_prefs;

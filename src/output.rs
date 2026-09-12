@@ -101,7 +101,11 @@ fn display_bounds_for(point: CGPoint) -> CGRect {
 /// Apply the scroll-acceleration curve to a velocity, returning pixels
 /// per second. Caller multiplies by per-tick `dt` for the per-tick
 /// pixel delta.
-fn accelerate_scroll(v_mm_per_sec: f64, scroll_accel: f64) -> f64 {
+///
+/// Public so the gesture scope can show what `scroll.sensitivity` is
+/// doing to a real scroll, rather than reimplementing the curve and
+/// being wrong about it later.
+pub fn accelerate_scroll(v_mm_per_sec: f64, scroll_accel: f64) -> f64 {
     let mag = v_mm_per_sec.abs();
     if mag == 0.0 {
         return 0.0;
