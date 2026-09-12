@@ -77,14 +77,22 @@ A trackpad's behaviour is now portable: a device nobody here owns can be
 diagnosed from a file, and a misclassification can be reproduced as many
 times as it takes.
 
-Open question found by the first real capture, and a good example of
-what this is for: three two-finger gestures on the test pad all locked
-to pinch+rotate, with `align` between -0.94 and -1.00 — near-perfectly
-anti-parallel motion — where two of them were intended as scrolls. Pan
-scored highest each time and was disqualified on margin. Either the
-fingers genuinely spread, or contact ids are being swapped between
-frames, which would make parallel motion look anti-parallel. One capture
-showed `balance=0.00`, meaning one finger was completely stationary.
+The first real capture is also a worked example of the value. Three
+two-finger gestures all locked to pinch+rotate with `align` between
+-0.94 and -1.00, where two were believed to be scrolls — which looked
+like a misclassification, with swapped contact ids as the obvious
+suspect.
+
+Analysing the raw capture directly, independent of the engine, settled
+it: contact ids stayed `(0, 1)` throughout with zero discontinuous
+jumps over 5 mm, and each finger travelled 38-49 mm in genuinely
+opposite directions. All three were pinches. The engine classified
+exactly what the hardware reported, and the scrolls simply weren't in
+the recording.
+
+The point is not the answer but the cost of getting it: about thirty
+seconds against a file, rather than an inconclusive argument about what
+someone's fingers did.
 
 ### Feature reports are read back ✅
 
