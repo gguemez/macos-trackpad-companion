@@ -248,6 +248,42 @@ fn main() {
     println!(
         "passed: settings focus, close/reopen, timer cancellation and multi-window activation"
     );
+    // The controls build() places are the window's direct subviews; a
+    // recursive walk would drag in each slider's own internals, which do
+    // legitimately sit on top of their slider. Absolute frames on a
+    // hand-laid-out window have no layout engine to catch a collision,
+    // so this is the only thing that will.
+    for w in [&settings_window, &scope_window] {
+        // A bare NSView is a container — the scope's tuning column is one,
+        // and its buttons are meant to sit inside it. Every control is a
+        // subclass, so this excludes exactly the groups. "Has subviews"
+        // would not: NSSlider has internals of its own.
+        let placed: Vec<_> = w
+            .contentView()
+            .unwrap()
+            .subviews()
+            .into_iter()
+            .filter(|v| v.class().name().to_bytes() != b"NSView")
+            .collect();
+        for (i, a) in placed.iter().enumerate() {
+            for b in placed.iter().skip(i + 1) {
+                let (fa, fb) = (a.frame(), b.frame());
+                let overlap = fa.origin.x < fb.origin.x + fb.size.width
+                    && fb.origin.x < fa.origin.x + fa.size.width
+                    && fa.origin.y < fb.origin.y + fb.size.height
+                    && fb.origin.y < fa.origin.y + fa.size.height;
+                assert!(
+                    !overlap,
+                    "{} overlaps {} in \"{}\": {fa:?} vs {fb:?}",
+                    a.class().name().to_string_lossy(),
+                    b.class().name().to_string_lossy(),
+                    w.title(),
+                );
+            }
+        }
+    }
+    println!("passed: no control overlaps another in the settings or scope window");
+
     about::show(mtm);
     let about_window = window(&app, "About Trackpad Companion");
     assert_eq!(

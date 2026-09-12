@@ -112,14 +112,20 @@ fn main() -> Result<()> {
     log_builder.init();
     config_watch::set_log_file_path(log_file_path.clone());
 
+    // The version goes on this line specifically. A log someone mails you
+    // is often all you get, and "which build produced this" is the first
+    // question; the diagnostics blob carries it too, but that is a copy
+    // the user has to think to make.
     if cfg_path.exists() {
         log::info!(
-            "macos-trackpad-companion starting (config={})",
+            "macos-trackpad-companion {} starting (config={})",
+            env!("CARGO_PKG_VERSION"),
             cfg_path.display()
         );
     } else {
         log::info!(
-            "macos-trackpad-companion starting (no config at {} — using defaults)",
+            "macos-trackpad-companion {} starting (no config at {} — using defaults)",
+            env!("CARGO_PKG_VERSION"),
             cfg_path.display(),
         );
     }

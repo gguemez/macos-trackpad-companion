@@ -36,7 +36,7 @@ use crate::config::{self, Config, GestureEnable};
 use crate::config_edit::ConfigFile;
 
 const WINDOW_W: f64 = 520.0;
-const WINDOW_H: f64 = 656.0;
+const WINDOW_H: f64 = 676.0;
 const POLL_SECS: f64 = 1.0;
 /// Quiet period after the last slider movement before the file is
 /// written. Long enough to coalesce a drag, short enough that letting
@@ -419,22 +419,22 @@ impl Window {
             .contentView()
             .expect("NSWindow auto-creates a contentView");
 
-        let title = label(mtm, "Settings", 24.0, 614.0, 300.0, 22.0);
+        let title = label(mtm, "Settings", 24.0, 634.0, 300.0, 22.0);
         title.setFont(Some(&NSFont::boldSystemFontOfSize(15.0)));
         content.addSubview(&title);
         let blurb = label(
             mtm,
             "Saved to the config file and applied within a second.",
             24.0,
-            592.0,
+            612.0,
             472.0,
             18.0,
         );
         blurb.setFont(Some(&NSFont::systemFontOfSize(11.0)));
         content.addSubview(&blurb);
 
-        content.addSubview(&section(mtm, "Cursor", 560.0));
-        content.addSubview(&label(mtm, "Sensitivity", 24.0, 532.0, 120.0, 18.0));
+        content.addSubview(&section(mtm, "Cursor", 580.0));
+        content.addSubview(&label(mtm, "Sensitivity", 24.0, 552.0, 120.0, 18.0));
         let cursor_sensitivity = slider(
             mtm,
             25.0,
@@ -443,13 +443,13 @@ impl Window {
             &actions,
             sel!(cursorSensitivity:),
             150.0,
-            528.0,
+            548.0,
         );
         content.addSubview(&cursor_sensitivity);
-        let cursor_sensitivity_value = label(mtm, "", 400.0, 532.0, 90.0, 18.0);
+        let cursor_sensitivity_value = label(mtm, "", 400.0, 552.0, 90.0, 18.0);
         content.addSubview(&cursor_sensitivity_value);
 
-        content.addSubview(&label(mtm, "Acceleration", 24.0, 502.0, 120.0, 18.0));
+        content.addSubview(&label(mtm, "Acceleration", 24.0, 522.0, 120.0, 18.0));
         let cursor_exponent = slider(
             mtm,
             1.0,
@@ -458,13 +458,13 @@ impl Window {
             &actions,
             sel!(cursorExponent:),
             150.0,
-            498.0,
+            518.0,
         );
         content.addSubview(&cursor_exponent);
-        let cursor_exponent_value = label(mtm, "", 400.0, 502.0, 90.0, 18.0);
+        let cursor_exponent_value = label(mtm, "", 400.0, 522.0, 90.0, 18.0);
         content.addSubview(&cursor_exponent_value);
 
-        content.addSubview(&label(mtm, "Accel reference", 24.0, 472.0, 120.0, 18.0));
+        content.addSubview(&label(mtm, "Accel reference", 24.0, 492.0, 120.0, 18.0));
         let cursor_accel_ref = slider(
             mtm,
             80.0,
@@ -473,24 +473,24 @@ impl Window {
             &actions,
             sel!(cursorAccelRef:),
             150.0,
-            468.0,
+            488.0,
         );
         content.addSubview(&cursor_accel_ref);
-        let cursor_accel_ref_value = label(mtm, "", 400.0, 472.0, 90.0, 18.0);
+        let cursor_accel_ref_value = label(mtm, "", 400.0, 492.0, 90.0, 18.0);
         content.addSubview(&cursor_accel_ref_value);
         let accel_note = label(
             mtm,
             "mm/s at which sensitivity is the plain linear feel",
             150.0,
-            450.0,
+            470.0,
             340.0,
             14.0,
         );
         accel_note.setFont(Some(&NSFont::systemFontOfSize(10.0)));
         content.addSubview(&accel_note);
 
-        content.addSubview(&section(mtm, "Scroll", 418.0));
-        content.addSubview(&label(mtm, "Sensitivity", 24.0, 390.0, 120.0, 18.0));
+        content.addSubview(&section(mtm, "Scroll", 438.0));
+        content.addSubview(&label(mtm, "Sensitivity", 24.0, 410.0, 120.0, 18.0));
         let scroll_sensitivity = slider(
             mtm,
             20.0,
@@ -499,13 +499,13 @@ impl Window {
             &actions,
             sel!(scrollSensitivity:),
             150.0,
-            386.0,
+            406.0,
         );
         content.addSubview(&scroll_sensitivity);
-        let scroll_sensitivity_value = label(mtm, "", 400.0, 390.0, 90.0, 18.0);
+        let scroll_sensitivity_value = label(mtm, "", 400.0, 410.0, 90.0, 18.0);
         content.addSubview(&scroll_sensitivity_value);
 
-        content.addSubview(&label(mtm, "Acceleration", 24.0, 360.0, 120.0, 18.0));
+        content.addSubview(&label(mtm, "Acceleration", 24.0, 380.0, 120.0, 18.0));
         let scroll_exponent = slider(
             mtm,
             1.3,
@@ -514,13 +514,13 @@ impl Window {
             &actions,
             sel!(scrollExponent:),
             150.0,
-            356.0,
+            376.0,
         );
         content.addSubview(&scroll_exponent);
-        let scroll_exponent_value = label(mtm, "", 400.0, 360.0, 90.0, 18.0);
+        let scroll_exponent_value = label(mtm, "", 400.0, 380.0, 90.0, 18.0);
         content.addSubview(&scroll_exponent_value);
 
-        content.addSubview(&label(mtm, "Accel reference", 24.0, 330.0, 120.0, 18.0));
+        content.addSubview(&label(mtm, "Accel reference", 24.0, 350.0, 120.0, 18.0));
         let scroll_accel_ref = slider(
             mtm,
             60.0,
@@ -529,10 +529,10 @@ impl Window {
             &actions,
             sel!(scrollAccelRef:),
             150.0,
-            326.0,
+            346.0,
         );
         content.addSubview(&scroll_accel_ref);
-        let scroll_accel_ref_value = label(mtm, "", 400.0, 330.0, 90.0, 18.0);
+        let scroll_accel_ref_value = label(mtm, "", 400.0, 350.0, 90.0, 18.0);
         content.addSubview(&scroll_accel_ref_value);
 
         let natural = checkbox(
@@ -541,19 +541,19 @@ impl Window {
             &actions,
             sel!(naturalScroll:),
             150.0,
-            300.0,
+            320.0,
             240.0,
         );
         content.addSubview(&natural);
 
-        content.addSubview(&section(mtm, "Gestures", 266.0));
+        content.addSubview(&section(mtm, "Gestures", 286.0));
         let pinch = checkbox(
             mtm,
             "Pinch",
             &actions,
             sel!(togglePinch:),
             24.0,
-            238.0,
+            258.0,
             220.0,
         );
         content.addSubview(&pinch);
@@ -563,7 +563,7 @@ impl Window {
             &actions,
             sel!(toggleRotate:),
             262.0,
-            238.0,
+            258.0,
             220.0,
         );
         content.addSubview(&rotate);
@@ -573,7 +573,7 @@ impl Window {
             &actions,
             sel!(toggleSwipeH:),
             24.0,
-            214.0,
+            234.0,
             220.0,
         );
         content.addSubview(&swipe_h);
@@ -583,7 +583,7 @@ impl Window {
             &actions,
             sel!(toggleSwipeV:),
             262.0,
-            214.0,
+            234.0,
             220.0,
         );
         content.addSubview(&swipe_v);
@@ -593,19 +593,19 @@ impl Window {
             &actions,
             sel!(toggleOverlay:),
             24.0,
-            190.0,
+            210.0,
             300.0,
         );
         content.addSubview(&overlay);
 
-        content.addSubview(&section(mtm, "General", 156.0));
+        content.addSubview(&section(mtm, "General", 176.0));
         let login = checkbox(
             mtm,
             "Start at login",
             &actions,
             sel!(toggleLoginItem:),
             24.0,
-            128.0,
+            148.0,
             300.0,
         );
         content.addSubview(&login);
@@ -613,21 +613,21 @@ impl Window {
             mtm,
             "Restarts the companion after a crash, not after you quit.",
             44.0,
-            108.0,
+            128.0,
             452.0,
             16.0,
         );
         login_note.setFont(Some(&NSFont::systemFontOfSize(10.0)));
         content.addSubview(&login_note);
 
-        content.addSubview(&section(mtm, "Troubleshooting", 74.0));
+        content.addSubview(&section(mtm, "Troubleshooting", 94.0));
         let perms_btn = push(
             mtm,
             "Permissions…",
             &actions,
             sel!(openPermissions:),
             24.0,
-            56.0,
+            58.0,
             140.0,
         );
         content.addSubview(&perms_btn);
@@ -637,7 +637,7 @@ impl Window {
             &actions,
             sel!(copyDiagnostics:),
             172.0,
-            56.0,
+            58.0,
             160.0,
         );
         content.addSubview(&diag_btn);
@@ -647,7 +647,7 @@ impl Window {
             &actions,
             sel!(revealLog:),
             340.0,
-            56.0,
+            58.0,
             140.0,
         );
         content.addSubview(&log_btn);
@@ -657,7 +657,7 @@ impl Window {
             &actions,
             sel!(revealConfig:),
             24.0,
-            20.0,
+            22.0,
             180.0,
         );
         content.addSubview(&reveal);
@@ -667,7 +667,7 @@ impl Window {
             &actions,
             sel!(resetDefaults:),
             212.0,
-            20.0,
+            22.0,
             170.0,
         );
         content.addSubview(&reset);

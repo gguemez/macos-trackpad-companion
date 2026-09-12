@@ -13,6 +13,34 @@ What is understood but *not* done — and what is not understood — stays in
 [`docs/known-gaps.md`](docs/known-gaps.md). That file is a standing record
 rather than a per-version one, so it is not duplicated here.
 
+## [0.9.2] — 2026-09-12
+
+### Fixed
+
+- The settings window drew its **Troubleshooting** heading on top of the
+  first row of buttons. The section needs 92 points below its heading —
+  an 8-point gap, two 28-point button rows, the gap between them and the
+  window's own bottom margin — and the 656-point window left it 74. The
+  window is now 676 points and everything above that section moved up by
+  20, so the heading clears the buttons and every other gap is unchanged.
+- The AppKit test now asserts that no control in the settings or scope
+  window overlaps another. Absolute hand-placed frames have no layout
+  engine to catch a collision, which is why this one shipped; the test
+  fails on the old coordinates and passes on the new.
+
+### Changed
+
+- The startup log line carries the version:
+  `macos-trackpad-companion 0.9.2 starting (config=…)`. A log someone
+  mails you is often all you get, and which build produced it is the
+  first question. `Copy Diagnostics` already had it, but that is a copy
+  the user has to think to make.
+- The menu item is **About** rather than **About Trackpad Companion**.
+  The application menu names the app because the app name is that menu's
+  own title; a status-bar menu whose header already reads "Trackpad
+  Companion 0.9.2" has no such excuse. The window it opens keeps the
+  full name.
+
 ## [0.9.1] — 2026-09-12
 
 First numbered version. The 70 commits before it carried a placeholder
