@@ -12,6 +12,7 @@ pub mod descriptor;
 pub mod gesture;
 pub mod hid;
 pub mod instance_lock;
+pub mod launch_agent;
 pub mod onboarding;
 pub mod output;
 pub mod overlay;

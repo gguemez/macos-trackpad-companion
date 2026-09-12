@@ -20,8 +20,9 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{AnyThread, MainThreadMarker, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSAlertThirdButtonReturn, NSImage, NSMenu,
-    NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+    NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSAlertThirdButtonReturn,
+    NSControlStateValueOff, NSControlStateValueOn, NSImage, NSMenu, NSMenuItem, NSStatusBar,
+    NSStatusItem, NSVariableStatusItemLength,
 };
 use objc2_foundation::{NSData, NSSize, NSString};
 
@@ -68,6 +69,39 @@ define_class!(
             }
         }
 
+        #[unsafe(method(toggleLoginItem:))]
+        fn toggle_login_item(&self, sender: Option<&AnyObject>) {
+            let enabling = !crate::launch_agent::is_enabled();
+            let result = if enabling {
+                crate::launch_agent::enable()
+            } else {
+                crate::launch_agent::disable()
+            };
+            match result {
+                Ok(()) => {
+                    // Reflect the new state on the item that was clicked.
+                    if let Some(item) = sender.and_then(|s| s.downcast_ref::<NSMenuItem>()) {
+                        set_check(item, enabling);
+                    }
+                }
+                Err(e) => log::error!("start-at-login toggle failed: {e:#}"),
+            }
+        }
+
+        #[unsafe(method(openLog:))]
+        fn open_log(&self, _sender: Option<&AnyObject>) {
+            match crate::config_watch::log_file_path() {
+                Some(path) if path.exists() => {
+                    let _ = std::process::Command::new("/usr/bin/open")
+                        .arg("-R")
+                        .arg(&path)
+                        .spawn();
+                }
+                Some(path) => log::info!("no log file at {} yet", path.display()),
+                None => log::info!("logging to stderr; set [log].file to get a file"),
+            }
+        }
+
         #[unsafe(method(openSettings:))]
         fn open_settings(&self, _sender: Option<&AnyObject>) {
             if let Some(mtm) = MainThreadMarker::new() {
@@ -103,6 +137,14 @@ define_class!(
         }
     }
 );
+
+fn set_check(item: &NSMenuItem, on: bool) {
+    item.setState(if on {
+        NSControlStateValueOn
+    } else {
+        NSControlStateValueOff
+    });
+}
 
 /// Warn before a quit that would leave no working pointer.
 ///
@@ -244,6 +286,31 @@ impl StatusItem {
         };
         unsafe { settings.setTarget(Some(target.as_ref() as &AnyObject)) };
         menu.addItem(&settings);
+
+        let login = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                mtm.alloc::<NSMenuItem>(),
+                &NSString::from_str("Start at Login"),
+                Some(sel!(toggleLoginItem:)),
+                &NSString::from_str(""),
+            )
+        };
+        unsafe { login.setTarget(Some(target.as_ref() as &AnyObject)) };
+        set_check(&login, crate::launch_agent::is_enabled());
+        menu.addItem(&login);
+
+        let log_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                mtm.alloc::<NSMenuItem>(),
+                &NSString::from_str("Reveal Log…"),
+                Some(sel!(openLog:)),
+                &NSString::from_str(""),
+            )
+        };
+        unsafe { log_item.setTarget(Some(target.as_ref() as &AnyObject)) };
+        menu.addItem(&log_item);
+
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
 
         let quit = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(

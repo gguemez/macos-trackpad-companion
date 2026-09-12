@@ -25,6 +25,7 @@ mod descriptor;
 mod gesture;
 mod hid;
 mod instance_lock;
+mod launch_agent;
 mod onboarding;
 mod output;
 mod overlay;
@@ -98,6 +99,7 @@ fn main() -> Result<()> {
         log_builder.target(env_logger::Target::Pipe(Box::new(file)));
     }
     log_builder.init();
+    config_watch::set_log_file_path(log_file_path.clone());
 
     if cfg_path.exists() {
         log::info!(
@@ -114,7 +116,18 @@ fn main() -> Result<()> {
 
     // Bound to a non-underscore name so the guard lives until end of
     // main; closing the fd releases the kernel's flock.
-    let lock = instance_lock::acquire()?;
+    let lock = match instance_lock::acquire() {
+        Ok(lock) => lock,
+        Err(e) if e.downcast_ref::<instance_lock::AlreadyRunning>().is_some() => {
+            // Exit 0 on purpose. A duplicate launch is normal — the user
+            // double-clicked, or launchd started one while another was
+            // already up — and under a KeepAlive agent a non-zero exit
+            // would be restarted immediately, forever.
+            log::info!("{e}");
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
     log::debug!("acquired instance lock at {}", lock.path.display());
 
     let perms = permissions::State::current();

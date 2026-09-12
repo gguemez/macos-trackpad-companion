@@ -12,11 +12,38 @@
 //! releases the flock on exit (clean, panic, or SIGKILL), so there's no
 //! stale-lock recovery path.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+
+/// Another instance already holds the lock.
+///
+/// Typed rather than a plain message because the caller has to treat it
+/// as a *normal* outcome and exit successfully. Under a `KeepAlive`
+/// LaunchAgent, exiting non-zero here would have launchd restart the
+/// duplicate immediately, which spins into a restart loop — the exact
+/// failure the previous hand-rolled agent for this project exhibited.
+#[derive(Debug)]
+pub struct AlreadyRunning {
+    pub pid: String,
+    pub path: PathBuf,
+}
+
+impl std::fmt::Display for AlreadyRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "another companion instance is already running (lock {} held by PID {}); \
+             running two would clobber each other's PTP input-mode state on the firmware",
+            self.path.display(),
+            self.pid,
+        )
+    }
+}
+
+impl std::error::Error for AlreadyRunning {}
 
 #[derive(Debug)]
 pub struct InstanceLock {
@@ -47,12 +74,10 @@ fn acquire_at(path: &Path) -> Result<InstanceLock> {
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
             let other = read_pid(&mut file).unwrap_or_else(|| "<unknown>".into());
-            bail!(
-                "another companion instance is already running (lock {} held by PID {}); \
-                 running two would clobber each other's PTP input-mode state on the firmware",
-                path.display(),
-                other,
-            );
+            return Err(anyhow::Error::new(AlreadyRunning {
+                pid: other,
+                path: path.to_path_buf(),
+            }));
         }
         return Err(err).with_context(|| format!("flock {}", path.display()));
     }
@@ -109,6 +134,18 @@ mod tests {
 
         drop(first);
         let _third = acquire_at(&path).expect("acquire after release");
+    }
+
+    #[test]
+    fn lock_contention_is_a_typed_error() {
+        let dir = tempdir();
+        let path = dir.join("instance.lock");
+        let _first = acquire_at(&path).expect("first acquire");
+        let err = acquire_at(&path).expect_err("second acquire must fail");
+        assert!(
+            err.downcast_ref::<AlreadyRunning>().is_some(),
+            "caller must be able to recognise this and exit 0",
+        );
     }
 
     #[test]

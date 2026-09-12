@@ -14,6 +14,7 @@
 //! by design, but no reason to tear down a daemon that is already
 //! working.
 
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -25,6 +26,22 @@ use core_foundation::runloop::{
 use core_foundation_sys::runloop::CFRunLoopTimerRef;
 
 use crate::config::Config;
+
+thread_local! {
+    /// Where logs are going, if anywhere. Recorded so the menu can
+    /// reveal the file without re-reading and re-resolving the config.
+    static LOG_FILE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+/// Remember the resolved log path (called from `main` after it expands
+/// `~` and creates the directory).
+pub fn set_log_file_path(path: Option<PathBuf>) {
+    LOG_FILE.with(|p| *p.borrow_mut() = path);
+}
+
+pub fn log_file_path() -> Option<PathBuf> {
+    LOG_FILE.with(|p| p.borrow().clone())
+}
 
 /// How often to stat the config file.
 const POLL_SECS: f64 = 1.0;
