@@ -129,11 +129,25 @@ const PARTIAL_LIFT_REJOIN_WINDOW: Duration = Duration::from_millis(80);
 /// the user has lifted their other finger so they're typically slower).
 const PARTIAL_LIFT_REJOIN_DRIFT_MM: f64 = 10.0;
 
-/// EMA weight on the freshest velocity sample during 2F pan, in [0, 1].
-/// 0.4 ≈ 2.5-frame averaging window on a ~125 Hz pad — fast enough to
-/// catch a flick, slow enough that one noisy chip frame doesn't dominate
-/// the inertia seed. Mirrors rmk's `VEL_EMA_NUM/VEL_EMA_DEN = 96/256`.
-const SCROLL_VELOCITY_ALPHA: f64 = 0.4;
+/// Time constant of the 2F pan velocity EMA, in seconds.
+///
+/// This used to be a fixed per-frame weight of 0.4 — "≈ 2.5-frame
+/// averaging on a ~125 Hz pad". The trouble with a fixed weight is that
+/// it measures the smoothing window in *frames*, so a 60 Hz pad smooths
+/// over twice as much wall-clock time as a 125 Hz one for the same
+/// number, making scroll feel sluggish and the inertia seed stale on
+/// slower hardware.
+///
+/// Deriving the weight from the frame interval instead keeps the window
+/// fixed in time: `alpha = 1 - exp(-dt / tau)`. 15.7 ms is chosen to
+/// reproduce 0.4 exactly at 8 ms frames, so pads at the rate the
+/// original constant was tuned for behave identically.
+const SCROLL_VELOCITY_TAU_SECS: f64 = 0.0157;
+
+/// EMA weight for a frame that took `dt_secs`.
+fn velocity_ema_alpha(dt_secs: f64) -> f64 {
+    (1.0 - (-dt_secs / SCROLL_VELOCITY_TAU_SECS).exp()).clamp(0.0, 1.0)
+}
 
 /// Fallback frame `dt` for the very first sampled frame of a gesture,
 /// before we have a previous frame to subtract from. ~8 ms matches a
@@ -1691,10 +1705,11 @@ impl<O: Output> State<O> {
                         let dt = (now - prev_t).as_secs_f64().max(1e-3);
                         let inst_vx = ddx / dt;
                         let inst_vy = ddy / dt;
-                        base.scroll_velocity.0 = SCROLL_VELOCITY_ALPHA * inst_vx
-                            + (1.0 - SCROLL_VELOCITY_ALPHA) * base.scroll_velocity.0;
-                        base.scroll_velocity.1 = SCROLL_VELOCITY_ALPHA * inst_vy
-                            + (1.0 - SCROLL_VELOCITY_ALPHA) * base.scroll_velocity.1;
+                        let alpha = velocity_ema_alpha(dt);
+                        base.scroll_velocity.0 =
+                            alpha * inst_vx + (1.0 - alpha) * base.scroll_velocity.0;
+                        base.scroll_velocity.1 =
+                            alpha * inst_vy + (1.0 - alpha) * base.scroll_velocity.1;
                     }
                     base.last_scroll_time = Some(now);
                     log::debug!(
@@ -1812,10 +1827,13 @@ impl<O: Output> State<O> {
             let dt = (now - prev_t).as_secs_f64().max(1e-3);
             let inst_vx = (cx - base.last_centroid.0) / dt;
             let inst_vy = (cy - base.last_centroid.1) / dt;
-            base.velocity.0 =
-                SCROLL_VELOCITY_ALPHA * inst_vx + (1.0 - SCROLL_VELOCITY_ALPHA) * base.velocity.0;
-            base.velocity.1 =
-                SCROLL_VELOCITY_ALPHA * inst_vy + (1.0 - SCROLL_VELOCITY_ALPHA) * base.velocity.1;
+            // Same reasoning as the pan EMA: weight derived from the
+            // frame interval so the smoothing window is a duration, not
+            // a frame count. This one feeds swipe velocity, which is
+            // what macOS uses to decide a flick has completed.
+            let alpha = velocity_ema_alpha(dt);
+            base.velocity.0 = alpha * inst_vx + (1.0 - alpha) * base.velocity.0;
+            base.velocity.1 = alpha * inst_vy + (1.0 - alpha) * base.velocity.1;
         }
         base.last_centroid = (cx, cy);
         base.last_centroid_time = Some(now);
@@ -1986,6 +2004,25 @@ mod tests {
             exponent: 1.0,
             ref_mm_per_sec: 80.0,
         }
+    }
+
+    #[test]
+    fn velocity_smoothing_is_fixed_in_time_not_in_frames() {
+        // 8 ms frames (125 Hz) reproduce the historical fixed 0.4.
+        let at_125hz = velocity_ema_alpha(0.008);
+        assert!((at_125hz - 0.4).abs() < 0.01, "was {at_125hz}");
+
+        // A slower pad gets a proportionally larger weight, so the
+        // smoothing window stays the same length in wall-clock time
+        // rather than doubling.
+        let at_60hz = velocity_ema_alpha(1.0 / 60.0);
+        assert!(at_60hz > at_125hz, "{at_60hz} should exceed {at_125hz}");
+        assert!(at_60hz < 1.0);
+
+        // And a very fast pad smooths more per frame, not less.
+        let at_250hz = velocity_ema_alpha(0.004);
+        assert!(at_250hz < at_125hz);
+        assert!(at_250hz > 0.0);
     }
 
     #[test]
