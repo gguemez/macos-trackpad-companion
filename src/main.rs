@@ -21,7 +21,7 @@
 // every module twice and runs every test twice.
 use macos_trackpad_companion::{
     app_kit, capture, config, config_watch, gesture, hid, instance_lock, onboarding, output,
-    overlay, pause, permissions, scope, settings, status_item, system_prefs, time,
+    overlay, pause, permissions, scope, settings, status_item, system_prefs, time, update,
 };
 
 use anyhow::{Context, Result};
@@ -190,6 +190,15 @@ fn main() -> Result<()> {
     settings::set_config_path(cfg_path.clone());
     let _status_item = status_item::StatusItem::install(mtm);
 
+    // After the status item, because the quiet check's only output is
+    // renaming one of its menu items — and before the event loop,
+    // because the fetch is asynchronous and needs the loop running to
+    // deliver its result.
+    update::set_feed_url(&cfg.update.feed_url);
+    if cfg.update.check_at_launch {
+        update::check(update::Presentation::Quiet);
+    }
+
     // Auto-open when either grant is missing: without Accessibility the
     // companion fails silently, and a first-run user has no reason to
     // go hunting in the menu.
@@ -293,6 +302,7 @@ fn run<O: output::Output + 'static>(
             new_cfg.scroll.sensitivity,
             new_cfg.scroll.natural,
         );
+        update::set_feed_url(&new_cfg.update.feed_url);
         *reload_cfg.borrow_mut() = new_cfg.clone();
         reload_state
             .borrow_mut()

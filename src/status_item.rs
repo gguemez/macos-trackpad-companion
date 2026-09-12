@@ -41,6 +41,11 @@ thread_local! {
     /// thread ever touches AppKit; [`set_status`] is a no-op on any
     /// other thread, and on the main thread before `install`.
     static STATUS_LINE: RefCell<Option<Retained<NSMenuItem>>> = const { RefCell::new(None) };
+
+    /// The "Check for Updates…" line. Held for the same reason as
+    /// STATUS_LINE: the launch check finishes long after the menu is
+    /// built and renames this item in place.
+    static UPDATE_ITEM: RefCell<Option<Retained<NSMenuItem>>> = const { RefCell::new(None) };
 }
 
 /// Update the menu's device-state line. Safe to call before the status
@@ -50,6 +55,28 @@ pub fn set_status(text: &str) {
     STATUS_LINE.with(|cell| {
         if let Some(item) = cell.borrow().as_ref() {
             item.setTitle(&NSString::from_str(text));
+        }
+    });
+}
+
+/// What the update line says when there is nothing to report. Lives
+/// here because `build_menu` needs it too, and a title written twice is
+/// a title that gets changed once.
+const CHECK_TITLE: &str = "Check for Updates…";
+
+/// Retitle the update line; `None` restores the idle title.
+///
+/// This is the whole of the quiet check's UI, and of a download's
+/// progress: a menu-bar agent has no window to hang a banner or a
+/// progress bar on, and a notification for something with no deadline
+/// is an interruption the user did not ask for. The menu is where they
+/// already look, and the item keeps working as a manual check whatever
+/// it currently says — so a rename adds information without taking
+/// anything away.
+pub fn set_update_title(title: Option<&str>) {
+    UPDATE_ITEM.with(|cell| {
+        if let Some(item) = cell.borrow().as_ref() {
+            item.setTitle(&NSString::from_str(title.unwrap_or(CHECK_TITLE)));
         }
     });
 }
@@ -95,6 +122,15 @@ define_class!(
             if let Some(mtm) = MainThreadMarker::new() {
                 crate::scope::show(mtm);
             }
+        }
+
+        #[unsafe(method(checkForUpdates:))]
+        fn check_for_updates(&self, _sender: Option<&AnyObject>) {
+            // Always a fresh check rather than reusing what the launch
+            // check found: the menu item is what someone reaches for
+            // when they want to know *now*, and a cached answer from
+            // hours ago is the one thing that would not serve.
+            crate::update::check(crate::update::Presentation::Modal);
         }
 
         #[unsafe(method(openAbout:))]
@@ -194,6 +230,12 @@ pub struct StatusItem {
 }
 
 impl StatusItem {
+    /// The menu as AppKit holds it. Exposed so a test can read the
+    /// titles back rather than assert against a second copy of them.
+    pub fn menu(&self, mtm: MainThreadMarker) -> Option<Retained<NSMenu>> {
+        self.item.menu(mtm)
+    }
+
     /// Install the status item. Must run on the main thread, before the
     /// event loop starts.
     pub fn install(mtm: MainThreadMarker) -> Self {
@@ -302,6 +344,20 @@ impl StatusItem {
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 
+        // Renamed in place by `set_update_available` when the launch
+        // check finds something; still a manual check when clicked.
+        let update = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                mtm.alloc::<NSMenuItem>(),
+                &NSString::from_str(CHECK_TITLE),
+                Some(sel!(checkForUpdates:)),
+                &NSString::from_str(""),
+            )
+        };
+        unsafe { update.setTarget(Some(target.as_ref() as &AnyObject)) };
+        menu.addItem(&update);
+        UPDATE_ITEM.with(|cell| *cell.borrow_mut() = Some(update));
+
         // An agent has no application menu, so this is the only About
         // there is. Grouped with Quit rather than with the working
         // items, which is where the application menu puts it.
@@ -340,6 +396,7 @@ impl StatusItem {
 impl Drop for StatusItem {
     fn drop(&mut self) {
         STATUS_LINE.with(|cell| *cell.borrow_mut() = None);
+        UPDATE_ITEM.with(|cell| *cell.borrow_mut() = None);
         let status_bar = NSStatusBar::systemStatusBar();
         status_bar.removeStatusItem(&self.item);
     }

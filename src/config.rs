@@ -39,6 +39,10 @@
 //! [overlay]                        # debug HUD; off by default
 //! enable      = false
 //! duration_ms = 600
+//!
+//! [update]
+//! check_at_launch = true
+//! # feed_url = "https://…/appcast.json"   # "" disables checking
 //! ```
 
 use anyhow::{Context, Result};
@@ -54,7 +58,41 @@ pub struct Config {
     pub scroll: Scroll,
     pub gestures: Gestures,
     pub overlay: Overlay,
+    pub update: Update,
 }
+
+/// Update checking. See [`crate::update`] — the check is a plain GET of
+/// a static JSON file and sends nothing about this machine.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields, default)]
+pub struct Update {
+    /// Check once, shortly after launch. Failures and up-to-date
+    /// results are silent; only an available update shows, as a menu
+    /// title. The menu item checks on demand regardless of this.
+    pub check_at_launch: bool,
+    /// The version feed. An empty string turns checking off entirely,
+    /// which is the setting for anyone who would rather their machine
+    /// not reach out at all.
+    pub feed_url: String,
+}
+
+impl Default for Update {
+    fn default() -> Self {
+        Self {
+            check_at_launch: true,
+            feed_url: DEFAULT_FEED_URL.to_string(),
+        }
+    }
+}
+
+/// Where releases are announced.
+///
+/// Hosted with the dmg rather than alongside any project page: if the
+/// feed and the artifact live on different infrastructure, an outage of
+/// the page makes every installed copy fail its update check while the
+/// download it names is perfectly reachable.
+pub const DEFAULT_FEED_URL: &str =
+    "https://dl.trackpad-companion.guemez.net/appcast.json";
 
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields, default)]

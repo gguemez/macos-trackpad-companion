@@ -29,5 +29,6 @@ pub mod settings;
 pub mod status_item;
 pub mod system_prefs;
 pub mod time;
+pub mod update;
 mod tuning_slider;
 mod window_lifecycle;

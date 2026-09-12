@@ -84,6 +84,7 @@ The companion's only UI is a status-bar icon.
 | **Pause / Resume** | Suspends synthesis without stopping the daemon. The device stays acquired, so it doesn't go dormant the way it does when nothing is driving it, and resuming is instant. |
 | **Settings…** (⌘,) | Sliders and toggles that write the config file. |
 | **Gesture Scope…** (⌘G) | Live view of the contacts and the 2F lock decision. See below. |
+| **Check for Updates…** | Asks the release feed what the current version is. Renames itself to **Update to X.Y.Z…** when the check at launch finds one, and to **Downloading update…** while one is being fetched. |
 | **About** | Icon, name and version. An agent has no application menu, so this is the only About there is. |
 | **Quit** (⌘Q) | Warns first if it would leave no working pointer. |
 
@@ -181,6 +182,11 @@ backend = "synthetic"
 [overlay]                     # on-screen HUD naming each gesture as it locks
 enable      = false
 duration_ms = 600             # how long the flash stays up
+
+[update]
+check_at_launch = true        # one check shortly after launch; silent unless
+                              #   there is something to report
+# feed_url = "https://…/appcast.json"   # "" turns checking off entirely
 ```
 
 ### Live reload
@@ -192,11 +198,126 @@ immediately.
 
 Two sections are only read at startup — `[device]` and `[log]`. Changing
 either is reported in the log as needing a restart rather than being
-silently ignored.
+silently ignored. (`[update].check_at_launch` is inherently a startup
+question; `feed_url` does reload.)
 
 A file that fails to parse never disturbs a running daemon: the error is
 logged and the previous settings stay in force. (At startup a bad file
 is still fatal — unknown keys are rejected so typos surface immediately.)
+
+## Updates
+
+**Check for Updates…** in the menu fetches a small static JSON feed, compares
+its version against this build, and reports what it found — a newer version,
+already current, or why it couldn't tell.
+
+With `check_at_launch` on (the default), the same check runs once shortly
+after launch. That one is quiet: failures and up-to-date results go to the
+log only, and the single visible effect of finding something is the menu item
+renaming itself to **Update to X.Y.Z…**.
+
+The feed is a plain `GET` of a static file and carries no identifier, so a
+check discloses nothing beyond the IP and user-agent inherent in any HTTP
+request. Setting `feed_url = ""` stops it reaching out at all.
+
+```json
+{ "version": "0.9.3",
+  "url": "https://…/Trackpad-Companion-0.9.3.dmg",
+  "sha256": "…", "size": 4194304 }
+```
+
+### Downloading
+
+Choosing **Download** fetches the dmg to
+`~/Library/Application Support/macos-trackpad-companion/Updates/` and checks it
+against the `size` and `sha256` the feed published. A file that fails either
+check is deleted rather than left somewhere for someone to find later and
+trust. On success the companion offers to reveal it in the Finder — you open
+the dmg and replace the app yourself.
+
+**It never replaces itself.** Installing over a running app means quitting the
+process doing the installing, and here it would also have to survive a
+`KeepAlive` LaunchAgent that restarts the thing it just deleted. That is worth
+doing properly or not at all.
+
+The checksum is not decoration. A dmg fetched in-app does not carry the
+quarantine bit a browser download sets, so macOS does not run its notarization
+check on first launch — the feed's SHA-256, served over HTTPS alongside the
+bytes it describes, is what stands in for that. A feed that publishes no
+`sha256` still installs, and says so in the log.
+
+## Releasing
+
+Three scripts, each owning one stage, and deliberately not one script.
+
+| Stage | Script | Produces |
+| --- | --- | --- |
+| Build + sign | `RELEASE=1 scripts/bundle.sh` | `target/companion.app` — universal, hardened runtime, secure timestamp, Developer ID |
+| Notarize + package | `scripts/release.sh` | `dist/Trackpad-Companion-X.Y.Z.dmg`, notarized and stapled |
+| Publish | `scripts/publish.sh` | the dmg on R2, then `appcast.json` a minute later |
+
+`release.sh` runs the build itself, so the first row is only for looking at
+the bundle. One-time setup is a Developer ID Application certificate, both
+toolchain targets (`rustup target add aarch64-apple-darwin x86_64-apple-darwin`),
+and a stored `notarytool` credential profile.
+
+**Publishing is separate from building on purpose.** A locally built dmg
+carries no quarantine bit, so it proves nothing about Gatekeeper: the dmg
+wants downloading through a browser and launching before anyone else is
+offered it. Keeping the two apart also makes a re-publish free — no rebuild,
+no second round trip to Apple.
+
+**`appcast.json` is the single source of truth for what version is current**,
+and `publish.sh` writes it from the built artifact — so the feed cannot
+advertise bytes nobody built. Never hand-edit a version anywhere but
+`Cargo.toml`.
+
+### Publish is two phases: the bytes, then the pointer
+
+`publish.sh` uploads the dmg, verifies it over its public URL, **waits a
+minute**, and only then uploads `appcast.json`. The wait is the point, not an
+accident of doing things in order.
+
+Until the feed names a version, the dmg in the bucket is inert — nothing links
+to it and no updater asks for it. The moment the feed changes, every installed
+copy starts fetching that URL on its next check. So the pointer must move last,
+and only once what it points at is genuinely retrievable *everywhere*.
+
+Ordering alone does not achieve that. R2 is strongly consistent, so the object
+is readable the instant the upload returns — but the public hostname is fronted
+by Cloudflare, and an edge PoP asked for that key *before* it existed can still
+be holding a cached 404. Publish the feed into that window and the users who
+check within seconds get a download that fails at their edge while working
+perfectly from the build machine.
+
+Two consequences, both easy to violate by hand:
+
+- **Never request a release URL before it is published.** A 404 is a cacheable
+  response; checking whether the file "is up yet" is one of the ways it ends up
+  appearing missing after it is up.
+- **`FEED_DELAY` is overridable for one situation only** — re-publishing a
+  version whose bytes are already live and verified, where the settling already
+  happened. It is not a way to make a first publish finish sooner.
+
+### A release ends outside this machine
+
+`dist/` holds a signed, notarized, stapled dmg the moment `release.sh`
+finishes, and it looks identical whether or not anything was ever uploaded.
+Nothing fails and nothing warns; the release simply does not exist. So
+`publish.sh` ends by fetching the live feed the way the app will and failing if
+it does not name this exact version — the release is a local build until that
+check passes, whatever `dist/` looks like.
+
+### What the guards are for
+
+`release.sh` re-asserts the architecture, the hardened runtime, the secure
+timestamp and a non-ad-hoc signature *itself*, rather than trusting
+`bundle.sh` — because `SKIP_BUILD=1` does not run `bundle.sh` at all. Every one
+of those produces an artifact that signs, notarizes, staples and installs
+perfectly and then fails somewhere the build machine cannot see. A
+single-arch binary is the clearest case: Rosetta translates Intel to ARM and
+never the reverse, so an arm64-only build does not run slowly on an Intel Mac,
+it does not launch at all.
 
 ## Permissions
 
@@ -470,6 +591,7 @@ on separate interfaces.
 | `permissions.rs` | Input Monitoring and Accessibility state via the real APIs, plus System Settings deep links. |
 | `onboarding.rs` | First-run setup window; opens automatically when either grant is missing. |
 | `about.rs` | About window — name, icon and the crate version. |
+| `update.rs` | The release feed: fetch, version comparison, the verified download, and what to say about all three. Stops short of installing. |
 | `settings.rs` | Settings window. Writes the config file; never touches the engine directly. |
 | `config.rs` | TOML config loading and defaults. Unknown keys are rejected. |
 | `config_watch.rs` | Watches the config file and re-applies it live, keeping the previous settings if a file fails to parse. |
@@ -554,3 +676,38 @@ about are collected in [docs/known-gaps.md](docs/known-gaps.md).
   a windowless `LSUIElement` agent gets its timers coalesced — observed
   ~9 s in practice. Recovery works, just slower than the interval
   suggests. `NSProcessInfo beginActivityWithOptions` would opt out.
+
+## Installing
+
+```
+brew tap gguemez/tap
+brew install --cask trackpad-companion
+```
+
+The cask installs the notarized, Developer ID-signed bundle — not a
+source build. That matters more than convenience: Input Monitoring and
+Accessibility grants are keyed to code identity, and a locally compiled
+binary is ad-hoc signed, so its designated requirement embeds a cdhash
+and every rebuild re-prompts for both permissions. See [Releasing](#releasing).
+
+`brew uninstall --cask trackpad-companion` stops the LaunchAgent before
+removing the bundle. Doing it the other way round would delete the app
+out from under a running daemon, and a pad on the spec Input Mode path
+goes dormant the moment nothing is driving it — which, if macOS is set
+to ignore the built-in trackpad, leaves no pointer at all. Add `--zap`
+to also remove the config, the log, and the staged updates.
+
+## License
+
+A fork of [scottlamb/macos-trackpad-companion](https://github.com/scottlamb/macos-trackpad-companion),
+which is copyright © 2026 Scott Lamb and dual-licensed. This fork keeps
+those terms; contributions here are offered under the same.
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or
+  <http://opensource.org/licenses/MIT>)
+
+at your option.

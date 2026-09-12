@@ -165,3 +165,37 @@ extern "C" fn stop_on_main(_ctx: *mut c_void) {
         app.postEvent_atStart(&event, true);
     }
 }
+
+/// Run `f` on the main thread, from any thread.
+///
+/// The update check's completion handler lands on an `NSURLSession`
+/// queue, and everything it wants to do next — an alert, a menu title —
+/// is AppKit and so main-thread-only. Reuses the same
+/// `dispatch_async_f` already declared above for [`request_stop`]
+/// rather than introducing a second way to reach the main queue.
+///
+/// The closure is double-boxed on purpose: `Box<dyn FnOnce>` is a fat
+/// pointer and cannot round-trip through a `*mut c_void`, so the outer
+/// box is what gets passed and the inner one carries the vtable.
+pub fn on_main<F>(f: F)
+where
+    F: FnOnce(MainThreadMarker) + Send + 'static,
+{
+    let boxed: Box<Box<dyn FnOnce(MainThreadMarker)>> = Box::new(Box::new(f));
+    unsafe {
+        let queue = &raw const _dispatch_main_q as *mut c_void;
+        dispatch_async_f(queue, Box::into_raw(boxed) as *mut c_void, run_on_main);
+    }
+}
+
+extern "C" fn run_on_main(ctx: *mut c_void) {
+    // Reclaimed exactly once: dispatch_async_f calls this exactly once
+    // for the pointer `on_main` leaked into it.
+    let f: Box<Box<dyn FnOnce(MainThreadMarker)>> =
+        unsafe { Box::from_raw(ctx as *mut Box<dyn FnOnce(MainThreadMarker)>) };
+    // dispatch_async_f onto the main queue always lands on the main
+    // thread, so this marker is sound.
+    if let Some(mtm) = MainThreadMarker::new() {
+        f(mtm);
+    }
+}

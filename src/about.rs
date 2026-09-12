@@ -164,6 +164,35 @@ impl About {
         blurb.setTextColor(Some(&NSColor::secondaryLabelColor()));
         content.addSubview(&blurb);
 
+        // The attribution the shipped binary owes its upstream. The
+        // notices themselves ride along in Contents/Resources, where
+        // Apache-2.0 section 4(a) wants them; this is the part a user
+        // can actually find, and it names the copyright holder rather
+        // than this fork, because the LICENSE-MIT we ship is his.
+        //
+        // Full width from the left margin rather than the text column:
+        // these two lines sit below the icon, so the column's inset
+        // would only make them wrap sooner for no alignment gained.
+        for (i, line) in [
+            "© 2026 Scott Lamb — MIT or Apache-2.0, at your option",
+            "A fork of scottlamb/macos-trackpad-companion",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let note = label(
+                mtm,
+                line,
+                24.0,
+                68.0 - 18.0 * i as f64,
+                WINDOW_W - 48.0,
+                16.0,
+            );
+            note.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+            note.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            content.addSubview(&note);
+        }
+
         let actions = Actions::new(mtm);
         let close_btn = unsafe {
             NSButton::buttonWithTitle_target_action(
