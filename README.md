@@ -301,13 +301,23 @@ judge by feel, live:
 | **Scroll — Acceleration** | `scroll.accel_exponent` |
 | **Scroll — Accel reference** | `scroll.accel_ref` |
 
-A drag reaches the engine on the spot and the config file is written
-behind it, debounced. That inverts what the settings window does — it
-writes the file and lets the watcher apply it — because going through
-the file costs a debounce plus a poll, and over a second between
-dragging a slider and feeling the change makes the slider useless. The
-file still ends up authoritative: when the watcher notices it, it
-re-applies the identical values. Editing the file by hand, or from the
+Letting go of a slider reaches the engine on the spot, and the config
+file is written behind it, debounced. That inverts what the settings
+window does — it writes the file and lets the watcher apply it —
+because going through the file costs a debounce plus a poll, and over a
+second between moving a slider and feeling the change makes the slider
+useless. The file still ends up authoritative: when the watcher notices
+it, it re-applies the identical values.
+
+**On release, not during the drag.** You drag these sliders with the
+trackpad they configure, so applying mid-drag moves the pointer doing
+the dragging — the knob stops tracking your finger, and at the low end
+of Speed it takes several times the travel to drag it back. Nothing is
+lost by waiting: you cannot perform the gesture you are trying to judge
+while your finger is on the knob. The number under the slider still
+tracks the drag, so you can see where you are heading. Clicking a
+slider focuses it, and the arrow keys then nudge it without touching
+the pad at all — which applies immediately, since no button is held. Editing the file by hand, or from the
 settings window, updates the scope's sliders the same way — except
 while a drag is in flight, which is the one moment a refresh would yank
 the slider out from under you.

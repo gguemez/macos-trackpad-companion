@@ -18,7 +18,7 @@ scope from the menu-bar icon ▸ **Gesture Scope…**.
 | --- | --- | --- |
 | 1.1 | One finger on the pad, move it around | A filled dot follows your finger. A small cross marks where it landed, and a line trails behind it |
 | 1.2 | Put the finger down near each corner in turn | The dot reaches each corner of the drawn rectangle. If it stops short, or the pad looks the wrong shape, the geometry mapping is wrong |
-| 1.3 | Five fingers at once | Five dots, five colours, each labelled with its contact id |
+| 1.3 | Four fingers at once | Four dots, four colours, each labelled with its contact id. **On the test pad four is the maximum** — its firmware fills four of the five contact slots its descriptor advertises, so a fifth finger is not a scope bug (see `known-gaps.md`). On other hardware, expect as many dots as the pad reports |
 | 1.4 | Lift everything | Tracks stay on screen, dimmed |
 | 1.5 | Touch again | The dimmed tracks vanish as the new touch starts |
 
@@ -53,7 +53,9 @@ are the highest-risk items in this list.
 
 | | Step | Expect |
 | --- | --- | --- |
-| 4.1 | Drag **Cursor ▸ Speed**, then move one finger | The cursor feels different **immediately** — no perceptible delay |
+| 4.1 | Drag **Cursor ▸ Speed** and let go, then move one finger | The cursor feels different **immediately** on release — no perceptible delay |
+| 4.1a | While still holding the knob | The number tracks, but the pointer does **not** change speed under you — the knob keeps following your finger |
+| 4.1b | Click a slider once, then press <kbd>←</kbd> / <kbd>→</kbd> | It nudges, and applies at once. This is the way to tune without dragging at all |
 | 4.2 | Wait a second, then `cat ~/.config/macos-trackpad-companion/config.toml` | `cursor.sensitivity` is the new value, and every comment in the file is still there |
 | 4.3 | Move one finger slowly, then quickly | The `cursor … mm/s → … px/s` line tracks. *Effective px/mm* rises with speed when Acceleration is above 1.00 |
 | 4.4 | Set Acceleration to 1.00 | *Effective px/mm* stops changing with speed and sits on the Speed slider's value |

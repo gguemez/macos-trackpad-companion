@@ -890,20 +890,40 @@ impl Window {
         }
     }
 
-    /// Take what a slider now reads, hand it to the engine immediately,
-    /// and queue the file write behind it.
+    /// Take what a slider now reads, hand it to the engine, and queue
+    /// the file write behind it.
     ///
-    /// The engine-first order is the whole point: going through the
-    /// file the way the settings window does costs a debounce plus a
-    /// poll, which is over a second before your fingers feel anything.
-    /// The file still ends up authoritative — when the watcher notices
-    /// it, it re-applies the identical values.
+    /// The engine-first order is the point: going through the file the
+    /// way the settings window does costs a debounce plus a poll, which
+    /// is over a second before your fingers feel anything. The file
+    /// still ends up authoritative — when the watcher notices it, it
+    /// re-applies the identical values.
+    ///
+    /// But *not* while the knob is still held. You drag these sliders
+    /// with the trackpad they configure, so applying mid-drag changes
+    /// the pointer doing the dragging: the knob stops tracking your
+    /// finger, and at the low end of Speed it takes several times the
+    /// travel to drag it back. Nothing is lost by waiting — you cannot
+    /// perform the gesture you are trying to judge while your finger is
+    /// on the knob anyway, so "live" was only ever worth anything from
+    /// the moment you let go. Which is exactly when this fires.
+    ///
+    /// A keyboard change (arrow keys on a focused slider) has no button
+    /// held, so it applies at once.
     fn slider_moved(&mut self) {
         let Some(ui) = self.tune.as_ref() else {
             return;
         };
         let values = ui.values();
+        // The number under the slider tracks the drag regardless — you
+        // should be able to see where you are heading.
         ui.relabel(values);
+        if NSEvent::pressedMouseButtons() & 1 != 0 {
+            return;
+        }
+        // Only now, with the engine actually taking the value, does the
+        // canvas get to draw the curve — a readout showing a curve the
+        // engine isn't running would be worse than none.
         TUNING.with(|t| t.set(values));
         LIVE_APPLY.with(|h| {
             if let Some(f) = h.borrow().as_ref() {
@@ -999,8 +1019,14 @@ impl Window {
         self.window.makeKeyAndOrderFront(None);
         // Keyboard transport only works if the canvas is first
         // responder; the buttons would otherwise steal it on first
-        // click and never give it back.
-        self.window.makeFirstResponder(Some(&self.view));
+        // click and never give it back. Only where there is a transport
+        // to drive, though — in the daemon the canvas has no keys of
+        // its own worth claiming, and holding first responder would
+        // stop a click from focusing a tuning slider, which is how you
+        // nudge one with the arrow keys instead of dragging it.
+        if self.transport.is_some() {
+            self.window.makeFirstResponder(Some(&self.view));
+        }
 
         if self.timer.is_none() {
             let interval = 1.0 / REDRAW_HZ;

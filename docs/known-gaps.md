@@ -70,6 +70,35 @@ They are now `scroll.accel_exponent` and `scroll.accel_ref`, with the
 curve parameters gathered into an `output::ScrollAccel` shaped exactly
 like `gesture::CursorAccel`. Both windows carry all six sliders.
 
+### The descriptor's contact count is not a promise
+
+The test pad's descriptor declares five finger collections, so the
+startup line says `5 contacts` — and the pad tracks four. Measured, not
+inferred: 766 trace-logged reports with four and five fingers on the
+surface, and
+
+- the Contact Count field (byte 28) never read above `4`;
+- the fifth 5-byte contact slot was all zeros in *every* report, never
+  once populated;
+- only contact ids 0-3 ever appeared;
+- no report was rejected and no decode failed.
+
+So the firmware allocates five slots in the report and fills at most
+four. The decoder surfaced exactly what arrived; what is wrong is the
+startup line, which reports the *report layout's capacity* as if it
+were the device's capability.
+
+`contact_slots` comes from `finger_blocks.len()` — how many contacts
+the report has room for. The number that actually answers "how many
+fingers does this pad track" is Contact Count Maximum (usage `0x55`),
+a feature report this project still doesn't read (see above: the walker
+doesn't record its report id yet). Reading it would let the startup
+line and the diagnostics say four, and would say whether this firmware
+declares four and over-allocates, or declares five and under-delivers.
+
+Worth knowing before trusting any descriptor-derived capability on
+another device.
+
 ### Only one real device has ever been tested
 
 There is one third-party pad (vid `0x258a` pid `0x0010`) plus the
@@ -243,7 +272,18 @@ The scope also carries a live-tuning column — the cursor curve
 to match — applied to the engine on the drag with the config file
 written behind it, debounced. A write that fails reverts both the
 slider and the engine to what is on disk rather than leaving the engine
-running on a value the file never accepted. The inverted order (engine first, file second) is the
+running on a value the file never accepted.
+
+Applied on release, not continuously — found by using it. These
+sliders are dragged with the trackpad they configure, so a live apply
+changes the pointer performing the drag: the knob stops tracking the
+finger, and at the low end of Speed it takes several times the travel
+to drag back. The general shape of that is worth remembering for
+anything else that tunes an input device from a window shown on that
+device: the only moments a change can safely take effect are the ones
+where the device is not being used to make it. Here that is the instant
+you let go, which costs nothing, because you cannot perform the gesture
+you are judging while your finger is on the knob. The inverted order (engine first, file second) is the
 one place the "file is the single source of truth" rule bends, and it
 bends on purpose: routing a slider through the file costs a 0.25 s
 debounce plus a 1 s watcher poll, and a slider you feel 1.25 s later is
