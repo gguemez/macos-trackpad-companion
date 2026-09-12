@@ -79,10 +79,12 @@ The companion's only UI is a status-bar icon.
 
 | Item | What it does |
 | --- | --- |
+| *(header)* | The app's name and the running version. |
 | *(status line)* | Device state — waiting, connected, paused, or what's missing. |
 | **Pause / Resume** | Suspends synthesis without stopping the daemon. The device stays acquired, so it doesn't go dormant the way it does when nothing is driving it, and resuming is instant. |
 | **Settings…** (⌘,) | Sliders and toggles that write the config file. |
 | **Gesture Scope…** (⌘G) | Live view of the contacts and the 2F lock decision. See below. |
+| **About Trackpad Companion** | Icon, name and version. An agent has no application menu, so this is the only About there is. |
 | **Quit** (⌘Q) | Warns first if it would leave no working pointer. |
 
 Everything else lives in the settings window: **Start at Login**, and a
@@ -205,7 +207,7 @@ background (see **Caveats**).
 
 A setup window opens automatically when either grant is missing, shows
 live state, and links straight to the right System Settings pane.
-Reopen it later from **Setup…** in the menu.
+Reopen it later from **Permissions…** in the settings window.
 
 - **Input Monitoring** — required to read raw HID input reports from
   the trackpad. macOS surfaces error `0xE00002C5` from `IOHIDManagerOpen`
@@ -467,6 +469,7 @@ on separate interfaces.
 | `status_item.rs` | Menu-bar status item and menu, including the guard that refuses to quit silently when it would leave no pointer. |
 | `permissions.rs` | Input Monitoring and Accessibility state via the real APIs, plus System Settings deep links. |
 | `onboarding.rs` | First-run setup window; opens automatically when either grant is missing. |
+| `about.rs` | About window — name, icon and the crate version. |
 | `settings.rs` | Settings window. Writes the config file; never touches the engine directly. |
 | `config.rs` | TOML config loading and defaults. Unknown keys are rejected. |
 | `config_watch.rs` | Watches the config file and re-applies it live, keeping the previous settings if a file fails to parse. |
@@ -494,6 +497,12 @@ macOS graphical session with Launch Services access. Run it alone with
 `cargo test --test appkit`; use `cargo test --lib` for the library tests.
 The physical-device checks remain in [the scope test plan](docs/scope-test-plan.md).
 
+
+## Versions
+
+What each version is, in [CHANGELOG.md](CHANGELOG.md). The number lives
+only in `Cargo.toml` and reaches `--version`, the menu header, the About
+window, the diagnostics blob and the bundle's `Info.plist` from there.
 
 ## Known gaps
 

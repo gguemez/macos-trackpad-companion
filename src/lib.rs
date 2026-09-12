@@ -3,6 +3,7 @@
 //! daemon) and `src/bin/gesture_tap.rs` (the read-only event tap used
 //! to characterize real-trackpad event streams).
 
+pub mod about;
 pub mod app_context;
 pub mod app_kit;
 pub mod capture;

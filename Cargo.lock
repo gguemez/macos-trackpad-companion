@@ -319,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "macos-trackpad-companion"
-version = "0.1.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "clap",

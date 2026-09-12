@@ -97,6 +97,13 @@ define_class!(
             }
         }
 
+        #[unsafe(method(openAbout:))]
+        fn open_about(&self, _sender: Option<&AnyObject>) {
+            if let Some(mtm) = MainThreadMarker::new() {
+                crate::about::show(mtm);
+            }
+        }
+
         #[unsafe(method(quit:))]
         fn quit(&self, _sender: Option<&AnyObject>) {
             // Quitting can leave the machine with no pointer at all: a
@@ -251,8 +258,8 @@ impl StatusItem {
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 
-        // Reopening matters: the setup window auto-opens once at launch,
-        // and without this there is no way back to it.
+        // Stopping without quitting. The title flips to "Resume", so
+        // this one item is also where the paused state is visible.
         let pause_item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 mtm.alloc::<NSMenuItem>(),
@@ -294,6 +301,20 @@ impl StatusItem {
         menu.addItem(&scope);
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+        // An agent has no application menu, so this is the only "About
+        // <App>" there is. Grouped with Quit rather than with the
+        // working items, which is where the application menu puts it.
+        let about = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                mtm.alloc::<NSMenuItem>(),
+                &NSString::from_str("About Trackpad Companion"),
+                Some(sel!(openAbout:)),
+                &NSString::from_str(""),
+            )
+        };
+        unsafe { about.setTarget(Some(target.as_ref() as &AnyObject)) };
+        menu.addItem(&about);
 
         let quit = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(

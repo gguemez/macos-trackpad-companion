@@ -6,12 +6,12 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use core_foundation::runloop::{CFRunLoop, kCFRunLoopDefaultMode};
-use macos_trackpad_companion::{app_kit, config, scope, settings};
+use macos_trackpad_companion::{about, app_kit, config, scope, settings};
 use objc2::rc::Retained;
 use objc2::{ClassType, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSEvent, NSEventModifierFlags, NSEventType,
-    NSSlider, NSTextField, NSView, NSWindow,
+    NSApplication, NSApplicationActivationPolicy, NSButton, NSEvent, NSEventModifierFlags,
+    NSEventType, NSSlider, NSTextField, NSView, NSWindow,
 };
 use objc2_foundation::{NSPoint, NSSize, NSString};
 
@@ -248,5 +248,42 @@ fn main() {
     println!(
         "passed: settings focus, close/reopen, timer cancellation and multi-window activation"
     );
+    about::show(mtm);
+    let about_window = window(&app, "About Trackpad Companion");
+    assert_eq!(
+        app.activationPolicy(),
+        NSApplicationActivationPolicy::Regular,
+        "About must be able to take focus"
+    );
+    // The version on screen is the crate's, not a second copy someone
+    // has to remember to bump.
+    let labels: Vec<String> = descendants(&about_window.contentView().unwrap())
+        .into_iter()
+        .filter_map(|v| v.downcast::<NSTextField>().ok())
+        .map(|v| v.stringValue().to_string())
+        .collect();
+    assert!(
+        labels.contains(&format!("Version {}", env!("CARGO_PKG_VERSION"))),
+        "{labels:?}"
+    );
+    // The button, not performClose: directly — a Close that stopped
+    // reaching the window would otherwise pass this test.
+    let about_close = descendants(&about_window.contentView().unwrap())
+        .into_iter()
+        .filter_map(|v| v.downcast::<NSButton>().ok())
+        .find(|b| b.title().to_string() == "Close")
+        .expect("About has a Close button");
+    unsafe { about_close.performClick(None) };
+    assert!(!about_window.isVisible());
+    assert_eq!(
+        app.activationPolicy(),
+        NSApplicationActivationPolicy::Accessory,
+        "closing the last window settles back to an agent"
+    );
+    about::show(mtm);
+    assert!(about_window.isVisible(), "About reopens the same window");
+    about_window.performClose(None);
+    println!("passed: about shows the crate version, closes by button, and reopens");
+
     std::fs::remove_dir_all(dir).unwrap();
 }
