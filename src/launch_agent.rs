@@ -58,14 +58,12 @@ pub fn enable() -> Result<()> {
     }
 
     let log_dir = home()?.join("Library/Logs");
-    std::fs::create_dir_all(&log_dir)
-        .with_context(|| format!("create {}", log_dir.display()))?;
+    std::fs::create_dir_all(&log_dir).with_context(|| format!("create {}", log_dir.display()))?;
     let out = log_dir.join("macos-trackpad-companion.agent.log");
 
     let path = plist_path()?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     std::fs::write(&path, plist_contents(&exe, &out))
         .with_context(|| format!("write {}", path.display()))?;
@@ -83,8 +81,7 @@ pub fn disable() -> Result<()> {
     let path = plist_path()?;
     let _ = bootout();
     if path.exists() {
-        std::fs::remove_file(&path)
-            .with_context(|| format!("remove {}", path.display()))?;
+        std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
     }
     log::info!("start-at-login disabled");
     Ok(())
@@ -185,7 +182,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tpc-agent-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("test.plist");
-        std::fs::write(&p, plist_contents(Path::new("/bin/true"), Path::new("/tmp/a.log"))).unwrap();
+        std::fs::write(
+            &p,
+            plist_contents(Path::new("/bin/true"), Path::new("/tmp/a.log")),
+        )
+        .unwrap();
 
         let out = std::process::Command::new("/usr/bin/plutil")
             .arg("-lint")

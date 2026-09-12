@@ -20,8 +20,8 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{AnyThread, MainThreadMarker, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSAlertThirdButtonReturn,
-    NSImage, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+    NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSAlertThirdButtonReturn, NSImage, NSMenu,
+    NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
 };
 use objc2_foundation::{NSData, NSSize, NSString};
 
@@ -65,12 +65,12 @@ define_class!(
             // Pausing has the same consequence as quitting for a pad
             // that only works while we drive it — except you also need
             // a pointer to un-pause. Ask first.
-            if !crate::pause::is_paused() && no_pointer_fallback() {
-                if let Some(mtm) = MainThreadMarker::new() {
-                    if !confirm_pointer_loss(mtm, "Pause and lose the trackpad?", "Pause Anyway") {
-                        return;
-                    }
-                }
+            if !crate::pause::is_paused()
+                && no_pointer_fallback()
+                && let Some(mtm) = MainThreadMarker::new()
+                && !confirm_pointer_loss(mtm, "Pause and lose the trackpad?", "Pause Anyway")
+            {
+                return;
             }
             let paused = crate::pause::toggle();
             if let Some(item) = sender.and_then(|s| s.downcast_ref::<NSMenuItem>()) {
@@ -107,13 +107,12 @@ define_class!(
             // a pad that goes dormant without us, and no usable built-in
             // trackpad to fall back on — either because macOS is
             // ignoring it, or because this Mac hasn't got one.
-            if no_pointer_fallback() {
-                if let Some(mtm) = MainThreadMarker::new() {
-                    if !confirm_pointer_loss(mtm, "Quit and lose the trackpad?", "Quit Anyway") {
-                        log::info!("quit cancelled");
-                        return;
-                    }
-                }
+            if no_pointer_fallback()
+                && let Some(mtm) = MainThreadMarker::new()
+                && !confirm_pointer_loss(mtm, "Quit and lose the trackpad?", "Quit Anyway")
+            {
+                log::info!("quit cancelled");
+                return;
             }
             log::info!("quit requested from menu");
             // Straight into the sigwait worker installed by
@@ -123,7 +122,6 @@ define_class!(
         }
     }
 );
-
 
 /// Whether stopping now would leave the machine with no usable pointer:
 /// a pad that only responds while we drive it, and no built-in trackpad
@@ -258,7 +256,11 @@ impl StatusItem {
         let pause_item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 mtm.alloc::<NSMenuItem>(),
-                &NSString::from_str(if crate::pause::is_paused() { "Resume" } else { "Pause" }),
+                &NSString::from_str(if crate::pause::is_paused() {
+                    "Resume"
+                } else {
+                    "Pause"
+                }),
                 Some(sel!(togglePause:)),
                 &NSString::from_str(""),
             )

@@ -349,11 +349,7 @@ fn main() -> Result<()> {
 }
 
 /// Drive the replay from the scope window instead of straight through.
-fn run_scope(
-    frames: Vec<(Timestamp, Frame)>,
-    pad: Option<PadGeometry>,
-    speed: f64,
-) -> Result<()> {
+fn run_scope(frames: Vec<(Timestamp, Frame)>, pad: Option<PadGeometry>, speed: f64) -> Result<()> {
     let mtm = objc2::MainThreadMarker::new()
         .ok_or_else(|| anyhow::anyhow!("main() must run on the main thread"))?;
 
@@ -381,9 +377,7 @@ fn run_scope(
     println!("scope open — space plays/pauses, ← → step a frame, shift+← → steps ten");
     app_kit::run_event_loop(mtm);
 
-    unsafe {
-        core_foundation_sys::runloop::CFRunLoopTimerInvalidate(timer.as_concrete_TypeRef())
-    };
+    unsafe { core_foundation_sys::runloop::CFRunLoopTimerInvalidate(timer.as_concrete_TypeRef()) };
     with_player(|p| p.state.output().flush_cursor());
     println!("---");
     Ok(())

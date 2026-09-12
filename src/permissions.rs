@@ -119,6 +119,7 @@ pub fn accessibility() -> bool {
 ///     nothing to toggle;
 ///   * adding the bundle by hand with the `+` button worked, and the
 ///     grant then persisted across rebuilds.
+///
 /// By contrast `AXIsProcessTrustedWithOptions` (Accessibility) prompted
 /// correctly on the first try, so this is specific to the HID path.
 ///
@@ -131,6 +132,7 @@ pub fn accessibility() -> bool {
 ///   * whether a denial cached earlier in the same boot session
 ///     suppresses later prompts;
 ///   * whether notarization or hardened runtime changes it.
+///
 /// Reset state before each attempt:
 ///   tccutil reset ListenEvent net.guemez.trackpad-companion
 ///

@@ -5,10 +5,10 @@
 //! resuming is instant. It is the right answer to "stop doing that for
 //! a minute" — quitting is not.
 //!
-//! Pausing settles the engine first by feeding it one empty frame, so
-//! any gesture in flight ends cleanly. Simply dropping frames would
-//! leave the engine believing fingers are still down, and macOS
-//! believing a scroll never finished.
+//! Pausing cancels the engine's active input without recognizing a
+//! finger lift, so it cannot produce a tap, swipe commit or new inertia.
+//! Simply dropping frames would leave the engine believing fingers are
+//! still down, and macOS believing a scroll never finished.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,6 +41,9 @@ pub fn toggle() -> bool {
             }
         });
     }
-    log::info!("gesture synthesis {}", if now { "paused" } else { "resumed" });
+    log::info!(
+        "gesture synthesis {}",
+        if now { "paused" } else { "resumed" }
+    );
     now
 }

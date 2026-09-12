@@ -19,7 +19,9 @@ use std::ffi::c_void;
 
 use core_foundation::base::TCFType;
 use core_foundation::date::CFAbsoluteTimeGetCurrent;
-use core_foundation::runloop::{CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext, kCFRunLoopCommonModes};
+use core_foundation::runloop::{
+    CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext, kCFRunLoopCommonModes,
+};
 use core_foundation_sys::runloop::{CFRunLoopTimerInvalidate, CFRunLoopTimerRef};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
@@ -166,10 +168,7 @@ impl Setup {
     fn build(mtm: MainThreadMarker) -> Self {
         app_kit::ensure_app(mtm);
 
-        let rect = NSRect::new(
-            NSPoint::new(0.0, 0.0),
-            NSSize::new(WINDOW_W, WINDOW_H),
-        );
+        let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WINDOW_W, WINDOW_H));
         let style = NSWindowStyleMask::Titled | NSWindowStyleMask::Closable;
         let window: Retained<NSWindow> = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -193,9 +192,18 @@ impl Setup {
         app_kit::register_window(window.clone());
 
         let actions = Actions::new(mtm);
-        let content = window.contentView().expect("NSWindow auto-creates a contentView");
+        let content = window
+            .contentView()
+            .expect("NSWindow auto-creates a contentView");
 
-        let title = label(mtm, "Two permissions are required", 24.0, 216.0, 452.0, 22.0);
+        let title = label(
+            mtm,
+            "Two permissions are required",
+            24.0,
+            216.0,
+            452.0,
+            22.0,
+        );
         title.setFont(Some(&NSFont::boldSystemFontOfSize(15.0)));
         content.addSubview(&title);
 
@@ -214,7 +222,14 @@ impl Setup {
         let im_label = label(mtm, "Input Monitoring", 24.0, 150.0, 150.0, 20.0);
         im_label.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
         content.addSubview(&im_label);
-        let im_why = label(mtm, "Read touch data from the trackpad", 24.0, 132.0, 300.0, 16.0);
+        let im_why = label(
+            mtm,
+            "Read touch data from the trackpad",
+            24.0,
+            132.0,
+            300.0,
+            16.0,
+        );
         im_why.setFont(Some(&NSFont::systemFontOfSize(11.0)));
         content.addSubview(&im_why);
         let im_status = label(mtm, "", 180.0, 150.0, 150.0, 20.0);
@@ -226,7 +241,14 @@ impl Setup {
         let ax_label = label(mtm, "Accessibility", 24.0, 96.0, 150.0, 20.0);
         ax_label.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
         content.addSubview(&ax_label);
-        let ax_why = label(mtm, "Move the cursor and post gestures", 24.0, 78.0, 300.0, 16.0);
+        let ax_why = label(
+            mtm,
+            "Move the cursor and post gestures",
+            24.0,
+            78.0,
+            300.0,
+            16.0,
+        );
         ax_why.setFont(Some(&NSFont::systemFontOfSize(11.0)));
         content.addSubview(&ax_why);
         let ax_status = label(mtm, "", 180.0, 96.0, 150.0, 20.0);
@@ -317,8 +339,7 @@ impl Setup {
 
         // A grant made while running doesn't reach this process: the
         // HID access check is made when the manager opens.
-        let needs_relaunch =
-            state.input_monitoring.is_granted() && !self.initial_im.is_granted();
+        let needs_relaunch = state.input_monitoring.is_granted() && !self.initial_im.is_granted();
         self.relaunch.setHidden(!needs_relaunch);
         // Input Monitoring gets its own instruction. macOS often
         // declines to show the prompt for a background agent and

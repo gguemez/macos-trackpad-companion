@@ -225,18 +225,13 @@ pub enum SwipeBackend {
 /// can't kill its own gesture. Mirrors how macOS itself dispatches
 /// pinch/rotate/scroll/click — to the window under the cursor, not
 /// strictly the frontmost app.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum GestureEnable {
+    #[default]
     On,
     Off,
     Only(Vec<String>),
     Except(Vec<String>),
-}
-
-impl Default for GestureEnable {
-    fn default() -> Self {
-        Self::On
-    }
 }
 
 impl<'de> Deserialize<'de> for GestureEnable {

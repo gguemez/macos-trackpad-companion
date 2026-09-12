@@ -119,10 +119,10 @@ impl Default for ScrollAccel {
 /// which is exactly the case we're trying to clamp against). Used by
 /// `move_cursor_by` to keep posted event locations on-screen.
 fn display_bounds_for(point: CGPoint) -> CGRect {
-    if let Ok((ids, _)) = CGDisplay::displays_with_point(point, 1) {
-        if let Some(&id) = ids.first() {
-            return CGDisplay::new(id).bounds();
-        }
+    if let Ok((ids, _)) = CGDisplay::displays_with_point(point, 1)
+        && let Some(&id) = ids.first()
+    {
+        return CGDisplay::new(id).bounds();
     }
     CGDisplay::main().bounds()
 }
@@ -373,7 +373,6 @@ const SWIPE_VERTICAL_COMMIT_PROGRESS: f64 = 0.2;
 /// past the natural feel without changing slow ones at all. Tunable.
 const SWIPE_END_VELOCITY_MAX: f64 = 8.0;
 
-
 /// Magic CGEventFlags value calftrail's gesture synthesizer sets on the
 /// envelope event before serialization (`CGEventSetFlags(e, 256)`).
 /// `0x100` is `NX_NONCOALSESCEDMASK` in IOHIDSystem private headers —
@@ -478,7 +477,6 @@ impl Drop for Event {
         unsafe { CFRelease(self.0 as *const c_void) };
     }
 }
-
 
 // ---------- Calftrail-style gesture synthesizer ----------
 //
@@ -922,9 +920,15 @@ pub trait Output {
     /// pinch/rotate doesn't strand a 2F gesture in pinch+rotate when
     /// the user meant to scroll. Defaults are admissive so test fakes
     /// don't have to thread policy through.
-    fn pinch_admissible_now(&self) -> bool { true }
-    fn rotate_admissible_now(&self) -> bool { true }
-    fn swipe_admissible_now(&self, _axis: SwipeAxis) -> bool { true }
+    fn pinch_admissible_now(&self) -> bool {
+        true
+    }
+    fn rotate_admissible_now(&self) -> bool {
+        true
+    }
+    fn swipe_admissible_now(&self, _axis: SwipeAxis) -> bool {
+        true
+    }
     /// Post a cursor move with the given pixel deltas. The gesture
     /// engine has already applied any acceleration curve and rounded
     /// to integer pixels (carrying the sub-pixel residual across
@@ -1063,7 +1067,8 @@ impl<O: Output> Output for OverlayOutput<O> {
             };
             self.flash(label);
         }
-        self.inner.swipe(axis, signed_progress, velocity_mm_per_sec, phase);
+        self.inner
+            .swipe(axis, signed_progress, velocity_mm_per_sec, phase);
     }
 }
 
@@ -1261,12 +1266,16 @@ impl Emitter {
         }) else {
             return;
         };
-        e.set_int(kCGMouseEventDeltaX as u32, i64::from(dx_px));
-        e.set_int(kCGMouseEventDeltaY as u32, i64::from(dy_px));
+        e.set_int(kCGMouseEventDeltaX, i64::from(dx_px));
+        e.set_int(kCGMouseEventDeltaY, i64::from(dy_px));
         unsafe { CGEventSetTimestamp(e.0, self.event_timestamp().as_nanos()) };
         log::trace!(
             "post: {} d=({:+},{:+})px to=({:.0},{:.0})",
-            if held { "leftMouseDragged" } else { "mouseMoved" },
+            if held {
+                "leftMouseDragged"
+            } else {
+                "mouseMoved"
+            },
             dx_px,
             dy_px,
             p.x,
@@ -1391,7 +1400,11 @@ impl Emitter {
     /// Per-frame mm is converted to mm/s via wall-clock dt so the
     /// acceleration curve runs on a frame-rate-independent velocity.
     pub fn scroll(&self, dx_mm: f64, dy_mm: f64, phase: Phase) {
-        let sign = if self.cfg.borrow().natural_scroll { 1.0 } else { -1.0 };
+        let sign = if self.cfg.borrow().natural_scroll {
+            1.0
+        } else {
+            -1.0
+        };
         let now = self.event_timestamp();
         // Reset per-stroke state on Began. Carry would otherwise leak a
         // fraction-of-a-pixel from the previous stroke; `scroll_last_time`
@@ -1422,10 +1435,8 @@ impl Emitter {
         }
         post_scroll_event(
             self.event_source,
-            int_x,
-            int_y,
-            dx_px,
-            dy_px,
+            (int_x, int_y),
+            (dx_px, dy_px),
             phase,
             /* momentum */ Phase::Cancelled,
             now,
@@ -1435,7 +1446,11 @@ impl Emitter {
     /// Seed inertia from the just-ended pan. Cancels any in-flight coast
     /// and starts a new one driven by a CFRunLoopTimer.
     pub fn scroll_inertia(&self, vx_mm_per_sec: f64, vy_mm_per_sec: f64) {
-        let sign = if self.cfg.borrow().natural_scroll { 1.0 } else { -1.0 };
+        let sign = if self.cfg.borrow().natural_scroll {
+            1.0
+        } else {
+            -1.0
+        };
         // Apply direction sign here so the Momentum struct doesn't have
         // to know about natural_scroll — it just integrates a velocity.
         self.momentum
@@ -1499,7 +1514,19 @@ impl Emitter {
     /// matches a negative horizontal `origin_offset` and fingers-up
     /// (Mission Control) matches a positive vertical `origin_offset` —
     /// so this function negates both before sending.
-    pub fn swipe(&self, axis: SwipeAxis, signed_progress: f64, velocity_mm_per_sec: f64, phase: Phase) {
+    pub fn swipe(
+        &self,
+        axis: SwipeAxis,
+        signed_progress: f64,
+        velocity_mm_per_sec: f64,
+        phase: Phase,
+    ) {
+        // A reload can disable/change the backend while a Dock stream is
+        // live. Cancellation must still reach the backend that opened it.
+        if matches!(phase, Phase::Cancelled) && self.swipe_axis.get() == Some(axis) {
+            self.swipe_synthetic(axis, signed_progress, velocity_mm_per_sec, phase);
+            return;
+        }
         let backend = match axis {
             SwipeAxis::Horizontal => self.cfg.borrow().horizontal_swipe.backend,
             SwipeAxis::Vertical => self.cfg.borrow().vertical_swipe.backend,
@@ -1508,7 +1535,9 @@ impl Emitter {
             (SwipeBackend::Off, _) | (SwipeBackend::Notification, SwipeAxis::Horizontal) => {
                 log::trace!(
                     "post: swipe {:?} {:?} suppressed (backend={:?})",
-                    axis, phase, backend,
+                    axis,
+                    phase,
+                    backend,
                 );
             }
             (SwipeBackend::Notification, SwipeAxis::Vertical) => {
@@ -1523,7 +1552,13 @@ impl Emitter {
     /// Live-animated DockSwipe synthesis. Posts an event pair per
     /// gesture-engine frame; user can reverse or abort mid-gesture.
     /// See [`post_dock_swipe`] for the event shape and attribution.
-    fn swipe_synthetic(&self, axis: SwipeAxis, signed_progress: f64, velocity_mm_per_sec: f64, phase: Phase) {
+    fn swipe_synthetic(
+        &self,
+        axis: SwipeAxis,
+        signed_progress: f64,
+        velocity_mm_per_sec: f64,
+        phase: Phase,
+    ) {
         // Gesture-engine convention: positive `signed_progress` = finger
         // centroid moved +X (right) / +Y (down) since gesture start.
         // Dock's wire convention is the opposite on both axes (measured
@@ -1548,9 +1583,8 @@ impl Emitter {
         // Velocity is meaningful at lift only; cap to keep fast lifts
         // from looking abrupt vs. real-trackpad feel. See
         // SWIPE_END_VELOCITY_MAX comment.
-        let velocity = matches!(phase, Phase::Ended | Phase::Cancelled).then(|| {
-            velocity_mm_per_sec.clamp(-SWIPE_END_VELOCITY_MAX, SWIPE_END_VELOCITY_MAX)
-        });
+        let velocity = matches!(phase, Phase::Ended | Phase::Cancelled)
+            .then(|| velocity_mm_per_sec.clamp(-SWIPE_END_VELOCITY_MAX, SWIPE_END_VELOCITY_MAX));
         log::trace!(
             "post: swipe (synthetic) axis={:?} motion={} progress={:+.3} origin_offset={:+.3} v={:+.1} (capped {:+.1}) phase={:?}",
             axis,
@@ -1575,10 +1609,13 @@ impl Emitter {
     /// threshold. Vertical-only — there's no Dock notification for
     /// horizontal Space switching.
     fn swipe_notification(&self, signed_progress: f64, phase: Phase) {
-        if !matches!(phase, Phase::Ended) || signed_progress.abs() < SWIPE_VERTICAL_COMMIT_PROGRESS {
+        if !matches!(phase, Phase::Ended) || signed_progress.abs() < SWIPE_VERTICAL_COMMIT_PROGRESS
+        {
             log::trace!(
                 "post: vertical swipe (notification) {:?} progress={:+.3} (no-op until Ended past ±{})",
-                phase, signed_progress, SWIPE_VERTICAL_COMMIT_PROGRESS,
+                phase,
+                signed_progress,
+                SWIPE_VERTICAL_COMMIT_PROGRESS,
             );
             return;
         }
@@ -1589,7 +1626,8 @@ impl Emitter {
         };
         log::debug!(
             "post: vertical swipe → {} via CoreDockSendNotification (progress={:+.3})",
-            label, signed_progress,
+            label,
+            signed_progress,
         );
         send_dock_notification(notif);
     }
@@ -1683,7 +1721,9 @@ fn post_dock_swipe(
     velocity: Option<f64>,
     ts: Timestamp,
 ) {
-    let Some(event) = Event::with_source(source) else { return };
+    let Some(event) = Event::with_source(source) else {
+        return;
+    };
     event.set_int(kCGSEventTypeField, kCGSEventDockControl);
     event.set_int(kCGEventGestureHIDType, kIOHIDEventTypeDockSwipe);
     event.set_int(kCGEventGesturePhase, phase);
@@ -1717,14 +1757,14 @@ fn post_dock_swipe(
 /// real-trackpad fling worthy of rubber-band bounce.
 fn post_scroll_event(
     source: CGEventSourceRef,
-    int_x_px: i32,
-    int_y_px: i32,
-    float_x_px: f64,
-    float_y_px: f64,
+    int_delta_px: (i32, i32),
+    float_delta_px: (f64, f64),
     scroll_phase: Phase,
     momentum_phase: Phase,
     ts: Timestamp,
 ) {
+    let (int_x_px, int_y_px) = int_delta_px;
+    let (float_x_px, float_y_px) = float_delta_px;
     let Some(e) = Event::from_raw(unsafe {
         CGEventCreateScrollWheelEvent2(source, kCGScrollEventUnitPixel, 2, int_y_px, int_x_px, 0)
     }) else {
@@ -1840,10 +1880,8 @@ impl Momentum {
         if self.began_posted.replace(false) {
             post_scroll_event(
                 self.event_source,
-                0,
-                0,
-                0.0,
-                0.0,
+                (0, 0),
+                (0.0, 0.0),
                 Phase::Cancelled,
                 Phase::Ended,
                 Timestamp::now(),
@@ -1898,10 +1936,8 @@ impl Momentum {
         };
         post_scroll_event(
             self.event_source,
-            int_x,
-            int_y,
-            dx_px,
-            dy_px,
+            (int_x, int_y),
+            (dx_px, dy_px),
             Phase::Cancelled,
             phase,
             Timestamp::now(),
@@ -1920,6 +1956,8 @@ extern "C" fn momentum_tick(_timer: CFRunLoopTimerRef, info: *mut c_void) {
 
 impl Drop for Emitter {
     fn drop(&mut self) {
+        self.event_time.set(None);
+        self.set_left_button_held(false);
         // Invalidate the timer before the Momentum box is dropped so
         // an in-flight callback can't dereference a freed pointer.
         // `cancel` may post a final MomentumPhase::Ended via the event
@@ -1973,7 +2011,10 @@ impl Output for Emitter {
             .pinch
             .evaluate(crate::app_context::bundle_id_under_cursor);
         if !admit {
-            log::debug!("admit: pinch denied by policy {:?}", self.cfg.borrow().pinch);
+            log::debug!(
+                "admit: pinch denied by policy {:?}",
+                self.cfg.borrow().pinch
+            );
         }
         admit
     }
@@ -1984,7 +2025,10 @@ impl Output for Emitter {
             .rotate
             .evaluate(crate::app_context::bundle_id_under_cursor);
         if !admit {
-            log::debug!("admit: rotate denied by policy {:?}", self.cfg.borrow().rotate);
+            log::debug!(
+                "admit: rotate denied by policy {:?}",
+                self.cfg.borrow().rotate
+            );
         }
         admit
     }

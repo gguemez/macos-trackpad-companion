@@ -338,6 +338,12 @@ impl TwoFingerBaseline {
     /// The strictly-greater comparison correctly rejects the boundary
     /// case of a fully-anchored finger (|common| = |differential|).
     fn metrics(&self, a: Contact, b: Contact) -> TwoFingerMetrics {
+        // Orient the lever arm by identity, not by a device's slot order.
+        let (a, b) = if a.id == self.initial_b.0 && b.id == self.initial_a.0 {
+            (b, a)
+        } else {
+            (a, b)
+        };
         let dx = b.x - a.x;
         let dy = b.y - a.y;
         let dist = (dx * dx + dy * dy).sqrt().max(1e-9);
@@ -436,7 +442,7 @@ impl TwoFingerBaseline {
         //     of opposite-y noise looks anti-parallel; defer until
         //     trailer commits.
         let pinch_rot_admissible =
-            min_per_finger >= TAP_MAX_MOVE_MM || min_per_finger < ANCHORED_FINGER_FLOOR_MM;
+            !(ANCHORED_FINGER_FLOOR_MM..TAP_MAX_MOVE_MM).contains(&min_per_finger);
         // Penalize pinch/rot selection scores when the two finger-
         // motion vectors are roughly parallel (high positive
         // alignment cosine). Real pinch and real rotate have
@@ -501,6 +507,7 @@ impl TwoFingerBaseline {
 
 #[derive(Clone, Copy, Debug)]
 struct MultiBaseline {
+    contact_ids: [u64; 4],
     initial_centroid: (f64, f64),
     /// Locked swipe axis. None until cumulative centroid motion
     /// crosses [`SWIPE_AXIS_LOCK_MM`]; after that, the dominant
@@ -672,6 +679,9 @@ pub struct State<O: Output> {
     /// over to LeftMouseDragged. Treated independently of finger
     /// gestures (taps/scroll still classify normally while held).
     prev_button: bool,
+    /// A physical click consumes tap eligibility until both the button
+    /// and every contact have lifted, including asynchronous lifts.
+    physical_button_used: bool,
 
     /// Contact selected to drive cursor motion while the physical button is
     /// held with multiple fingers on the pad. Once selected, the contact ID
@@ -750,10 +760,75 @@ impl<O: Output> State<O> {
             born_during_coast: false,
             suppress_one_finger_click: false,
             prev_button: false,
+            physical_button_used: false,
             physical_drag_contact_id: None,
             physical_drag_pending_motion: None,
             observer: None,
         }
+    }
+
+    /// Cancel input on pause, device loss or shutdown. Unlike an empty
+    /// report, this cannot recognize a tap, seed inertia or commit a swipe.
+    pub fn cancel_at(&mut self, now: Timestamp) {
+        self.out.set_event_time(now);
+        self.out.cancel_inertia();
+        if self.prev_button {
+            self.out.set_left_button_held(false);
+        }
+        match self.kind {
+            GestureKind::TwoFingerPan => {
+                // Scroll uses Ended to close its active phase; Cancelled
+                // is the output layer's sentinel for no scroll phase.
+                self.out.scroll(0.0, 0.0, Phase::Ended);
+            }
+            GestureKind::TwoFingerPinchAndRotate => {
+                if let Some(base) = self.two_baseline {
+                    if base.pinch_admitted {
+                        self.out.pinch(0.0, Phase::Cancelled);
+                    }
+                    if base.rotate_admitted {
+                        self.out.rotate(0.0, Phase::Cancelled);
+                    }
+                }
+            }
+            GestureKind::ThreeFingerLive | GestureKind::FourFingerLive => {
+                if let Some(base) = self.multi_baseline
+                    && base.began_posted
+                    && let Some(axis) = base.axis
+                {
+                    let distance = match axis {
+                        SwipeAxis::Horizontal => base.last_centroid.0 - base.initial_centroid.0,
+                        SwipeAxis::Vertical => base.last_centroid.1 - base.initial_centroid.1,
+                    };
+                    self.out.swipe(
+                        axis,
+                        distance / self.swipe_ref_mm(axis),
+                        0.0,
+                        Phase::Cancelled,
+                    );
+                }
+            }
+            _ => {}
+        }
+        self.contacts.clear();
+        self.kind = GestureKind::Idle;
+        self.started_at = now;
+        self.max_move_sq = 0.0;
+        self.two_baseline = None;
+        self.multi_baseline = None;
+        self.pending_motion = None;
+        self.cursor_carry_x_px = 0.0;
+        self.cursor_carry_y_px = 0.0;
+        self.prev_frame_at = None;
+        self.pending_two_finger_tap = None;
+        self.two_finger_recent = None;
+        self.born_during_coast = false;
+        self.suppress_one_finger_click = false;
+        self.prev_button = false;
+        self.physical_button_used = false;
+        self.physical_drag_contact_id = None;
+        self.physical_drag_pending_motion = None;
+        self.observe(&[], now, false, false);
     }
 
     /// Attach (or detach) the observer that receives a [`Snapshot`] per
@@ -807,6 +882,8 @@ impl<O: Output> State<O> {
         // with the host-aligned scan time rather than wall-clock now,
         // matching the time base the gesture engine itself runs on.
         self.out.set_event_time(now);
+
+        self.physical_button_used |= frame.button;
 
         // Forward integrated-button edges before the contact-driven
         // gesture pipeline runs, so a press that arrives in the same
@@ -889,6 +966,9 @@ impl<O: Output> State<O> {
             self.dispatch(&active, now, frame_dt);
         }
         self.observe(&active, now, frame.button, false);
+        if active.is_empty() && !frame.button {
+            self.physical_button_used = false;
+        }
     }
 
     /// Hand the observer what this frame's dispatch was decided from.
@@ -919,7 +999,8 @@ impl<O: Output> State<O> {
                     down_x_mm: tracked.map_or(c.x, |t| t.down_x),
                     down_y_mm: tracked.map_or(c.y, |t| t.down_y),
                     max_move_mm: tracked.map_or(0.0, |t| t.max_move_sq.sqrt()),
-                    age: tracked.map_or(Duration::ZERO, |t| now.saturating_duration_since(t.down_at)),
+                    age: tracked
+                        .map_or(Duration::ZERO, |t| now.saturating_duration_since(t.down_at)),
                     confidence: c.confidence,
                 }
             })
@@ -990,7 +1071,9 @@ impl<O: Output> State<O> {
             contacts,
             since_start,
             max_move_mm,
-            tap_window_open: max_move_mm < TAP_MAX_MOVE_MM && since_start < TAP_MAX_DURATION,
+            tap_window_open: !self.physical_button_used
+                && max_move_mm < TAP_MAX_MOVE_MM
+                && since_start < TAP_MAX_DURATION,
             two_finger,
             multi,
             cursor_accel: self.cursor_accel,
@@ -1047,11 +1130,10 @@ impl<O: Output> State<O> {
         // `born_during_coast`).
         if matches!(self.kind, GestureKind::Idle)
             && !matches!(new_kind, GestureKind::Idle | GestureKind::SwipeLatched)
+            && self.out.cancel_inertia()
         {
-            if self.out.cancel_inertia() {
-                self.born_during_coast = true;
-                log::debug!("touch born during coast — suppressing taps for this session");
-            }
+            self.born_during_coast = true;
+            log::debug!("touch born during coast — suppressing taps for this session");
         }
         // Snapshot before the close-out potentially clears it. We want
         // the close-out's tap branches to see the flag the way they were
@@ -1099,7 +1181,10 @@ impl<O: Output> State<O> {
                         // residual's own left-click path.
                         let total_dur = now - p.started_at;
                         let combined_max_move = p.max_move_sq.max(self.max_move_sq).sqrt();
-                        if total_dur < TAP_MAX_DURATION && combined_max_move < TAP_MAX_MOVE_MM {
+                        if !self.physical_button_used
+                            && total_dur < TAP_MAX_DURATION
+                            && combined_max_move < TAP_MAX_MOVE_MM
+                        {
                             log::debug!(
                                 "2f tap (split lift): click Right (total_dur={}ms combined_max_move={:.2}mm)",
                                 total_dur.as_millis(),
@@ -1121,7 +1206,10 @@ impl<O: Output> State<O> {
                     } else {
                         let dur = now - self.started_at;
                         let max_move = self.max_move_sq.sqrt();
-                        if dur < TAP_MAX_DURATION && max_move < TAP_MAX_MOVE_MM {
+                        if !self.physical_button_used
+                            && dur < TAP_MAX_DURATION
+                            && max_move < TAP_MAX_MOVE_MM
+                        {
                             log::debug!(
                                 "1f tap: click Left (dur={}ms max_move={:.2}mm{})",
                                 dur.as_millis(),
@@ -1177,8 +1265,14 @@ impl<O: Output> State<O> {
             }
             GestureKind::TwoFingerPinchAndRotate => {
                 log::debug!("pinch+rotate: ended");
-                self.out.pinch(0.0, Phase::Ended);
-                self.out.rotate(0.0, Phase::Ended);
+                if let Some(base) = self.two_baseline {
+                    if base.pinch_admitted {
+                        self.out.pinch(0.0, Phase::Ended);
+                    }
+                    if base.rotate_admitted {
+                        self.out.rotate(0.0, Phase::Ended);
+                    }
+                }
                 if matches!(new_kind, GestureKind::OneFinger) {
                     self.suppress_one_finger_click = true;
                     self.capture_partial_lift(active, now);
@@ -1187,7 +1281,9 @@ impl<O: Output> State<O> {
             GestureKind::TwoFingerUnclassified => {
                 let dur = now - self.started_at;
                 let max_move = self.max_move_sq.sqrt();
-                let tap_eligible = dur < TAP_MAX_DURATION && max_move < TAP_MAX_MOVE_MM;
+                let tap_eligible = !self.physical_button_used
+                    && dur < TAP_MAX_DURATION
+                    && max_move < TAP_MAX_MOVE_MM;
                 if matches!(new_kind, GestureKind::Idle) {
                     if bc {
                         log::debug!(
@@ -1279,7 +1375,12 @@ impl<O: Output> State<O> {
                     // residuals: lock out further gestures until full
                     // lift, so brief 2F windows don't fire spurious
                     // right-clicks.
-                    self.kind = GestureKind::SwipeLatched;
+                    self.kind = if active.is_empty() {
+                        self.born_during_coast = false;
+                        GestureKind::Idle
+                    } else {
+                        GestureKind::SwipeLatched
+                    };
                     self.started_at = now;
                     self.max_move_sq = 0.0;
                     self.two_baseline = None;
@@ -1358,6 +1459,7 @@ impl<O: Output> State<O> {
                     );
                 }
                 self.multi_baseline = Some(MultiBaseline {
+                    contact_ids: contact_ids(active),
                     initial_centroid: (cx, cy),
                     axis: None,
                     began_posted: false,
@@ -1503,8 +1605,12 @@ impl<O: Output> State<O> {
                 self.out.scroll(0.0, 0.0, Phase::Began);
             }
             GestureKind::TwoFingerPinchAndRotate => {
-                self.out.pinch(0.0, Phase::Began);
-                self.out.rotate(0.0, Phase::Began);
+                if baseline.pinch_admitted {
+                    self.out.pinch(0.0, Phase::Began);
+                }
+                if baseline.rotate_admitted {
+                    self.out.rotate(0.0, Phase::Began);
+                }
             }
             _ => {}
         }
@@ -1531,14 +1637,14 @@ impl<O: Output> State<O> {
 
         // If the selected contact disappeared, forget it and wait for a clean
         // re-selection rather than jumping immediately to another finger.
-        if let Some(id) = self.physical_drag_contact_id {
-            if !active.iter().any(|c| c.id == id) {
-                self.physical_drag_contact_id = None;
-                self.physical_drag_pending_motion = None;
-                self.cursor_carry_x_px = 0.0;
-                self.cursor_carry_y_px = 0.0;
-                return;
-            }
+        if let Some(id) = self.physical_drag_contact_id
+            && !active.iter().any(|c| c.id == id)
+        {
+            self.physical_drag_contact_id = None;
+            self.physical_drag_pending_motion = None;
+            self.cursor_carry_x_px = 0.0;
+            self.cursor_carry_y_px = 0.0;
+            return;
         }
 
         // No mover selected yet: compare this frame's displacement for every
@@ -1598,12 +1704,12 @@ impl<O: Output> State<O> {
         // Same one-frame deferral used by normal cursor movement. If the chosen
         // contact lifts on the next report, this buffered final delta is dropped
         // rather than causing a lift-frame jump.
-        if let Some((bdx, bdy, bdt)) = self.physical_drag_pending_motion.take() {
-            if bdx.abs() > MOTION_DEAD_ZONE_MM || bdy.abs() > MOTION_DEAD_ZONE_MM {
-                let (dx_px, dy_px) = self.cursor_pixels_for(bdx, bdy, bdt);
-                if dx_px != 0 || dy_px != 0 {
-                    self.out.move_cursor_by(dx_px, dy_px);
-                }
+        if let Some((bdx, bdy, bdt)) = self.physical_drag_pending_motion.take()
+            && (bdx.abs() > MOTION_DEAD_ZONE_MM || bdy.abs() > MOTION_DEAD_ZONE_MM)
+        {
+            let (dx_px, dy_px) = self.cursor_pixels_for(bdx, bdy, bdt);
+            if dx_px != 0 || dy_px != 0 {
+                self.out.move_cursor_by(dx_px, dy_px);
             }
         }
 
@@ -1644,7 +1750,8 @@ impl<O: Output> State<O> {
         // moment we cross the threshold.
         let max_move = tr.max_move_sq.sqrt();
         let dur = now - self.started_at;
-        let could_still_tap = max_move < TAP_MAX_MOVE_MM && dur < TAP_MAX_DURATION;
+        let could_still_tap =
+            !self.physical_button_used && max_move < TAP_MAX_MOVE_MM && dur < TAP_MAX_DURATION;
         if could_still_tap {
             self.pending_motion = None;
             return;
@@ -1657,22 +1764,22 @@ impl<O: Output> State<O> {
         // `pending_motion` without emitting it — that's what drops
         // the centroid-shift jump that capacitive trackpads commonly
         // report on the last with-finger frame.
-        if let Some((bdx, bdy, bdt)) = self.pending_motion.take() {
-            if bdx.abs() > MOTION_DEAD_ZONE_MM || bdy.abs() > MOTION_DEAD_ZONE_MM {
-                let (dx_px, dy_px) = self.cursor_pixels_for(bdx, bdy, bdt);
-                if dx_px != 0 || dy_px != 0 {
-                    log::debug!(
-                        "cursor: emit deferred d=({:+.3},{:+.3})mm → ({:+},{:+})px \
+        if let Some((bdx, bdy, bdt)) = self.pending_motion.take()
+            && (bdx.abs() > MOTION_DEAD_ZONE_MM || bdy.abs() > MOTION_DEAD_ZONE_MM)
+        {
+            let (dx_px, dy_px) = self.cursor_pixels_for(bdx, bdy, bdt);
+            if dx_px != 0 || dy_px != 0 {
+                log::debug!(
+                    "cursor: emit deferred d=({:+.3},{:+.3})mm → ({:+},{:+})px \
                          (cur frame at=({:.2},{:.2})mm)",
-                        bdx,
-                        bdy,
-                        dx_px,
-                        dy_px,
-                        c.x,
-                        c.y,
-                    );
-                    self.out.move_cursor_by(dx_px, dy_px);
-                }
+                    bdx,
+                    bdy,
+                    dx_px,
+                    dy_px,
+                    c.x,
+                    c.y,
+                );
+                self.out.move_cursor_by(dx_px, dy_px);
             }
         }
         self.pending_motion = Some((dx, dy, frame_dt));
@@ -1738,7 +1845,8 @@ impl<O: Output> State<O> {
         if matches!(self.kind, GestureKind::TwoFingerUnclassified) {
             let max_move = self.max_move_sq.sqrt();
             let dur = now - self.started_at;
-            let could_still_tap = max_move < TAP_MAX_MOVE_MM && dur < TAP_MAX_DURATION;
+            let could_still_tap =
+                !self.physical_button_used && max_move < TAP_MAX_MOVE_MM && dur < TAP_MAX_DURATION;
             if could_still_tap {
                 base.last_centroid = centroid;
                 // Track scale and angle pre-lock so the first Changed
@@ -1859,13 +1967,14 @@ impl<O: Output> State<O> {
                             alignment,
                             balance,
                         );
-                        // Both streams begin at lock so a downstream app
-                        // subscribed to either gets a coherent
-                        // Began/Changed/Ended sequence — Changed events
-                        // alternate per-frame based on which stream is
-                        // dominant.
-                        self.out.pinch(0.0, Phase::Began);
-                        self.out.rotate(0.0, Phase::Began);
+                        // Only admitted streams get phase brackets. The
+                        // admission remains fixed through the whole touch.
+                        if base.pinch_admitted {
+                            self.out.pinch(0.0, Phase::Began);
+                        }
+                        if base.rotate_admitted {
+                            self.out.rotate(0.0, Phase::Began);
+                        }
                         // Seed the dominant stream from whichever signal
                         // crossed harder at lock. Subsequent switching
                         // is gated by `PINCH_ROTATE_HYSTERESIS`.
@@ -1926,8 +2035,16 @@ impl<O: Output> State<O> {
                 let scale = dist / base.initial_distance;
                 let scale_delta = scale - base.prev_scale;
                 let angle_d = angle_delta(ang, base.prev_angle);
-                let pinch_strength = scale_delta.abs() / PINCH_LOCK_RATIO;
-                let rot_strength = angle_d.abs() / ROTATE_LOCK_RAD;
+                let pinch_strength = if base.pinch_admitted {
+                    scale_delta.abs() / PINCH_LOCK_RATIO
+                } else {
+                    0.0
+                };
+                let rot_strength = if base.rotate_admitted {
+                    angle_d.abs() / ROTATE_LOCK_RAD
+                } else {
+                    0.0
+                };
                 base.pinch_rotate_dominant = match base.pinch_rotate_dominant {
                     PinchRotateDominant::Pinch
                         if rot_strength > pinch_strength * PINCH_ROTATE_HYSTERESIS =>
@@ -1942,11 +2059,13 @@ impl<O: Output> State<O> {
                     other => other,
                 };
                 match base.pinch_rotate_dominant {
-                    PinchRotateDominant::Pinch if scale_delta.abs() > 1e-4 => {
+                    PinchRotateDominant::Pinch
+                        if base.pinch_admitted && scale_delta.abs() > 1e-4 =>
+                    {
                         log::debug!("pinch: delta={:+.4} scale={:.4}", scale_delta, scale);
                         self.out.pinch(scale_delta, Phase::Changed);
                     }
-                    PinchRotateDominant::Rotate if angle_d.abs() > 1e-4 => {
+                    PinchRotateDominant::Rotate if base.rotate_admitted && angle_d.abs() > 1e-4 => {
                         log::debug!("rotate: delta={:+.2}deg", angle_d.to_degrees());
                         self.out.rotate(angle_d.to_degrees(), Phase::Changed);
                     }
@@ -1973,6 +2092,19 @@ impl<O: Output> State<O> {
         };
         let cx: f64 = active.iter().map(|c| c.x).sum::<f64>() / active.len() as f64;
         let cy: f64 = active.iter().map(|c| c.y).sum::<f64>() / active.len() as f64;
+        let ids = contact_ids(active);
+        if ids != base.contact_ids {
+            // Adding/removing a finger shifts the centroid even without
+            // motion. Rebase this sample while preserving accumulated
+            // progress, the locked axis and the last real velocity.
+            base.initial_centroid.0 += cx - base.last_centroid.0;
+            base.initial_centroid.1 += cy - base.last_centroid.1;
+            base.last_centroid = (cx, cy);
+            base.last_centroid_time = Some(now);
+            base.contact_ids = ids;
+            self.multi_baseline = Some(base);
+            return;
+        }
         let dx = cx - base.initial_centroid.0;
         let dy = cy - base.initial_centroid.1;
 
@@ -2046,6 +2178,21 @@ impl<O: Output> State<O> {
             .swipe(axis, signed_progress, /* velocity */ 0.0, phase);
         self.multi_baseline = Some(base);
     }
+}
+
+impl<O: Output> Drop for State<O> {
+    fn drop(&mut self) {
+        // Output is still alive here, so held input can be released.
+        self.cancel_at(Timestamp::now());
+    }
+}
+
+fn contact_ids(active: &[Contact]) -> [u64; 4] {
+    let mut ids = [0; 4];
+    for c in active {
+        ids[c.id as usize / 64] |= 1u64 << (c.id % 64);
+    }
+    ids
 }
 
 // ---- Observation ----
@@ -2403,15 +2550,24 @@ mod tests {
         use crate::output::SwipeAxis;
 
         // The reference firmware: 65 x 40 mm.
-        let small = PadGeometry { width_mm: 65.0, height_mm: 40.0 };
+        let small = PadGeometry {
+            width_mm: 65.0,
+            height_mm: 40.0,
+        };
         assert!((small.swipe_progress_ref_mm(SwipeAxis::Horizontal) - 39.0).abs() < 0.1);
         // Below the floor, so clamped rather than becoming trivially easy.
-        assert_eq!(small.swipe_progress_ref_mm(SwipeAxis::Vertical), SWIPE_PROGRESS_MIN_MM);
+        assert_eq!(
+            small.swipe_progress_ref_mm(SwipeAxis::Vertical),
+            SWIPE_PROGRESS_MIN_MM
+        );
 
         // The third-party pad this was found on: 209.8 x 119.1 mm. The
         // old fixed 50 mm meant a horizontal swipe completed after a
         // quarter of the surface.
-        let large = PadGeometry { width_mm: 209.8, height_mm: 119.1 };
+        let large = PadGeometry {
+            width_mm: 209.8,
+            height_mm: 119.1,
+        };
         assert!((large.swipe_progress_ref_mm(SwipeAxis::Horizontal) - 120.0).abs() < 0.1);
         assert!((large.swipe_progress_ref_mm(SwipeAxis::Vertical) - 71.5).abs() < 0.5);
         assert!(
@@ -2452,6 +2608,303 @@ mod tests {
         let mut f = frame(contacts);
         f.button = button;
         f
+    }
+
+    fn at_ms(ms: u64) -> Timestamp {
+        Timestamp::from_nanos(1_000_000_000 + ms * 1_000_000)
+    }
+
+    #[test]
+    fn physical_click_never_becomes_a_tap_even_after_button_release() {
+        for contacts in [vec![(1, 0.2, 0.4)], vec![(1, 0.2, 0.4), (2, 0.6, 0.4)]] {
+            for split_lift in [false, true] {
+                let out = Recorder::default();
+                let mut s = State::new(&out, test_accel());
+                s.on_frame_at(frame_with_button(&contacts, true), at_ms(0));
+                // Releasing the switch before the contacts lift must not
+                // restore tap eligibility for this contact session.
+                s.on_frame_at(frame(&contacts), at_ms(20));
+                if split_lift {
+                    s.on_frame_at(frame(&contacts[..1]), at_ms(30));
+                }
+                s.on_frame_at(frame(&[]), at_ms(50));
+                let log = out.pop();
+                assert_eq!(
+                    log.iter()
+                        .filter(|l| l.starts_with("set_left_button_held"))
+                        .count(),
+                    2,
+                    "{log:?}"
+                );
+                assert!(!log.iter().any(|l| l.starts_with("click ")), "{log:?}");
+                // A new, independent touch can still tap normally.
+                s.on_frame_at(frame(&[(3, 0.4, 0.4)]), at_ms(200));
+                s.on_frame_at(frame(&[]), at_ms(250));
+                assert!(out.pop().contains(&"click Left".to_owned()));
+            }
+        }
+    }
+
+    #[test]
+    fn reordering_contact_slots_does_not_rotate_a_locked_pinch() {
+        let out = Recorder::default();
+        let mut s = State::new(&out, test_accel());
+        s.on_frame_at(frame(&[(1, 0.2, 0.4), (2, 0.6, 0.4)]), at_ms(0));
+        s.on_frame_at(frame(&[(1, 0.1, 0.4), (2, 0.7, 0.4)]), at_ms(200));
+        assert!(
+            out.pop()
+                .iter()
+                .any(|l| l.starts_with("pinch") && l.ends_with("Began"))
+        );
+        for ms in 201..210 {
+            let contacts = if ms % 2 == 0 {
+                [(1, 0.1, 0.4), (2, 0.7, 0.4)]
+            } else {
+                [(2, 0.7, 0.4), (1, 0.1, 0.4)]
+            };
+            s.on_frame_at(frame(&contacts), at_ms(ms));
+        }
+        assert!(
+            out.pop().is_empty(),
+            "stationary contacts must emit no deltas"
+        );
+    }
+
+    /// Spread and twist around a fixed centroid, in real millimetres.
+    fn pair(radius: f64, degrees: f64) -> Frame {
+        let angle = degrees.to_radians();
+        let (dx, dy) = (radius * angle.cos(), radius * angle.sin());
+        frame(&[
+            (1, (20.0 - dx) / 50.0, (20.0 - dy) / 50.0),
+            (2, (20.0 + dx) / 50.0, (20.0 + dy) / 50.0),
+        ])
+    }
+
+    #[test]
+    fn disabled_pinch_or_rotate_stays_disabled_after_lock_and_rejoin() {
+        for deny_pinch in [false, true] {
+            for cancel in [false, true] {
+                let out = Recorder::default();
+                let (allowed, denied) = if deny_pinch {
+                    out.deny_pinch();
+                    ("rotate", "pinch")
+                } else {
+                    out.deny_rotate();
+                    ("pinch", "rotate")
+                };
+                let mut s = State::new(&out, test_accel());
+                s.on_frame_at(pair(10.0, 0.0), at_ms(0));
+                s.on_frame_at(pair(15.0, 10.0), at_ms(200));
+                s.on_frame_at(pair(20.0, 45.0), at_ms(210));
+                let mut single = pair(20.0, 45.0);
+                single.contacts.truncate(1);
+                s.on_frame_at(single, at_ms(220));
+                s.on_frame_at(pair(20.0, 45.0), at_ms(230));
+                s.on_frame_at(pair(25.0, 60.0), at_ms(240));
+                if cancel {
+                    s.cancel_at(at_ms(250));
+                } else {
+                    s.on_frame_at(frame(&[]), at_ms(250));
+                }
+                let log = out.pop();
+                assert!(
+                    log.iter()
+                        .any(|l| l.starts_with(allowed) && l.ends_with("Changed")),
+                    "{log:?}"
+                );
+                assert!(
+                    log.iter()
+                        .filter(|l| l.starts_with(allowed) && l.ends_with("Began"))
+                        .count()
+                        >= 2,
+                    "rejoin must reopen admitted stream: {log:?}"
+                );
+                assert!(
+                    !log.iter().any(|l| l.starts_with(denied)),
+                    "disabled stream emitted: {log:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn simultaneous_swipe_lift_allows_the_very_next_touch() {
+        let out = Recorder::default();
+        let mut s = State::new(&out, test_accel());
+        s.on_frame_at(
+            frame(&[(1, 0.2, 0.4), (2, 0.4, 0.4), (3, 0.6, 0.4)]),
+            at_ms(0),
+        );
+        s.on_frame_at(
+            frame(&[(1, 0.3, 0.4), (2, 0.5, 0.4), (3, 0.7, 0.4)]),
+            at_ms(10),
+        );
+        s.on_frame_at(frame(&[]), at_ms(20));
+        let log = out.pop();
+        assert!(
+            log.iter()
+                .any(|l| l.starts_with("swipe") && l.ends_with("Ended")),
+            "{log:?}"
+        );
+        assert_eq!(s.kind, GestureKind::Idle);
+        s.on_frame_at(frame(&[(1, 0.2, 0.4)]), at_ms(200));
+        s.on_frame_at(frame(&[(1, 0.3, 0.4)]), at_ms(210));
+        s.on_frame_at(frame(&[(1, 0.4, 0.4)]), at_ms(220));
+        assert!(out.pop().iter().any(|l| l.starts_with("move ")));
+    }
+
+    #[test]
+    fn changing_swipe_membership_preserves_progress_without_false_motion() {
+        let out = Recorder::default();
+        let mut s = State::new(&out, test_accel());
+        s.on_frame_at(
+            frame(&[(1, 0.2, 0.4), (2, 0.4, 0.4), (3, 0.6, 0.4)]),
+            at_ms(0),
+        );
+        out.pop();
+        s.on_frame_at(
+            frame(&[(1, 0.2, 0.4), (2, 0.4, 0.4), (3, 0.6, 0.4), (255, 1.2, 0.4)]),
+            at_ms(8),
+        );
+        assert!(
+            out.pop().is_empty(),
+            "landing a fourth finger is not a swipe"
+        );
+        s.on_frame_at(
+            frame(&[(1, 0.3, 0.4), (2, 0.5, 0.4), (3, 0.7, 0.4), (255, 1.3, 0.4)]),
+            at_ms(16),
+        );
+        assert!(
+            out.pop()
+                .iter()
+                .any(|l| l.starts_with("swipe") && l.ends_with("Began"))
+        );
+        let before = s.multi_baseline.unwrap();
+        // Lift, then replace one contact without changing the count.
+        s.on_frame_at(
+            frame(&[(1, 0.3, 0.4), (2, 0.5, 0.4), (3, 0.7, 0.4)]),
+            at_ms(24),
+        );
+        s.on_frame_at(
+            frame(&[(1, 0.3, 0.4), (2, 0.5, 0.4), (128, 1.0, 0.4)]),
+            at_ms(32),
+        );
+        assert!(out.pop().is_empty());
+        let after = s.multi_baseline.unwrap();
+        assert_eq!(before.axis, after.axis);
+        assert_eq!(before.velocity, after.velocity);
+        assert!(
+            ((before.last_centroid.0 - before.initial_centroid.0)
+                - (after.last_centroid.0 - after.initial_centroid.0))
+                .abs()
+                < 1e-9
+        );
+        s.on_frame_at(
+            frame(&[(1, 0.4, 0.4), (2, 0.6, 0.4), (128, 1.1, 0.4)]),
+            at_ms(40),
+        );
+        let log = out.pop();
+        assert!(
+            log.iter()
+                .any(|l| l.starts_with("swipe Horizontal +0.200") && l.ends_with("Changed")),
+            "{log:?}"
+        );
+    }
+
+    #[test]
+    fn cancellation_discards_taps_and_releases_a_held_button_once() {
+        for button in [false, true] {
+            let out = Recorder::default();
+            let mut s = State::new(&out, test_accel());
+            s.on_frame_at(frame_with_button(&[(1, 0.2, 0.4)], button), at_ms(0));
+            out.pop();
+            s.cancel_at(at_ms(50));
+            s.cancel_at(at_ms(60));
+            let log = out.pop();
+            assert!(!log.iter().any(|l| l.starts_with("click ")), "{log:?}");
+            assert_eq!(
+                log.iter()
+                    .filter(|l| l.as_str() == "set_left_button_held false")
+                    .count(),
+                usize::from(button)
+            );
+            s.on_frame_at(frame(&[(2, 0.4, 0.4)]), at_ms(100));
+            s.on_frame_at(frame(&[]), at_ms(150));
+            assert!(out.pop().contains(&"click Left".to_owned()));
+        }
+    }
+
+    #[test]
+    fn cancellation_ends_scroll_without_starting_inertia() {
+        let out = Recorder::default();
+        let mut s = State::new(&out, test_accel());
+        s.on_frame_at(frame(&[(1, 0.2, 0.4), (2, 0.6, 0.4)]), at_ms(0));
+        s.on_frame_at(frame(&[(1, 0.2, 0.44), (2, 0.6, 0.44)]), at_ms(20));
+        s.on_frame_at(frame(&[(1, 0.2, 0.5), (2, 0.6, 0.5)]), at_ms(30));
+        assert!(
+            out.pop()
+                .iter()
+                .any(|l| l.starts_with("scroll") && l.ends_with("Changed"))
+        );
+        s.cancel_at(at_ms(40));
+        let log = out.pop();
+        assert!(
+            log.contains(&"scroll 0.0000 0.0000 Ended".to_owned()),
+            "{log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.starts_with("scroll_inertia")),
+            "{log:?}"
+        );
+        // Cancellation must also stop a fling after the contacts have left.
+        out.set_inertia_active(true);
+        s.cancel_at(at_ms(50));
+        assert!(!out.inertia_active.get());
+    }
+
+    #[test]
+    fn cancellation_and_drop_cancel_swipes_instead_of_committing() {
+        for explicit in [false, true] {
+            let out = Recorder::default();
+            let mut s = State::new(&out, test_accel());
+            s.on_frame_at(
+                frame(&[(1, 0.2, 0.4), (2, 0.4, 0.4), (3, 0.6, 0.4)]),
+                at_ms(0),
+            );
+            s.on_frame_at(
+                frame(&[(1, 0.4, 0.4), (2, 0.6, 0.4), (3, 0.8, 0.4)]),
+                at_ms(10),
+            );
+            out.pop();
+            if explicit {
+                s.cancel_at(at_ms(20));
+            }
+            drop(s);
+            let log = out.pop();
+            assert_eq!(
+                log.iter()
+                    .filter(|l| l.starts_with("swipe") && l.ends_with("Cancelled"))
+                    .count(),
+                1,
+                "{log:?}"
+            );
+            assert!(!log.iter().any(|l| l.ends_with("Ended")), "{log:?}");
+        }
+    }
+
+    #[test]
+    fn dropping_state_releases_a_held_physical_button() {
+        let out = Recorder::default();
+        let mut s = State::new(&out, test_accel());
+        s.on_frame_at(frame_with_button(&[(1, 0.2, 0.4)], true), at_ms(0));
+        out.pop();
+        drop(s);
+        let log = out.pop();
+        assert!(
+            log.contains(&"set_left_button_held false".to_owned()),
+            "{log:?}"
+        );
+        assert!(!log.iter().any(|l| l.starts_with("click ")), "{log:?}");
     }
 
     #[test]
@@ -2793,6 +3246,10 @@ mod tests {
     /// `common > differential` gate disqualifies pan; pinch wins on
     /// the next few frames as the distance ratio crosses threshold.
     #[test]
+    #[expect(
+        clippy::approx_constant,
+        reason = "These coordinates are input samples, not mathematical constants"
+    )]
     fn asymmetric_pinch_with_minor_motion_on_anchor_finger_locks_pinch() {
         let r = Recorder::default();
         let mut s = State::new(&r, test_accel());
@@ -2967,10 +3424,10 @@ mod tests {
     /// pinch crosses first at score 1.12. But |common| (1.08 mm,
     /// dominantly south) already beats |differential| (0.85 mm) by
     /// >20% — the basic margin test is passing — and one frame later
-    /// the trailing finger catches up enough that balance flips above
-    /// 0.30. The deferral logic gives pan that one frame to qualify.
-    /// Reproduces /tmp/companion-logs.txt at 2026-05-02 05:13:52.562
-    /// (pinch_score=1.12, rot_score=0.80 false lock).
+    /// > the trailing finger catches up enough that balance flips above
+    /// > 0.30. The deferral logic gives pan that one frame to qualify.
+    /// > Reproduces /tmp/companion-logs.txt at 2026-05-02 05:13:52.562
+    /// > (pinch_score=1.12, rot_score=0.80 false lock).
     #[test]
     fn slow_scroll_with_horizontal_drift_locks_pan_after_one_frame_defer() {
         let r = Recorder::default();

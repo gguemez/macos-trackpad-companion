@@ -11,6 +11,9 @@
 use anyhow::{Result, anyhow, bail};
 use std::collections::HashMap;
 
+const MAX_REPORT_BYTES: usize = 64 * 1024;
+const MAX_REPORT_BITS: usize = MAX_REPORT_BYTES * 8;
+
 const PAGE_GENERIC_DESKTOP: u16 = 0x01;
 const PAGE_BUTTON: u16 = 0x09;
 const PAGE_DIGITIZER: u16 = 0x0D;
@@ -37,12 +40,6 @@ const FINGER_USAGE: u32 = ((PAGE_DIGITIZER as u32) << 16) | (USAGE_DIG_FINGER as
 pub struct BitField {
     pub offset: usize,
     pub size: usize,
-}
-
-impl BitField {
-    fn end(&self) -> usize {
-        self.offset + self.size
-    }
 }
 
 /// Where each per-contact field lives.
@@ -146,17 +143,61 @@ impl Layout {
             );
         }
 
-        let c = &self.contact;
-        let mut furthest = c.tip.end().max(c.id.end()).max(c.x.end()).max(c.y.end());
-        if let Some(conf) = c.confidence {
-            furthest = furthest.max(conf.end());
+        if self.report_id == 0
+            || self.total_payload_bytes == 0
+            || self.total_payload_bytes > MAX_REPORT_BYTES
+        {
+            bail!("unsupported report ID or payload size");
         }
-        if furthest > self.contact_stride_bits {
-            bail!(
-                "contact fields run past the stride ({} bits used of {})",
-                furthest,
-                self.contact_stride_bits
-            );
+        if self.contact_slots == 0 || self.contact_slots > 256 || self.fingers_bit_offset < 8 {
+            bail!("invalid contact count or contact offset");
+        }
+        let c = &self.contact;
+        for (field, max_size) in [(c.tip, 1), (c.id, 8), (c.x, 32), (c.y, 32)]
+            .into_iter()
+            .chain(c.confidence.map(|field| (field, 1)))
+        {
+            if field.size == 0
+                || field.size > max_size
+                || field
+                    .offset
+                    .checked_add(field.size)
+                    .is_none_or(|end| end > self.contact_stride_bits)
+            {
+                bail!("invalid contact field width or field outside stride");
+            }
+        }
+        let contact_end = self
+            .contact_slots
+            .checked_mul(self.contact_stride_bits)
+            .and_then(|size| self.fingers_bit_offset.checked_add(size));
+        if contact_end.is_none_or(|end| end > self.total_payload_bytes * 8) {
+            bail!("contacts run past the report payload");
+        }
+        for (offset, width) in [
+            (self.scan_time_offset, 2),
+            (self.contact_count_offset, 1),
+            (self.button_offset, 1),
+        ] {
+            if offset == 0
+                || offset
+                    .checked_add(width)
+                    .is_none_or(|end| end > self.total_payload_bytes)
+            {
+                bail!("trailing field outside report payload");
+            }
+        }
+        if self.button_bit >= 8 {
+            bail!("button bit outside its byte");
+        }
+        if self.logical_x_max <= 0
+            || self.logical_y_max <= 0
+            || !self.physical_x_max_mm.is_finite()
+            || self.physical_x_max_mm <= 0.0
+            || !self.physical_y_max_mm.is_finite()
+            || self.physical_y_max_mm <= 0.0
+        {
+            bail!("invalid coordinate geometry");
         }
         Ok(())
     }
@@ -204,8 +245,8 @@ struct Walker<'a> {
     touch_report_id: Option<u8>,
     finger_blocks: Vec<FingerBlock>,
     current_finger_block: Option<FingerBlockBuilder>,
-    scan_time: Option<FieldRef>,
-    contact_count: Option<FieldRef>,
+    scan_time: HashMap<u8, FieldRef>,
+    contact_count: HashMap<u8, FieldRef>,
     /// Button 0x01 fields keyed by the report id they belong to. PTP
     /// descriptors commonly include a sibling Mouse TLC (e.g. Microsoft's
     /// reference, RMK's firmware) which also declares Button 0x01 in its
@@ -231,6 +272,7 @@ struct Walker<'a> {
 
 #[derive(Debug)]
 struct FingerBlockBuilder {
+    report_id: u8,
     start_bit: usize,
     confidence: Option<BitField>,
     tip: Option<BitField>,
@@ -241,6 +283,7 @@ struct FingerBlockBuilder {
 
 #[derive(Debug)]
 struct FingerBlock {
+    report_id: u8,
     start_bit: usize,
     end_bit: usize,
     fields: ContactFields,
@@ -248,6 +291,7 @@ struct FingerBlock {
 
 #[derive(Debug, Clone, Copy)]
 struct FieldRef {
+    bit_size: usize,
     bit_offset: usize,
 }
 
@@ -280,8 +324,8 @@ impl<'a> Walker<'a> {
             touch_report_id: None,
             finger_blocks: Vec::new(),
             current_finger_block: None,
-            scan_time: None,
-            contact_count: None,
+            scan_time: HashMap::new(),
+            contact_count: HashMap::new(),
             buttons: HashMap::new(),
             logical_x_max: None,
             logical_y_max: None,
@@ -306,6 +350,9 @@ impl<'a> Walker<'a> {
                     bail!("truncated long item");
                 }
                 let dsize = self.data[self.pos] as usize;
+                if dsize > self.data.len() - self.pos - 2 {
+                    bail!("long item data exceeds descriptor");
+                }
                 self.pos += 2 + dsize;
                 continue;
             }
@@ -330,7 +377,7 @@ impl<'a> Walker<'a> {
 
             match kind {
                 0 => self.handle_main(tag, udata)?,
-                1 => self.handle_global(tag, udata, sdata),
+                1 => self.handle_global(tag, udata, sdata)?,
                 2 => self.handle_local(tag, udata),
                 _ => {}
             }
@@ -380,10 +427,22 @@ impl<'a> Walker<'a> {
     }
 
     fn handle_main(&mut self, tag: u8, udata: u32) -> Result<()> {
+        if matches!(tag, 0b1000 | 0b1001 | 0b1011) {
+            let bits = self
+                .report_size
+                .checked_mul(self.report_count)
+                .ok_or_else(|| anyhow!("report size/count overflow"))?;
+            if bits as usize > MAX_REPORT_BITS
+                || self.report_count as usize > MAX_REPORT_BITS
+                || (self.report_count != 0 && self.report_size == 0)
+            {
+                bail!("implausible report size/count");
+            }
+        }
         match tag {
-            0b1000 => self.handle_input(udata),
+            0b1000 => self.handle_input(udata)?,
             0b1011 => self.handle_feature(),
-            0b1010 => self.open_collection(udata),
+            0b1010 => self.open_collection(udata)?,
             0b1100 => self.close_collection(),
             _ => {}
         }
@@ -395,13 +454,13 @@ impl<'a> Walker<'a> {
         Ok(())
     }
 
-    fn open_collection(&mut self, udata: u32) {
+    fn open_collection(&mut self, udata: u32) -> Result<()> {
         let kind = (udata & 0xFF) as u8;
         let primary_usage = self
             .usages
             .first()
             .copied()
-            .unwrap_or(((self.usage_page as u32) << 16) | 0);
+            .unwrap_or((self.usage_page as u32) << 16);
 
         self.collections.push(Collection {
             kind,
@@ -409,8 +468,12 @@ impl<'a> Walker<'a> {
         });
 
         if kind == 0x02 && primary_usage == FINGER_USAGE {
+            if self.current_finger_block.is_some() {
+                bail!("nested finger collections");
+            }
             let cursor = *self.bit_cursor.entry(self.report_id).or_insert(8);
             self.current_finger_block = Some(FingerBlockBuilder {
+                report_id: self.report_id,
                 start_bit: cursor,
                 confidence: None,
                 tip: None,
@@ -419,6 +482,7 @@ impl<'a> Walker<'a> {
                 y: None,
             });
         }
+        Ok(())
     }
 
     fn close_collection(&mut self) {
@@ -436,6 +500,7 @@ impl<'a> Walker<'a> {
             (builder.tip, builder.id, builder.x, builder.y)
         {
             self.finger_blocks.push(FingerBlock {
+                report_id: builder.report_id,
                 start_bit: builder.start_bit,
                 end_bit,
                 fields: ContactFields {
@@ -450,7 +515,7 @@ impl<'a> Walker<'a> {
         }
     }
 
-    fn handle_input(&mut self, flags: u32) {
+    fn handle_input(&mut self, flags: u32) -> Result<()> {
         let constant = (flags & 0x01) != 0;
         let bit_size = self.report_size;
         let count = self.report_count;
@@ -462,10 +527,13 @@ impl<'a> Walker<'a> {
             .entry(self.report_id)
             .or_insert(cursor_initial);
         let start_bit = *cursor;
-        *cursor += total_bits;
+        *cursor = cursor
+            .checked_add(total_bits)
+            .filter(|end| *end <= MAX_REPORT_BITS)
+            .ok_or_else(|| anyhow!("input report exceeds size limit"))?;
 
         if constant {
-            return;
+            return Ok(());
         }
 
         let usages = self.expanded_usages(count as usize);
@@ -474,6 +542,7 @@ impl<'a> Walker<'a> {
             let usage = (usage32 & 0xFFFF) as u16;
             let field_bit_offset = start_bit + (i * bit_size as usize);
             let field = FieldRef {
+                bit_size: bit_size as usize,
                 bit_offset: field_bit_offset,
             };
 
@@ -529,10 +598,10 @@ impl<'a> Walker<'a> {
                     }
                 }
                 (PAGE_DIGITIZER, USAGE_DIG_SCAN_TIME) => {
-                    self.scan_time.get_or_insert(field);
+                    self.scan_time.entry(self.report_id).or_insert(field);
                 }
                 (PAGE_DIGITIZER, USAGE_DIG_CONTACT_COUNT) => {
-                    self.contact_count.get_or_insert(field);
+                    self.contact_count.entry(self.report_id).or_insert(field);
                 }
                 (PAGE_BUTTON, 0x01) => {
                     // Record the field per-report-id; the touch report's
@@ -544,9 +613,10 @@ impl<'a> Walker<'a> {
                 _ => {}
             }
         }
+        Ok(())
     }
 
-    fn handle_global(&mut self, tag: u8, udata: u32, sdata: i32) {
+    fn handle_global(&mut self, tag: u8, udata: u32, sdata: i32) -> Result<()> {
         match tag {
             0 => self.usage_page = udata as u16,
             1 => self.logical_min = sdata,
@@ -563,7 +633,17 @@ impl<'a> Walker<'a> {
             6 => self.unit = udata,
             7 => self.report_size = udata,
             8 => {
-                let id = udata as u8;
+                let id = u8::try_from(udata).map_err(|_| anyhow!("report ID exceeds one byte"))?;
+                if id == 0 {
+                    bail!("report ID zero is reserved");
+                }
+                if self
+                    .current_finger_block
+                    .as_ref()
+                    .is_some_and(|b| b.report_id != id)
+                {
+                    bail!("report ID changed within a finger collection");
+                }
                 self.report_id = id;
                 let initial = if id != 0 { 8 } else { 0 };
                 self.bit_cursor.entry(id).or_insert(initial);
@@ -571,6 +651,7 @@ impl<'a> Walker<'a> {
             9 => self.report_count = udata,
             _ => {}
         }
+        Ok(())
     }
 
     fn handle_local(&mut self, tag: u8, udata: u32) {
@@ -590,6 +671,9 @@ impl<'a> Walker<'a> {
     }
 
     fn expanded_usages(&self, count: usize) -> Vec<u32> {
+        if count == 0 {
+            return Vec::new();
+        }
         if !self.usages.is_empty() {
             let mut out = self.usages.clone();
             if out.len() < count {
@@ -603,7 +687,7 @@ impl<'a> Walker<'a> {
         }
         if let (Some(lo), Some(hi)) = (self.usage_min, self.usage_max) {
             let mut out = Vec::with_capacity(count);
-            for u in lo..=hi {
+            for u in (lo..=hi).take(count) {
                 out.push(((self.usage_page as u32) << 16) | u);
                 if out.len() == count {
                     break;
@@ -626,7 +710,22 @@ impl<'a> Walker<'a> {
             .finger_blocks
             .first()
             .ok_or_else(|| anyhow!("finger collection lacked tip/id/X/Y"))?;
-        let contact_stride_bits = first.end_bit - first.start_bit;
+        let contact_stride_bits = first
+            .end_bit
+            .checked_sub(first.start_bit)
+            .ok_or_else(|| anyhow!("finger ends before it starts"))?;
+        for (i, block) in self.finger_blocks.iter().enumerate() {
+            let expected_start = i
+                .checked_mul(contact_stride_bits)
+                .and_then(|offset| first.start_bit.checked_add(offset));
+            if block.report_id != report_id
+                || block.fields != first.fields
+                || Some(block.start_bit) != expected_start
+                || block.end_bit.checked_sub(block.start_bit) != Some(contact_stride_bits)
+            {
+                bail!("inconsistent contact layouts or report IDs");
+            }
+        }
         let bytes_per_contact = contact_stride_bits / 8;
         let fingers_offset = first.start_bit / 8;
         let fingers_bit_offset = first.start_bit;
@@ -634,13 +733,24 @@ impl<'a> Walker<'a> {
 
         let scan_time = self
             .scan_time
+            .get(&report_id)
             .ok_or_else(|| anyhow!("descriptor missing Scan Time field"))?;
         let contact_count = self
             .contact_count
+            .get(&report_id)
             .ok_or_else(|| anyhow!("descriptor missing Contact Count field"))?;
         let button = self.buttons.get(&report_id).copied().ok_or_else(|| {
             anyhow!("descriptor missing Button 1 field in touch report {report_id:#04x}")
         })?;
+
+        if scan_time.bit_size != 16
+            || scan_time.bit_offset % 8 != 0
+            || contact_count.bit_size != 8
+            || contact_count.bit_offset % 8 != 0
+            || button.bit_size != 1
+        {
+            bail!("unsupported scan time, contact count or button packing");
+        }
 
         let total_bits = self.bit_cursor.get(&report_id).copied().unwrap_or(0);
 
@@ -732,6 +842,102 @@ fn read_sint(bytes: &[u8]) -> i32 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn trailing_fields_belong_to_the_touch_report_in_composite_descriptors() {
+        // Sibling report puts Scan Time and Contact Count well beyond the
+        // end of the touch report. Neither order may contaminate its layout.
+        let sibling = from_hex("050d0905a10185027508954081037510950109568102750809548102c0");
+        let touch = wpt_descriptor_5_contacts();
+        for sibling_first in [false, true] {
+            let desc = if sibling_first {
+                [sibling.clone(), touch.clone()].concat()
+            } else {
+                [touch.clone(), sibling.clone()].concat()
+            };
+            let layout = parse(&desc).expect("valid composite descriptor");
+            assert_eq!(layout.scan_time_offset, 31);
+            assert_eq!(layout.contact_count_offset, 33);
+            let mut report = vec![0; layout.total_payload_bytes];
+            report[0] = layout.report_id;
+            report[31..33].copy_from_slice(&0x1234u16.to_le_bytes());
+            assert_eq!(
+                crate::report::decode(&layout, &report)
+                    .unwrap()
+                    .scan_time_100us,
+                0x1234
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_descriptor_arithmetic_and_field_packing_are_rejected() {
+        // A 32-bit size/count product must not overflow in debug or wrap
+        // in release. Large but non-overflowing reports are bounded too.
+        for bytes in [
+            "77ffffffff95028102",
+            "752097ffffffff8102",
+            "750095018102",
+            "750897000001008102",
+            "fe030001",
+        ] {
+            assert!(parse(&from_hex(bytes)).is_err(), "accepted {bytes}");
+        }
+        let good = wpt_descriptor_5_contacts();
+        for (needle, replacement) in [
+            (&[0x75, 0x10, 0x95, 0x01, 0x09, 0x56][..], 8), // Scan Time needs 16 bits.
+            (&[0x75, 0x08, 0x81, 0x02, 0x05, 0x09][..], 16), // Count needs 8 bits.
+            (&[0x75, 0x01, 0x95, 0x01, 0x81, 0x02][..], 2), // Button needs 1 bit.
+        ] {
+            let mut desc = good.clone();
+            let pos = desc
+                .windows(needle.len())
+                .position(|w| w == needle)
+                .unwrap();
+            desc[pos + 1] = replacement;
+            assert!(parse(&desc).is_err());
+        }
+        // Invalid Report ID values must not truncate or alias another ID.
+        for id in [0u16, 256] {
+            let mut desc = good.clone();
+            desc.splice(6..8, [0x86, id as u8, (id >> 8) as u8]);
+            assert!(parse(&desc).is_err());
+        }
+    }
+
+    #[test]
+    fn truncated_and_mutated_descriptors_never_produce_unsafe_layouts() {
+        // Exercise every truncation and sample byte mutations throughout a
+        // real descriptor. Accepted variants must remain safe to decode at the
+        // exact reported boundary, including maximal contact count.
+        let desc = from_hex(THIRD_PARTY_PTP_DESCRIPTOR);
+        let check = |bytes: &[u8]| {
+            if let Ok(layout) = parse(bytes) {
+                let mut report = vec![0xff; layout.total_payload_bytes];
+                report[0] = layout.report_id;
+                assert!(crate::report::decode(&layout, &report).is_some());
+                assert!(crate::report::decode(&layout, &report[..report.len() - 1]).is_none());
+            }
+        };
+        for end in 0..=desc.len() {
+            check(&desc[..end]);
+        }
+        for pos in 0..desc.len() {
+            for value in [0, 1, 0x7f, 0xff] {
+                let mut mutated = desc.clone();
+                mutated[pos] = value;
+                check(&mutated);
+            }
+        }
+    }
+
+    #[test]
+    fn a_zero_report_count_does_not_expand_a_usage_range() {
+        let mut walker = Walker::new(&[]);
+        walker.usage_min = Some(1);
+        walker.usage_max = Some(8);
+        assert!(walker.expanded_usages(0).is_empty());
+    }
+
     /// Reproduces the descriptor the firmware at commit 7f3ee1c emits
     /// for the PTP digitizer interface (5 contacts, 65×40 mm, logical
     /// 3936×2424).
@@ -767,8 +973,14 @@ mod tests {
                 confidence: Some(BitField { offset: 0, size: 1 }),
                 tip: BitField { offset: 1, size: 1 },
                 id: BitField { offset: 8, size: 8 },
-                x: BitField { offset: 16, size: 16 },
-                y: BitField { offset: 32, size: 16 },
+                x: BitField {
+                    offset: 16,
+                    size: 16,
+                },
+                y: BitField {
+                    offset: 32,
+                    size: 16,
+                },
             },
             scan_time_offset: 31,
             contact_count_offset: 33,
@@ -899,11 +1111,26 @@ mod tests {
 
         // The fields we need are found by usage, wherever they sit; the
         // Width and Height between them are simply skipped.
-        assert_eq!(layout.contact.confidence, Some(BitField { offset: 0, size: 1 }));
+        assert_eq!(
+            layout.contact.confidence,
+            Some(BitField { offset: 0, size: 1 })
+        );
         assert_eq!(layout.contact.tip, BitField { offset: 1, size: 1 });
         assert_eq!(layout.contact.id, BitField { offset: 8, size: 8 });
-        assert_eq!(layout.contact.x, BitField { offset: 16, size: 16 });
-        assert_eq!(layout.contact.y, BitField { offset: 32, size: 16 });
+        assert_eq!(
+            layout.contact.x,
+            BitField {
+                offset: 16,
+                size: 16
+            }
+        );
+        assert_eq!(
+            layout.contact.y,
+            BitField {
+                offset: 32,
+                size: 16
+            }
+        );
     }
 
     #[test]

@@ -36,8 +36,8 @@ pub struct Writer {
 
 impl Writer {
     pub fn create(path: &Path) -> Result<Self> {
-        let file = File::create(path)
-            .with_context(|| format!("create capture {}", path.display()))?;
+        let file =
+            File::create(path).with_context(|| format!("create capture {}", path.display()))?;
         let mut out = BufWriter::new(file);
         writeln!(out, "{HEADER}")?;
         Ok(Self {
@@ -59,12 +59,7 @@ impl Writer {
     }
 
     pub fn frame(&mut self, frame: &Frame, ts: Timestamp) -> Result<()> {
-        write!(
-            self.out,
-            "F {} {}",
-            ts.as_nanos(),
-            u8::from(frame.button)
-        )?;
+        write!(self.out, "F {} {}", ts.as_nanos(), u8::from(frame.button))?;
         for c in &frame.contacts {
             write!(
                 self.out,

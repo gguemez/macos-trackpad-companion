@@ -46,7 +46,10 @@ fn read_flag(domain: &str, key: &str) -> bool {
 
     // Copy semantics: we own the result and must release it.
     let value = unsafe {
-        CFPreferencesCopyAppValue(cf_key.as_concrete_TypeRef(), cf_domain.as_concrete_TypeRef())
+        CFPreferencesCopyAppValue(
+            cf_key.as_concrete_TypeRef(),
+            cf_domain.as_concrete_TypeRef(),
+        )
     };
     if value.is_null() {
         return false;

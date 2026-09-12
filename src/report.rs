@@ -47,6 +47,9 @@ fn read_bits(buf: &[u8], bit_offset: usize, count: usize) -> u32 {
 }
 
 pub fn decode(layout: &Layout, report: &[u8]) -> Option<Frame> {
+    // Layout is public and can be constructed without parse(). Verify
+    // every bound before indexing even for externally supplied layouts.
+    layout.validate().ok()?;
     if report.len() < layout.total_payload_bytes {
         return None;
     }
@@ -109,6 +112,48 @@ mod tests {
     use super::*;
     use crate::descriptor::{BitField, ContactFields};
 
+    #[test]
+    fn exact_report_boundary_decodes_but_one_byte_short_does_not() {
+        let layout = fake_layout();
+        let mut report = vec![0xff; layout.total_payload_bytes];
+        report[0] = layout.report_id;
+        assert_eq!(
+            decode(&layout, &report).unwrap().contacts.len(),
+            layout.contact_slots
+        );
+        for len in 0..report.len() {
+            assert!(decode(&layout, &report[..len]).is_none());
+        }
+    }
+
+    #[test]
+    fn manually_constructed_layouts_cannot_index_outside_the_report() {
+        let good = fake_layout();
+        let mut report = vec![0xff; good.total_payload_bytes];
+        report[0] = good.report_id;
+        let mutations: &[fn(&mut Layout)] = &[
+            |l| l.total_payload_bytes = 0,
+            |l| l.total_payload_bytes = usize::MAX,
+            |l| l.scan_time_offset = l.total_payload_bytes - 1,
+            |l| l.scan_time_offset = usize::MAX,
+            |l| l.contact_count_offset = l.total_payload_bytes,
+            |l| l.button_offset = l.total_payload_bytes,
+            |l| l.button_bit = 8,
+            |l| l.contact_slots = usize::MAX,
+            |l| l.fingers_bit_offset = usize::MAX,
+            |l| l.contact_stride_bits = usize::MAX,
+            |l| l.contact.x.offset = usize::MAX,
+            |l| l.contact.y.size = 33,
+            |l| l.contact.id.size = 9,
+            |l| l.contact.tip.size = 0,
+        ];
+        for mutate in mutations {
+            let mut bad = good.clone();
+            mutate(&mut bad);
+            assert!(decode(&bad, &report).is_none(), "accepted {bad:?}");
+        }
+    }
+
     fn fake_layout() -> Layout {
         Layout {
             report_id: 0x01,
@@ -121,8 +166,14 @@ mod tests {
                 confidence: Some(BitField { offset: 0, size: 1 }),
                 tip: BitField { offset: 1, size: 1 },
                 id: BitField { offset: 8, size: 8 },
-                x: BitField { offset: 16, size: 16 },
-                y: BitField { offset: 32, size: 16 },
+                x: BitField {
+                    offset: 16,
+                    size: 16,
+                },
+                y: BitField {
+                    offset: 32,
+                    size: 16,
+                },
             },
             scan_time_offset: 31,
             contact_count_offset: 33,
@@ -192,8 +243,14 @@ mod tests {
                 confidence: Some(BitField { offset: 0, size: 1 }),
                 tip: BitField { offset: 1, size: 1 },
                 id: BitField { offset: 2, size: 6 },
-                x: BitField { offset: 8, size: 16 },
-                y: BitField { offset: 24, size: 16 },
+                x: BitField {
+                    offset: 8,
+                    size: 16,
+                },
+                y: BitField {
+                    offset: 24,
+                    size: 16,
+                },
             },
             scan_time_offset: 26,
             contact_count_offset: 28,

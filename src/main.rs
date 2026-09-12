@@ -20,24 +20,8 @@
 // them rather than declaring them again. Declaring both compiles
 // every module twice and runs every test twice.
 use macos_trackpad_companion::{
-    app_kit,
-    capture,
-    config,
-    config_watch,
-    gesture,
-    hid,
-    instance_lock,
-    onboarding,
-    output,
-    overlay,
-    pause,
-    permissions,
-    report,
-    scope,
-    settings,
-    status_item,
-    system_prefs,
-    time,
+    app_kit, capture, config, config_watch, gesture, hid, instance_lock, onboarding, output,
+    overlay, pause, permissions, scope, settings, status_item, system_prefs, time,
 };
 
 use anyhow::{Context, Result};
@@ -273,9 +257,12 @@ fn run<O: output::Output + 'static>(
     // debounced — stays the shape of truth.
     let live_cfg = Rc::new(RefCell::new(cfg.clone()));
 
-    let tune_state = Rc::clone(&state);
-    let tune_cfg = Rc::clone(&live_cfg);
+    let tune_state = Rc::downgrade(&state);
+    let tune_cfg = Rc::downgrade(&live_cfg);
     scope::set_live_apply(move |t: scope::Tuning| {
+        let (Some(tune_state), Some(tune_cfg)) = (tune_state.upgrade(), tune_cfg.upgrade()) else {
+            return;
+        };
         let mut cfg = tune_cfg.borrow_mut();
         cfg.cursor.sensitivity = t.cursor_sensitivity;
         cfg.cursor.accel_exponent = t.cursor_accel_exponent;
@@ -306,18 +293,12 @@ fn run<O: output::Output + 'static>(
             .apply_config(cursor_accel(new_cfg), output_config(new_cfg));
     });
 
-    // Pausing feeds one empty frame so anything in flight ends cleanly,
-    // rather than leaving the engine mid-gesture.
-    let settle_state = Rc::clone(&state);
+    // These UI hooks must not keep the engine alive after run returns.
+    let settle_state = Rc::downgrade(&state);
     pause::set_settle_hook(move || {
-        settle_state.borrow_mut().on_frame_at(
-            report::Frame {
-                contacts: Vec::new(),
-                scan_time_100us: 0,
-                button: false,
-            },
-            time::Timestamp::now(),
-        );
+        if let Some(state) = settle_state.upgrade() {
+            state.borrow_mut().cancel_at(time::Timestamp::now());
+        }
     });
 
     let mut recorder = match record {
@@ -331,38 +312,46 @@ fn run<O: output::Output + 'static>(
 
     let frame_state = Rc::clone(&state);
     let mut known_geometry: Option<(f64, f64)> = None;
-    manager.run(move |frame, ts| {
-        if pause::is_paused() {
-            return;
-        }
+    let disconnect_state = Rc::clone(&state);
+    manager.run_with_disconnect(
+        move |frame, ts| {
+            if pause::is_paused() {
+                return;
+            }
 
-        if let Some(w) = recorder.as_mut() {
-            if !recorded_device {
-                recorded_device = true;
-                let summary = hid::device_summary().unwrap_or_else(|| "unknown".into());
-                if let Err(e) = w.device(&summary, hid::device_geometry()) {
-                    log::error!("capture header failed: {e:#}");
+            if let Some(w) = recorder.as_mut() {
+                if !recorded_device {
+                    recorded_device = true;
+                    let summary = hid::device_summary().unwrap_or_else(|| "unknown".into());
+                    if let Err(e) = w.device(&summary, hid::device_geometry()) {
+                        log::error!("capture header failed: {e:#}");
+                    }
+                }
+                if let Err(e) = w.frame(&frame, ts) {
+                    log::error!("capture write failed: {e:#}");
                 }
             }
-            if let Err(e) = w.frame(&frame, ts) {
-                log::error!("capture write failed: {e:#}");
+            // Cheap per-frame check rather than a callback from the HID
+            // layer: it keeps the gesture engine free of any dependency on
+            // how devices are discovered.
+            let geometry = hid::device_geometry();
+            if geometry != known_geometry {
+                known_geometry = geometry;
+                frame_state
+                    .borrow_mut()
+                    .set_pad_geometry(geometry.map(|(w, h)| gesture::PadGeometry {
+                        width_mm: w,
+                        height_mm: h,
+                    }));
             }
-        }
-        // Cheap per-frame check rather than a callback from the HID
-        // layer: it keeps the gesture engine free of any dependency on
-        // how devices are discovered.
-        let geometry = hid::device_geometry();
-        if geometry != known_geometry {
-            known_geometry = geometry;
-            frame_state
+            frame_state.borrow_mut().on_frame_at(frame, ts)
+        },
+        move || {
+            disconnect_state
                 .borrow_mut()
-                .set_pad_geometry(geometry.map(|(w, h)| gesture::PadGeometry {
-                    width_mm: w,
-                    height_mm: h,
-                }));
-        }
-        frame_state.borrow_mut().on_frame_at(frame, ts)
-    })
+                .cancel_at(time::Timestamp::now());
+        },
+    )
 }
 
 /// Flatten the TOML config into the emitter's runtime settings. Called

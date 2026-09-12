@@ -37,14 +37,16 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{AnyThread, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSAutoresizingMaskOptions, NSBackingStoreType, NSBezierPath, NSButton, NSColor, NSEvent, NSFont,
-    NSFontAttributeName, NSForegroundColorAttributeName, NSSlider, NSStringDrawing, NSTextAlignment,
-    NSTextField, NSView, NSWindow, NSWindowStyleMask,
+    NSAutoresizingMaskOptions, NSBackingStoreType, NSBezierPath, NSButton, NSColor, NSEvent,
+    NSFont, NSFontAttributeName, NSForegroundColorAttributeName, NSSlider, NSStringDrawing,
+    NSTextAlignment, NSTextField, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{NSDictionary, NSPoint, NSRect, NSSize, NSString};
 
 use crate::app_kit;
-use crate::gesture::{ContactTrack, GestureKind, MultiMetrics, Observer, Snapshot, TwoFingerMetrics};
+use crate::gesture::{
+    ContactTrack, GestureKind, MultiMetrics, Observer, Snapshot, TwoFingerMetrics,
+};
 use crate::output::SwipeAxis;
 
 /// Width of the drawn canvas. The window is this plus the tuning
@@ -213,8 +215,9 @@ pub trait Transport {
     fn toggle_play(&self);
     /// Move `delta` frames, clamped to the stream.
     fn step(&self, delta: i64);
+    /// Seek to a count of processed frames, from 0 through the total.
     fn seek(&self, frame: usize);
-    /// `(current frame, total frames, playing)`.
+    /// `(processed frames, total frames, playing)`; the total is reachable.
     fn position(&self) -> (usize, usize, bool);
 }
 
@@ -570,17 +573,35 @@ impl TuneUi {
 
     fn relabel(&self, t: Tuning) {
         self.sensitivity_value
-            .setStringValue(&NSString::from_str(&format!("{:.1} px/mm", t.cursor_sensitivity)));
+            .setStringValue(&NSString::from_str(&format!(
+                "{:.1} px/mm",
+                t.cursor_sensitivity
+            )));
         self.exponent_value
-            .setStringValue(&NSString::from_str(&format!("{:.2}", t.cursor_accel_exponent)));
+            .setStringValue(&NSString::from_str(&format!(
+                "{:.2}",
+                t.cursor_accel_exponent
+            )));
         self.accel_ref_value
-            .setStringValue(&NSString::from_str(&format!("{:.0} mm/s", t.cursor_accel_ref)));
+            .setStringValue(&NSString::from_str(&format!(
+                "{:.0} mm/s",
+                t.cursor_accel_ref
+            )));
         self.scroll_value
-            .setStringValue(&NSString::from_str(&format!("{:.1} px/mm", t.scroll_sensitivity)));
+            .setStringValue(&NSString::from_str(&format!(
+                "{:.1} px/mm",
+                t.scroll_sensitivity
+            )));
         self.scroll_exponent_value
-            .setStringValue(&NSString::from_str(&format!("{:.2}", t.scroll_accel_exponent)));
+            .setStringValue(&NSString::from_str(&format!(
+                "{:.2}",
+                t.scroll_accel_exponent
+            )));
         self.scroll_accel_ref_value
-            .setStringValue(&NSString::from_str(&format!("{:.0} mm/s", t.scroll_accel_ref)));
+            .setStringValue(&NSString::from_str(&format!(
+                "{:.0} mm/s",
+                t.scroll_accel_ref
+            )));
     }
 }
 
@@ -657,7 +678,8 @@ impl Window {
         let view: Retained<ScopeView> =
             unsafe { msg_send![mtm.alloc::<ScopeView>(), initWithFrame: view_frame] };
         view.setAutoresizingMask(
-            NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
+            NSAutoresizingMaskOptions::ViewWidthSizable
+                | NSAutoresizingMaskOptions::ViewHeightSizable,
         );
         content.addSubview(&view);
 
@@ -768,24 +790,17 @@ impl Window {
         title.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
         content.addSubview(&title);
         y -= 34.0;
-        let note = label(
-            mtm,
-            "Applies when you let go.",
-            x,
-            y,
-            w,
-            32.0,
-        );
+        let note = label(mtm, "Applies when you let go.", x, y, w, 32.0);
         note.setFont(Some(&NSFont::systemFontOfSize(10.0)));
         content.addSubview(&note);
         y -= 26.0;
 
         let row = |mtm: MainThreadMarker,
-                       name: &str,
-                       min: f64,
-                       max: f64,
-                       action: objc2::runtime::Sel,
-                       y: &mut f64|
+                   name: &str,
+                   min: f64,
+                   max: f64,
+                   action: objc2::runtime::Sel,
+                   y: &mut f64|
          -> (Retained<NSSlider>, Retained<NSTextField>) {
             *y -= 20.0;
             let l = label(mtm, name, x, *y, w - 88.0, 16.0);
@@ -1098,7 +1113,8 @@ impl Window {
         };
         ui.play
             .setTitle(&NSString::from_str(if playing { "Pause" } else { "Play" }));
-        ui.slider.setMaxValue((total.saturating_sub(1)) as f64);
+        // Position counts processed frames: 0 is before the first, total is after the last.
+        ui.slider.setMaxValue(total as f64);
         ui.slider.setDoubleValue(frame as f64);
         ui.label
             .setStringValue(&NSString::from_str(&format!("{frame} / {total}")));
@@ -1222,10 +1238,9 @@ fn bad() -> Retained<NSColor> {
 
 fn attrs(font: &NSFont, color: &NSColor) -> Retained<NSDictionary<NSString, AnyObject>> {
     NSDictionary::from_slices(
-        &[
-            unsafe { NSFontAttributeName },
-            unsafe { NSForegroundColorAttributeName },
-        ],
+        &[unsafe { NSFontAttributeName }, unsafe {
+            NSForegroundColorAttributeName
+        }],
         &[font as &AnyObject, color as &AnyObject],
     )
 }
@@ -1429,10 +1444,10 @@ fn draw_pad(area: NSRect, snap: &Snapshot, state: &ScopeState, mono: &NSFont) {
 
     // Centroid travel, which is what the swipe axis locks on.
     if let Some(m) = snap.multi {
-        let cx: f64 = snap.contacts.iter().map(|c| c.x_mm).sum::<f64>()
-            / snap.contacts.len().max(1) as f64;
-        let cy: f64 = snap.contacts.iter().map(|c| c.y_mm).sum::<f64>()
-            / snap.contacts.len().max(1) as f64;
+        let cx: f64 =
+            snap.contacts.iter().map(|c| c.x_mm).sum::<f64>() / snap.contacts.len().max(1) as f64;
+        let cy: f64 =
+            snap.contacts.iter().map(|c| c.y_mm).sum::<f64>() / snap.contacts.len().max(1) as f64;
         let from = at(cx - m.travel_mm.0, cy - m.travel_mm.1);
         let to = at(cx, cy);
         line(from, to, &warn(), 2.0);
@@ -1480,13 +1495,7 @@ fn draw_pad(area: NSRect, snap: &Snapshot, state: &ScopeState, mono: &NSFont) {
 
 /// The decision: what the engine thinks is happening, and the numbers
 /// it thinks it from.
-fn draw_panel(
-    area: NSRect,
-    snap: &Snapshot,
-    state: &ScopeState,
-    mono: &NSFont,
-    mono_big: &NSFont,
-) {
+fn draw_panel(area: NSRect, snap: &Snapshot, state: &ScopeState, mono: &NSFont, mono_big: &NSFont) {
     let mut y = area.origin.y;
     let x = area.origin.x;
 
@@ -1652,7 +1661,11 @@ fn draw_two_finger(area: NSRect, top: f64, m: &TwoFingerMetrics, mono: &NSFont) 
             );
         }
         if gated > 0.0 {
-            let color = if gated >= 1.0 { good() } else { rgb(0.36, 0.58, 0.92) };
+            let color = if gated >= 1.0 {
+                good()
+            } else {
+                rgb(0.36, 0.58, 0.92)
+            };
             fill(
                 NSRect::new(
                     NSPoint::new(bar_x, y + 4.0),
@@ -1674,7 +1687,11 @@ fn draw_two_finger(area: NSRect, top: f64, m: &TwoFingerMetrics, mono: &NSFont) 
         let value = format!("{raw:.2}");
         let w = text(&value, bar_x + bar_w + 10.0, y + 3.0, mono, &ink());
         if !tag.is_empty() {
-            let color = if tag.starts_with(" disq") { bad() } else { warn() };
+            let color = if tag.starts_with(" disq") {
+                bad()
+            } else {
+                warn()
+            };
             text(tag.trim(), bar_x + bar_w + 14.0 + w, y + 3.0, mono, &color);
         }
         y += 22.0;
@@ -1802,7 +1819,13 @@ fn draw_two_finger(area: NSRect, top: f64, m: &TwoFingerMetrics, mono: &NSFont) 
         ) + 16.0;
     }
     if m.lock_deferred {
-        text("lock deferred a frame for a lagging finger", cx, y, mono, &warn());
+        text(
+            "lock deferred a frame for a lagging finger",
+            cx,
+            y,
+            mono,
+            &warn(),
+        );
     }
     y + 18.0
 }
@@ -1817,13 +1840,7 @@ fn draw_multi(area: NSRect, top: f64, m: &MultiMetrics, mono: &NSFont) -> f64 {
         None => "not locked",
     };
     let mut cx = x;
-    cx += text(
-        &format!("{} fingers", m.fingers),
-        cx,
-        y,
-        mono,
-        &ink(),
-    ) + 16.0;
+    cx += text(&format!("{} fingers", m.fingers), cx, y, mono, &ink()) + 16.0;
     let axis_color = if m.axis.is_some() { ink() } else { warn() };
     cx += text(&format!("axis {axis}"), cx, y, mono, &axis_color) + 16.0;
     text(
@@ -1906,11 +1923,7 @@ fn draw_lock(area: NSRect, top: f64, lock: &LockRecord, past: bool, mono: &NSFon
         NSPoint::new(area.origin.x, top),
         NSSize::new(area.size.width, 44.0),
     );
-    let (wash, edge) = if past {
-        (0.02, 0.07)
-    } else {
-        (0.05, 0.12)
-    };
+    let (wash, edge) = if past { (0.02, 0.07) } else { (0.05, 0.12) };
     fill(box_rect, &rgba(1.0, 1.0, 1.0, wash));
     stroke(box_rect, &rgba(1.0, 1.0, 1.0, edge), 1.0);
 
@@ -2093,10 +2106,16 @@ mod tests {
     #[test]
     fn a_lock_is_latched_with_the_scores_of_the_frame_it_fired() {
         let mut st = ScopeState::default();
-        st.ingest(&snap(GestureKind::TwoFingerUnclassified, &[(0, 10.0, 10.0), (1, 30.0, 10.0)]));
+        st.ingest(&snap(
+            GestureKind::TwoFingerUnclassified,
+            &[(0, 10.0, 10.0), (1, 30.0, 10.0)],
+        ));
         assert!(st.lock.is_none(), "nothing has locked yet");
 
-        let mut locking = snap(GestureKind::TwoFingerPinchAndRotate, &[(0, 8.0, 10.0), (1, 32.0, 10.0)]);
+        let mut locking = snap(
+            GestureKind::TwoFingerPinchAndRotate,
+            &[(0, 8.0, 10.0), (1, 32.0, 10.0)],
+        );
         locking.two_finger = Some(metrics());
         st.ingest(&locking);
 
@@ -2107,7 +2126,10 @@ mod tests {
 
         // Scores keep climbing after the lock; the banner must keep
         // showing what actually crossed, not the latest reading.
-        let mut later = snap(GestureKind::TwoFingerPinchAndRotate, &[(0, 2.0, 10.0), (1, 38.0, 10.0)]);
+        let mut later = snap(
+            GestureKind::TwoFingerPinchAndRotate,
+            &[(0, 2.0, 10.0), (1, 38.0, 10.0)],
+        );
         let mut grown = metrics();
         grown.pinch_raw = 40.0;
         later.two_finger = Some(grown);
@@ -2123,7 +2145,10 @@ mod tests {
         // different transition than a fresh one.
         let mut st = ScopeState::default();
         st.ingest(&snap(GestureKind::OneFinger, &[(0, 10.0, 10.0)]));
-        let mut rejoined = snap(GestureKind::TwoFingerPan, &[(0, 10.0, 12.0), (1, 30.0, 12.0)]);
+        let mut rejoined = snap(
+            GestureKind::TwoFingerPan,
+            &[(0, 10.0, 12.0), (1, 30.0, 12.0)],
+        );
         rejoined.two_finger = Some(metrics());
         st.ingest(&rejoined);
 
@@ -2134,7 +2159,10 @@ mod tests {
     #[test]
     fn a_new_gesture_clears_the_previous_lock() {
         let mut st = ScopeState::default();
-        let mut locking = snap(GestureKind::TwoFingerPan, &[(0, 10.0, 10.0), (1, 30.0, 10.0)]);
+        let mut locking = snap(
+            GestureKind::TwoFingerPan,
+            &[(0, 10.0, 10.0), (1, 30.0, 10.0)],
+        );
         locking.two_finger = Some(metrics());
         st.ingest(&locking);
         assert!(st.lock.is_some());

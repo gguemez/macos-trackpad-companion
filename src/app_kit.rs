@@ -31,11 +31,7 @@ unsafe extern "C" {
     /// a dispatch crate for one symbol.
     static _dispatch_main_q: c_void;
 
-    fn dispatch_async_f(
-        queue: *mut c_void,
-        context: *mut c_void,
-        work: extern "C" fn(*mut c_void),
-    );
+    fn dispatch_async_f(queue: *mut c_void, context: *mut c_void, work: extern "C" fn(*mut c_void));
 }
 
 /// `finishLaunching` posts `NSApplicationDidFinishLaunching`; calling it

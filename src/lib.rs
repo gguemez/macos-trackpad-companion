@@ -21,6 +21,7 @@ pub mod overlay;
 pub mod pause;
 pub mod permissions;
 pub mod report;
+mod run_loop_timer;
 pub mod scan_clock;
 pub mod scope;
 pub mod settings;

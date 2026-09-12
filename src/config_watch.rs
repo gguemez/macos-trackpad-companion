@@ -15,17 +15,16 @@
 //! working.
 
 use std::cell::RefCell;
-use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use core_foundation::date::CFAbsoluteTimeGetCurrent;
-use core_foundation::runloop::{
-    CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext, kCFRunLoopCommonModes,
-};
-use core_foundation_sys::runloop::CFRunLoopTimerRef;
-
 use crate::config::Config;
+use crate::run_loop_timer::Timer;
+
+/// Owns the polling timer and callback. Dropping this stops watching.
+pub struct Watch {
+    _timer: Timer,
+}
 
 thread_local! {
     /// Where logs are going, if anywhere. Recorded so the menu can
@@ -63,80 +62,87 @@ struct Watcher {
 ///
 /// `on_change` runs on the main thread, in the same run loop as the HID
 /// callbacks, so it can mutate engine state directly.
-pub fn start<F>(path: PathBuf, initial: &Config, on_change: F) -> CFRunLoopTimer
+pub fn start<F>(path: PathBuf, initial: &Config, on_change: F) -> Watch
 where
     F: FnMut(&Config) + 'static,
 {
-    let watcher = Box::new(Watcher {
+    let mut watcher = Watcher {
         last_mtime: mtime(&path),
         path,
         initial_device: (initial.device.vid, initial.device.pid),
         initial_log: (initial.log.level.clone(), initial.log.file.clone()),
         on_change: Box::new(on_change),
-    });
-    // Leaked deliberately: the callback dereferences this for as long
-    // as the timer can fire, which is the life of the process.
-    let raw = Box::into_raw(watcher);
-
-    let mut context = CFRunLoopTimerContext {
-        version: 0,
-        info: raw as *mut c_void,
-        retain: None,
-        release: None,
-        copyDescription: None,
     };
-    let fire_at = unsafe { CFAbsoluteTimeGetCurrent() } + POLL_SECS;
-    let timer = CFRunLoopTimer::new(fire_at, POLL_SECS, 0, 0, on_tick, &mut context);
-    CFRunLoop::get_current().add_timer(&timer, unsafe { kCFRunLoopCommonModes });
-
+    let timer = Timer::new(POLL_SECS, POLL_SECS, move || watcher.tick());
     log::debug!("watching config for changes every {POLL_SECS}s");
-    timer
+    Watch { _timer: timer }
 }
 
 fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
 
-extern "C" fn on_tick(_timer: CFRunLoopTimerRef, info: *mut c_void) {
-    let watcher = unsafe { &mut *(info as *mut Watcher) };
-
-    let current = mtime(&watcher.path);
-    if current == watcher.last_mtime {
-        return;
-    }
-    // Record the new mtime even when the parse fails, so a file that
-    // stays broken is reported once rather than every second.
-    watcher.last_mtime = current;
-
-    if current.is_none() {
-        log::warn!(
-            "config {} disappeared; keeping current settings",
-            watcher.path.display()
-        );
-        return;
-    }
-
-    match crate::config::load(Some(&watcher.path)) {
-        Ok((cfg, _)) => {
-            if (cfg.device.vid, cfg.device.pid) != watcher.initial_device {
-                log::warn!(
-                    "[device] changed in config but is only read at startup — \
-                     restart for it to take effect"
-                );
-            }
-            if (cfg.log.level.clone(), cfg.log.file.clone()) != watcher.initial_log {
-                log::warn!(
-                    "[log] changed in config but is only read at startup — \
-                     restart for it to take effect"
-                );
-            }
-            log::info!("config reloaded from {}", watcher.path.display());
-            (watcher.on_change)(&cfg);
+impl Watcher {
+    fn tick(&mut self) {
+        let watcher = self;
+        let current = mtime(&watcher.path);
+        if current == watcher.last_mtime {
+            return;
         }
-        Err(e) => {
+        // Record the new mtime even when the parse fails, so a file that
+        // stays broken is reported once rather than every second.
+        watcher.last_mtime = current;
+
+        if current.is_none() {
             log::warn!(
-                "config reload failed, keeping previous settings: {e:#}"
+                "config {} disappeared; keeping current settings",
+                watcher.path.display()
             );
+            return;
         }
+
+        match crate::config::load(Some(&watcher.path)) {
+            Ok((cfg, _)) => {
+                if (cfg.device.vid, cfg.device.pid) != watcher.initial_device {
+                    log::warn!(
+                        "[device] changed in config but is only read at startup — \
+                     restart for it to take effect"
+                    );
+                }
+                if (cfg.log.level.clone(), cfg.log.file.clone()) != watcher.initial_log {
+                    log::warn!(
+                        "[log] changed in config but is only read at startup — \
+                     restart for it to take effect"
+                    );
+                }
+                log::info!("config reloaded from {}", watcher.path.display());
+                (watcher.on_change)(&cfg);
+            }
+            Err(e) => {
+                log::warn!("config reload failed, keeping previous settings: {e:#}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::rc::Rc;
+
+    #[test]
+    fn dropping_watch_releases_the_engine_callback() {
+        let owner = Rc::new(());
+        let weak = Rc::downgrade(&owner);
+        let watch = start(
+            PathBuf::from("/nonexistent/tpc-review-config"),
+            &Config::default(),
+            move |_| {
+                let _keep_alive = &owner;
+            },
+        );
+        assert!(weak.upgrade().is_some());
+        drop(watch);
+        assert!(weak.upgrade().is_none());
     }
 }

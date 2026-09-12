@@ -63,9 +63,9 @@ impl ConfigFile {
     fn table_mut(&mut self, path: &[&str]) -> Result<&mut Table> {
         let mut item: &mut Item = self.doc.as_item_mut();
         for (i, segment) in path.iter().enumerate() {
-            let table = item.as_table_mut().with_context(|| {
-                format!("config path {:?} is not a table", &path[..i])
-            })?;
+            let table = item
+                .as_table_mut()
+                .with_context(|| format!("config path {:?} is not a table", &path[..i]))?;
             if !table.contains_key(segment) {
                 let mut fresh = Table::new();
                 fresh.set_implicit(i + 1 < path.len());
@@ -132,9 +132,8 @@ mod tests {
 
     #[test]
     fn adding_a_key_leaves_other_tables_untouched() {
-        let mut f = from_text(
-            "[cursor]\nsensitivity = 25.0\n\n# scrolling\n[scroll]\nnatural = true\n",
-        );
+        let mut f =
+            from_text("[cursor]\nsensitivity = 25.0\n\n# scrolling\n[scroll]\nnatural = true\n");
         f.set_bool(&["scroll"], "natural", false).unwrap();
         f.set_f64(&["scroll"], "sensitivity", 33.0).unwrap();
         let out = f.to_text();
@@ -156,7 +155,10 @@ mod tests {
         assert!(out.contains("backend = \"off\""));
         // The implicit parents must not appear as empty headers.
         assert!(!out.contains("[gestures]\n"), "no empty [gestures]:\n{out}");
-        assert!(!out.contains("[gestures.swipe]\n"), "no empty parent:\n{out}");
+        assert!(
+            !out.contains("[gestures.swipe]\n"),
+            "no empty parent:\n{out}"
+        );
     }
 
     #[test]

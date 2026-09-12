@@ -11,24 +11,20 @@
 
 use crate::descriptor::{self, Layout};
 use crate::report::{self, Frame};
+use crate::run_loop_timer::Timer;
 use crate::scan_clock::ScanTimeClock;
 use crate::time::Timestamp;
 use anyhow::{Result, bail};
 use core_foundation::base::{CFType, TCFType};
-use core_foundation_sys::base::{CFGetTypeID, CFTypeRef};
-use core_foundation_sys::number::{CFBooleanGetTypeID, CFBooleanGetValue, CFBooleanRef};
 use core_foundation::data::CFData;
-use core_foundation::date::CFDate;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::CFNumber;
-use core_foundation::runloop::{
-    CFRunLoop, CFRunLoopRun, CFRunLoopTimer, kCFRunLoopCommonModes,
-};
-use objc2::MainThreadMarker;
+use core_foundation::runloop::{CFRunLoop, CFRunLoopRun, kCFRunLoopCommonModes};
 use core_foundation::string::CFString;
-use core_foundation_sys::runloop::{
-    CFRunLoopTimerContext, CFRunLoopTimerInvalidate, CFRunLoopTimerRef,
-};
+use core_foundation_sys::base::{CFGetTypeID, CFRelease, CFRetain, CFTypeRef};
+use core_foundation_sys::number::{CFBooleanGetTypeID, CFBooleanGetValue, CFBooleanRef};
+use core_foundation_sys::runloop::{CFRunLoopTimerInvalidate, CFRunLoopTimerRef};
+use objc2::MainThreadMarker;
 use std::ffi::c_void;
 use std::os::raw::c_int;
 use std::pin::Pin;
@@ -45,11 +41,6 @@ type IOHIDReportType = u32;
 const kIOHIDOptionsTypeNone: IOOptionBits = 0;
 const kIOReturnSuccess: IOReturn = 0;
 const kIOHIDReportTypeFeature: IOHIDReportType = 2;
-
-/// Spec Microsoft Precision Touchpad "Input Mode" Feature Report ID.
-/// Universal — every PTP device exposes it. 1 byte: 0 = mouse,
-/// 3 = multi-touch. We use this for third-party PTP devices and as a
-/// fallback when the RMK vendor 0x10 path is unavailable.
 
 /// Vendor Feature Report ID exposed by RMK firmware. One byte:
 /// low nibble = mode (0 = mouse, 3 = PTP), bit 7 = heartbeat-required.
@@ -112,16 +103,26 @@ unsafe extern "C" {
     fn IOHIDManagerSetDeviceMatching(manager: IOHIDManagerRef, matching: *const c_void);
     fn IOHIDManagerRegisterDeviceMatchingCallback(
         manager: IOHIDManagerRef,
-        callback: IOHIDDeviceCallback,
+        callback: Option<IOHIDDeviceCallback>,
         context: *mut c_void,
     );
     fn IOHIDManagerRegisterDeviceRemovalCallback(
         manager: IOHIDManagerRef,
-        callback: IOHIDDeviceCallback,
+        callback: Option<IOHIDDeviceCallback>,
         context: *mut c_void,
     );
     fn IOHIDManagerScheduleWithRunLoop(
         manager: IOHIDManagerRef,
+        run_loop: *mut c_void,
+        run_loop_mode: *const c_void,
+    );
+    fn IOHIDManagerUnscheduleFromRunLoop(
+        manager: IOHIDManagerRef,
+        run_loop: *mut c_void,
+        run_loop_mode: *const c_void,
+    );
+    fn IOHIDDeviceUnscheduleFromRunLoop(
+        device: IOHIDDeviceRef,
         run_loop: *mut c_void,
         run_loop_mode: *const c_void,
     );
@@ -133,7 +134,7 @@ unsafe extern "C" {
         device: IOHIDDeviceRef,
         report: *mut u8,
         report_length: isize,
-        callback: IOHIDReportCallback,
+        callback: Option<IOHIDReportCallback>,
         context: *mut c_void,
     );
     /// `IOReturn IOHIDDeviceSetReport(IOHIDDeviceRef, IOHIDReportType,
@@ -257,6 +258,7 @@ pub struct Manager {
     raw: IOHIDManagerRef,
     filter: Filter,
     bridge: Option<Pin<Box<Bridge>>>,
+    run_loop: Option<CFRunLoop>,
 }
 
 /// Owns the user's per-frame callback and the per-device state. All
@@ -264,6 +266,7 @@ pub struct Manager {
 /// access through raw pointers is safe.
 struct Bridge {
     on_frame: Box<dyn FnMut(Frame, Timestamp)>,
+    on_disconnect: Box<dyn FnMut()>,
     devices: Vec<Pin<Box<DeviceState>>>,
 }
 
@@ -286,6 +289,7 @@ enum ControlPath {
 
 struct DeviceState {
     device: IOHIDDeviceRef,
+    run_loop: CFRunLoop,
     layout: Layout,
     buf: Vec<u8>,
     bridge: *mut Bridge,
@@ -316,6 +320,22 @@ impl Drop for DeviceState {
     /// devices on the spec path have no equivalent, so a SIGKILL leaves
     /// them dormant in exactly the same way.
     fn drop(&mut self) {
+        // Stop delivery before freeing either the callback context or
+        // the report buffer. Keep the device open for the revert below.
+        unsafe {
+            IOHIDDeviceRegisterInputReportCallback(
+                self.device,
+                self.buf.as_mut_ptr(),
+                self.buf.len() as isize,
+                None,
+                std::ptr::null_mut(),
+            );
+            IOHIDDeviceUnscheduleFromRunLoop(
+                self.device,
+                self.run_loop.as_concrete_TypeRef() as *mut _,
+                kCFRunLoopCommonModes as *const _,
+            );
+        }
         // Revert the firmware to mouse mode on whichever report this
         // device actually responds to. Fires both on USB removal (after
         // the device is gone — the SET will fail, that's fine) and on
@@ -337,14 +357,15 @@ impl Drop for DeviceState {
                         Some(PTP_INPUT_MODE_MOUSE) => {
                             log::debug!("reverted to mouse mode (verified)")
                         }
-                        Some(other) => log::warn!(
-                            "revert to mouse mode reads back as {other:#04x}"
-                        ),
+                        Some(other) => {
+                            log::warn!("revert to mouse mode reads back as {other:#04x}")
+                        }
                         None => log::debug!("revert to mouse mode not verifiable"),
                     }
                 }
             }
         }
+        unsafe { CFRelease(self.device as CFTypeRef) };
     }
 }
 
@@ -358,6 +379,7 @@ impl Manager {
             raw,
             filter,
             bridge: None,
+            run_loop: None,
         })
     }
 
@@ -368,8 +390,19 @@ impl Manager {
     where
         F: FnMut(Frame, Timestamp) + 'static,
     {
+        self.run_with_disconnect(on_frame, || {})
+    }
+
+    /// Like `run`, also cancelling the consumer's input state when an
+    /// acquired device disappears and when the run loop exits.
+    pub fn run_with_disconnect<F, D>(&mut self, on_frame: F, on_disconnect: D) -> Result<()>
+    where
+        F: FnMut(Frame, Timestamp) + 'static,
+        D: FnMut() + 'static,
+    {
         let bridge = Box::pin(Bridge {
             on_frame: Box::new(on_frame),
+            on_disconnect: Box::new(on_disconnect),
             devices: Vec::new(),
         });
         self.bridge = Some(bridge);
@@ -377,17 +410,18 @@ impl Manager {
             unsafe { self.bridge.as_mut().unwrap().as_mut().get_unchecked_mut() };
 
         let matching = build_match_dict(&self.filter);
+        self.run_loop = Some(CFRunLoop::get_current());
 
         unsafe {
             IOHIDManagerSetDeviceMatching(self.raw, matching.as_concrete_TypeRef() as *const _);
             IOHIDManagerRegisterDeviceMatchingCallback(
                 self.raw,
-                on_device_matched,
+                Some(on_device_matched),
                 bridge_ptr as *mut c_void,
             );
             IOHIDManagerRegisterDeviceRemovalCallback(
                 self.raw,
-                on_device_removed,
+                Some(on_device_removed),
                 bridge_ptr as *mut c_void,
             );
             // Common modes, not default mode. AppKit runs a nested run
@@ -467,7 +501,38 @@ impl Manager {
             None => unsafe { CFRunLoopRun() },
         }
 
+        // The run loop retains timers. Invalidate both before freeing
+        // their raw manager/bridge pointers, even if another run starts.
+        drop(_heartbeat_timer);
+        drop(_open_retry_timer);
+        self.stop();
         Ok(())
+    }
+
+    fn stop(&mut self) {
+        if let Some(run_loop) = self.run_loop.take() {
+            unsafe {
+                IOHIDManagerRegisterDeviceMatchingCallback(self.raw, None, std::ptr::null_mut());
+                IOHIDManagerRegisterDeviceRemovalCallback(self.raw, None, std::ptr::null_mut());
+                IOHIDManagerUnscheduleFromRunLoop(
+                    self.raw,
+                    run_loop.as_concrete_TypeRef() as *mut _,
+                    kCFRunLoopCommonModes as *const _,
+                );
+            }
+        }
+        if let Some(mut bridge) = self.bridge.take() {
+            (bridge.on_disconnect)();
+            // Device drops unregister reports and revert mode while the
+            // manager is still open. The user callbacks are then freed.
+            bridge.devices.clear();
+        }
+        unsafe {
+            IOHIDManagerClose(self.raw, kIOHIDOptionsTypeNone);
+        }
+        SPEC_PATH_DEVICE.store(false, Ordering::Relaxed);
+        DEVICE_SUMMARY.with(|d| *d.borrow_mut() = None);
+        DEVICE_GEOMETRY.with(|g| *g.borrow_mut() = None);
     }
 }
 
@@ -475,41 +540,20 @@ impl Manager {
 /// `PTP_CONTROL_PTP_HEARTBEAT` to every matched device every
 /// `HEARTBEAT_INTERVAL_SECS`. Runs on the same thread as the device
 /// callbacks, so `bridge.devices` access is safely unsynchronized.
-fn install_heartbeat_timer(bridge_ptr: *mut Bridge) -> CFRunLoopTimer {
-    let mut context = CFRunLoopTimerContext {
-        version: 0,
-        info: bridge_ptr as *mut c_void,
-        retain: None,
-        release: None,
-        copyDescription: None,
-    };
-    let now = CFDate::now().abs_time();
-    let timer = CFRunLoopTimer::new(
-        now + HEARTBEAT_INTERVAL_SECS,
+fn install_heartbeat_timer(bridge_ptr: *mut Bridge) -> Timer {
+    Timer::new(
         HEARTBEAT_INTERVAL_SECS,
-        0,
-        0,
-        on_heartbeat_tick,
-        &mut context,
-    );
-    // Common modes, so the heartbeat keeps firing while a menu is open
-    // or a window is being dragged. The firmware reverts to mouse mode
-    // if it misses heartbeats for ~12 s, and a menu can easily be open
-    // that long.
-    let mode = unsafe { kCFRunLoopCommonModes };
-    CFRunLoop::get_current().add_timer(&timer, mode);
-    timer
-}
-
-extern "C" fn on_heartbeat_tick(_timer: CFRunLoopTimerRef, info: *mut c_void) {
-    let bridge = unsafe { &*(info as *const Bridge) };
-    for state in &bridge.devices {
-        // Spec 0x08 has no heartbeat semantics — pulsing it just causes
-        // pointless USB traffic. Skip those devices.
-        if state.control_path == ControlPath::Vendor {
-            set_ptp_control(state.device, PTP_CONTROL_PTP_HEARTBEAT);
-        }
-    }
+        HEARTBEAT_INTERVAL_SECS,
+        move || {
+            // Manager::run invalidates the timer before dropping the bridge.
+            let bridge = unsafe { &*bridge_ptr };
+            for state in &bridge.devices {
+                if state.control_path == ControlPath::Vendor {
+                    set_ptp_control(state.device, PTP_CONTROL_PTP_HEARTBEAT);
+                }
+            }
+        },
+    )
 }
 
 /// How often to retry `IOHIDManagerOpen` after a failed attempt.
@@ -540,33 +584,13 @@ fn short_open_failure(rv: IOReturn) -> &'static str {
 /// Retry `IOHIDManagerOpen` on a timer until it succeeds, then stop.
 /// Lets the companion recover without a restart once the user grants
 /// the permission or quits whatever was holding the devices.
-fn install_open_retry_timer(manager: IOHIDManagerRef) -> CFRunLoopTimer {
-    // Leaked on purpose: the callback dereferences this for as long as
-    // the timer can fire, which is the life of the process.
-    let ctx = Box::into_raw(Box::new(manager));
-    let mut context = CFRunLoopTimerContext {
-        version: 0,
-        info: ctx as *mut c_void,
-        retain: None,
-        release: None,
-        copyDescription: None,
-    };
-    let now = CFDate::now().abs_time();
-    let timer = CFRunLoopTimer::new(
-        now + OPEN_RETRY_SECS,
-        OPEN_RETRY_SECS,
-        0,
-        0,
-        on_open_retry,
-        &mut context,
-    );
-    let mode = unsafe { kCFRunLoopCommonModes };
-    CFRunLoop::get_current().add_timer(&timer, mode);
-    timer
+fn install_open_retry_timer(manager: IOHIDManagerRef) -> Timer {
+    Timer::with_callback(OPEN_RETRY_SECS, OPEN_RETRY_SECS, move |timer| {
+        on_open_retry(timer, manager);
+    })
 }
 
-extern "C" fn on_open_retry(timer: CFRunLoopTimerRef, info: *mut c_void) {
-    let manager = unsafe { *(info as *const IOHIDManagerRef) };
+fn on_open_retry(timer: CFRunLoopTimerRef, manager: IOHIDManagerRef) {
     let rv = unsafe { IOHIDManagerOpen(manager, kIOHIDOptionsTypeNone) };
     if rv != kIOReturnSuccess {
         log::debug!("IOHIDManagerOpen retry: {:#x}", rv as u32);
@@ -673,15 +697,9 @@ fn install_shutdown_worker() {
 
 impl Drop for Manager {
     fn drop(&mut self) {
-        // Drop the bridge first so each `DeviceState::drop` (writing
-        // Input Mode = 0 back to the firmware) fires while the
-        // IOHIDManager is still open. Closing the manager closes every
-        // opened device, after which `IOHIDDeviceSetReport` returns
-        // kIOReturnNotOpen and the cleanup write would be wasted.
-        self.bridge = None;
-        unsafe {
-            IOHIDManagerClose(self.raw, kIOHIDOptionsTypeNone);
-        }
+        self.stop();
+        // Balance IOHIDManagerCreate's owning reference.
+        unsafe { CFRelease(self.raw as CFTypeRef) };
     }
 }
 
@@ -692,6 +710,9 @@ unsafe extern "C" fn on_device_matched(
     device: IOHIDDeviceRef,
 ) {
     let bridge = unsafe { &mut *(context as *mut Bridge) };
+    if bridge.devices.iter().any(|d| d.device == device) {
+        return;
+    }
 
     let product = read_string_property(device, KEY_PRODUCT).unwrap_or_else(|| "<unknown>".into());
     let vid = read_number_property(device, KEY_VENDOR_ID);
@@ -713,8 +734,10 @@ unsafe extern "C" fn on_device_matched(
     if DUMP_ONLY.load(Ordering::Relaxed) {
         log::info!(
             "device \"{product}\" vid={} pid={}\n  descriptor ({} bytes): {}",
-            vid.map(|v| format!("{:#06x}", v as u16)).unwrap_or_else(|| "?".into()),
-            pid.map(|v| format!("{:#06x}", v as u16)).unwrap_or_else(|| "?".into()),
+            vid.map(|v| format!("{:#06x}", v as u16))
+                .unwrap_or_else(|| "?".into()),
+            pid.map(|v| format!("{:#06x}", v as u16))
+                .unwrap_or_else(|| "?".into()),
             desc.len(),
             hex(&desc),
         );
@@ -741,7 +764,11 @@ unsafe extern "C" fn on_device_matched(
             return;
         }
     };
-    log::debug!("\"{product}\" descriptor ({} bytes): {}", desc.len(), hex(&desc));
+    log::debug!(
+        "\"{product}\" descriptor ({} bytes): {}",
+        desc.len(),
+        hex(&desc)
+    );
     log::info!(
         "matched \"{product}\" (vid={} pid={}): {} contacts, logical max {}×{} \
          ({:.1}×{:.1} mm), {} bytes/contact, payload {} bytes total",
@@ -771,9 +798,8 @@ unsafe extern "C" fn on_device_matched(
 
     crate::status_item::set_status(&format!("Connected — {product}"));
 
-    DEVICE_GEOMETRY.with(|g| {
-        *g.borrow_mut() = Some((layout.physical_x_max_mm, layout.physical_y_max_mm))
-    });
+    DEVICE_GEOMETRY
+        .with(|g| *g.borrow_mut() = Some((layout.physical_x_max_mm, layout.physical_y_max_mm)));
     DEVICE_SUMMARY.with(|d| {
         *d.borrow_mut() = Some(format!(
             "{product} vid={:#06x} pid={:#06x}, {} contacts, {:.1}x{:.1} mm, \
@@ -797,8 +823,12 @@ unsafe extern "C" fn on_device_matched(
     }
 
     let buf_len = layout.total_payload_bytes.max(64);
+    // Hold our own reference through removal/teardown, independent of
+    // the manager's set of currently enumerated devices.
+    unsafe { CFRetain(device as CFTypeRef) };
     let mut state = Box::pin(DeviceState {
         device,
+        run_loop: CFRunLoop::get_current(),
         layout,
         buf: vec![0u8; buf_len],
         bridge: bridge as *mut Bridge,
@@ -825,7 +855,7 @@ unsafe extern "C" fn on_device_matched(
             device,
             buf_ptr,
             buf_len_isize,
-            on_input_report,
+            Some(on_input_report),
             ctx_ptr,
         );
     }
@@ -1051,6 +1081,10 @@ unsafe extern "C" fn on_device_removed(
     device: IOHIDDeviceRef,
 ) {
     let bridge = unsafe { &mut *(context as *mut Bridge) };
+    if !bridge.devices.iter().any(|d| d.device == device) {
+        return;
+    }
+    (bridge.on_disconnect)();
     bridge.devices.retain(|d| d.device != device);
     SPEC_PATH_DEVICE.store(
         bridge
@@ -1069,7 +1103,7 @@ unsafe extern "C" fn on_device_removed(
 
 unsafe extern "C" fn on_input_report(
     context: *mut c_void,
-    _result: IOReturn,
+    result: IOReturn,
     _sender: *mut c_void,
     _report_type: IOHIDReportType,
     _report_id: u32,
@@ -1077,6 +1111,13 @@ unsafe extern "C" fn on_input_report(
     report_length: isize,
 ) {
     let state = unsafe { &mut *(context as *mut DeviceState) };
+    if result != kIOReturnSuccess
+        || report.is_null()
+        || report_length <= 0
+        || report_length as usize > state.buf.len()
+    {
+        return;
+    }
     let bridge = unsafe { &mut *state.bridge };
     let bytes = unsafe { std::slice::from_raw_parts(report, report_length as usize) };
 
@@ -1202,4 +1243,53 @@ fn read_number_property(device: IOHIDDeviceRef, key: &str) -> Option<i32> {
     }
     let n: CFNumber = unsafe { CFNumber::wrap_under_get_rule(raw as *const _) };
     n.to_i32()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_foundation_sys::base::CFGetRetainCount;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    #[test]
+    fn manager_drop_releases_its_create_reference_without_opening_devices() {
+        let manager = Manager::new(Filter {
+            vid: None,
+            pid: None,
+        })
+        .unwrap();
+        let retained = unsafe { CFType::wrap_under_get_rule(manager.raw as CFTypeRef) };
+        let before = unsafe { CFGetRetainCount(retained.as_CFTypeRef()) };
+        drop(manager);
+        assert_eq!(
+            unsafe { CFGetRetainCount(retained.as_CFTypeRef()) },
+            before - 1
+        );
+    }
+
+    #[test]
+    fn stopping_manager_cancels_once_and_releases_callback_owners() {
+        let mut manager = Manager::new(Filter {
+            vid: None,
+            pid: None,
+        })
+        .unwrap();
+        let owner = Rc::new(());
+        let weak = Rc::downgrade(&owner);
+        let cancelled = Rc::new(Cell::new(0));
+        let seen = cancelled.clone();
+        manager.bridge = Some(Box::pin(Bridge {
+            on_frame: Box::new(move |_, _| {
+                let _keep_alive = &owner;
+            }),
+            on_disconnect: Box::new(move || seen.set(seen.get() + 1)),
+            devices: Vec::new(),
+        }));
+        manager.stop();
+        assert!(weak.upgrade().is_none());
+        assert_eq!(cancelled.get(), 1);
+        drop(manager);
+        assert_eq!(cancelled.get(), 1);
+    }
 }
