@@ -20,6 +20,7 @@
 // them rather than declaring them again. Declaring both compiles
 // every module twice and runs every test twice.
 use macos_trackpad_companion::{
+    app_kit,
     capture,
     config,
     config_watch,
@@ -192,6 +193,9 @@ fn main() -> Result<()> {
     // bar, so it has to live as long as `main` does.
     let mtm = objc2::MainThreadMarker::new()
         .ok_or_else(|| anyhow::anyhow!("main() must run on the main thread"))?;
+    // Before any timer is installed: App Nap coalesces them hard, and
+    // the retry/reload timers are how this process recovers.
+    app_kit::disable_app_nap();
     settings::set_config_path(cfg_path.clone());
     let _status_item = status_item::StatusItem::install(mtm);
 

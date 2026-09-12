@@ -42,7 +42,7 @@ use crate::config::{self, Config, GestureEnable};
 use crate::config_edit::ConfigFile;
 
 const WINDOW_W: f64 = 520.0;
-const WINDOW_H: f64 = 560.0;
+const WINDOW_H: f64 = 596.0;
 const POLL_SECS: f64 = 1.0;
 /// Quiet period after the last slider movement before the file is
 /// written. Long enough to coalesce a drag, short enough that letting
@@ -55,6 +55,9 @@ const EXPONENT_MIN: f64 = 0.5;
 const EXPONENT_MAX: f64 = 2.0;
 const SCROLL_MIN: f64 = 5.0;
 const SCROLL_MAX: f64 = 80.0;
+/// Velocity at which `sensitivity` is the plain linear feel, in mm/s.
+const ACCEL_REF_MIN: f64 = 20.0;
+const ACCEL_REF_MAX: f64 = 200.0;
 
 thread_local! {
     static SETTINGS: RefCell<Option<Window>> = const { RefCell::new(None) };
@@ -102,6 +105,8 @@ struct Window {
     cursor_sensitivity_value: Retained<NSTextField>,
     cursor_exponent: Retained<NSSlider>,
     cursor_exponent_value: Retained<NSTextField>,
+    cursor_accel_ref: Retained<NSSlider>,
+    cursor_accel_ref_value: Retained<NSTextField>,
     scroll_sensitivity: Retained<NSSlider>,
     scroll_sensitivity_value: Retained<NSTextField>,
     natural: Retained<NSButton>,
@@ -114,6 +119,9 @@ struct Window {
     timer: Option<CFRunLoopTimer>,
     /// Pending debounced write, replaced on each slider movement.
     flush_timer: Option<CFRunLoopTimer>,
+    /// Config mtime as of the last populate, so an edit made in a text
+    /// editor while this window is open is picked up.
+    seen_mtime: Option<std::time::SystemTime>,
     _actions: Retained<Actions>,
 }
 
@@ -137,6 +145,15 @@ define_class!(
             with_window_mut(|w| {
                 let v = round2(w.cursor_exponent.doubleValue());
                 w.cursor_exponent_value.setStringValue(&fmt(v));
+                w.schedule_flush();
+            });
+        }
+
+        #[unsafe(method(cursorAccelRef:))]
+        fn cursor_accel_ref(&self, _s: Option<&AnyObject>) {
+            with_window_mut(|w| {
+                let v = round1(w.cursor_accel_ref.doubleValue());
+                w.cursor_accel_ref_value.setStringValue(&fmt(v));
                 w.schedule_flush();
             });
         }
@@ -355,86 +372,104 @@ impl Window {
         let actions = Actions::new(mtm);
         let content = window.contentView().expect("NSWindow auto-creates a contentView");
 
-        let title = label(mtm, "Settings", 24.0, 518.0, 300.0, 22.0);
+        let title = label(mtm, "Settings", 24.0, 554.0, 300.0, 22.0);
         title.setFont(Some(&NSFont::boldSystemFontOfSize(15.0)));
         content.addSubview(&title);
         let blurb = label(
             mtm,
             "Saved to the config file and applied within a second.",
             24.0,
-            496.0,
+            532.0,
             472.0,
             18.0,
         );
         blurb.setFont(Some(&NSFont::systemFontOfSize(11.0)));
         content.addSubview(&blurb);
 
-        content.addSubview(&section(mtm, "Cursor", 464.0));
-        content.addSubview(&label(mtm, "Sensitivity", 24.0, 436.0, 120.0, 18.0));
+        content.addSubview(&section(mtm, "Cursor", 500.0));
+        content.addSubview(&label(mtm, "Sensitivity", 24.0, 472.0, 120.0, 18.0));
         let cursor_sensitivity = slider(
-            mtm, 25.0, CURSOR_MIN, CURSOR_MAX, &actions, sel!(cursorSensitivity:), 150.0, 432.0,
+            mtm, 25.0, CURSOR_MIN, CURSOR_MAX, &actions, sel!(cursorSensitivity:), 150.0, 468.0,
         );
         content.addSubview(&cursor_sensitivity);
-        let cursor_sensitivity_value = label(mtm, "", 400.0, 436.0, 90.0, 18.0);
+        let cursor_sensitivity_value = label(mtm, "", 400.0, 472.0, 90.0, 18.0);
         content.addSubview(&cursor_sensitivity_value);
 
-        content.addSubview(&label(mtm, "Acceleration", 24.0, 406.0, 120.0, 18.0));
+        content.addSubview(&label(mtm, "Acceleration", 24.0, 442.0, 120.0, 18.0));
         let cursor_exponent = slider(
-            mtm, 1.0, EXPONENT_MIN, EXPONENT_MAX, &actions, sel!(cursorExponent:), 150.0, 402.0,
+            mtm, 1.0, EXPONENT_MIN, EXPONENT_MAX, &actions, sel!(cursorExponent:), 150.0, 438.0,
         );
         content.addSubview(&cursor_exponent);
-        let cursor_exponent_value = label(mtm, "", 400.0, 406.0, 90.0, 18.0);
+        let cursor_exponent_value = label(mtm, "", 400.0, 442.0, 90.0, 18.0);
         content.addSubview(&cursor_exponent_value);
 
-        content.addSubview(&section(mtm, "Scroll", 372.0));
-        content.addSubview(&label(mtm, "Sensitivity", 24.0, 344.0, 120.0, 18.0));
+        content.addSubview(&label(mtm, "Accel reference", 24.0, 412.0, 120.0, 18.0));
+        let cursor_accel_ref = slider(
+            mtm, 80.0, ACCEL_REF_MIN, ACCEL_REF_MAX, &actions, sel!(cursorAccelRef:), 150.0, 408.0,
+        );
+        content.addSubview(&cursor_accel_ref);
+        let cursor_accel_ref_value = label(mtm, "", 400.0, 412.0, 90.0, 18.0);
+        content.addSubview(&cursor_accel_ref_value);
+        let accel_note = label(
+            mtm,
+            "mm/s at which sensitivity is the plain linear feel",
+            150.0,
+            390.0,
+            340.0,
+            14.0,
+        );
+        accel_note.setFont(Some(&NSFont::systemFontOfSize(10.0)));
+        content.addSubview(&accel_note);
+
+        content.addSubview(&section(mtm, "Scroll", 358.0));
+        content.addSubview(&label(mtm, "Sensitivity", 24.0, 330.0, 120.0, 18.0));
         let scroll_sensitivity = slider(
-            mtm, 20.0, SCROLL_MIN, SCROLL_MAX, &actions, sel!(scrollSensitivity:), 150.0, 340.0,
+            mtm, 20.0, SCROLL_MIN, SCROLL_MAX, &actions, sel!(scrollSensitivity:), 150.0, 326.0,
         );
         content.addSubview(&scroll_sensitivity);
-        let scroll_sensitivity_value = label(mtm, "", 400.0, 344.0, 90.0, 18.0);
+        let scroll_sensitivity_value = label(mtm, "", 400.0, 330.0, 90.0, 18.0);
         content.addSubview(&scroll_sensitivity_value);
 
         let natural = checkbox(
-            mtm, "Natural scrolling", &actions, sel!(naturalScroll:), 150.0, 314.0, 240.0,
+            mtm, "Natural scrolling", &actions, sel!(naturalScroll:), 150.0, 300.0, 240.0,
         );
         content.addSubview(&natural);
 
-        content.addSubview(&section(mtm, "Gestures", 280.0));
-        let pinch = checkbox(mtm, "Pinch", &actions, sel!(togglePinch:), 24.0, 252.0, 220.0);
+        content.addSubview(&section(mtm, "Gestures", 266.0));
+        let pinch = checkbox(mtm, "Pinch", &actions, sel!(togglePinch:), 24.0, 238.0, 220.0);
         content.addSubview(&pinch);
-        let rotate = checkbox(mtm, "Rotate", &actions, sel!(toggleRotate:), 262.0, 252.0, 220.0);
+        let rotate = checkbox(mtm, "Rotate", &actions, sel!(toggleRotate:), 262.0, 238.0, 220.0);
         content.addSubview(&rotate);
         let swipe_h = checkbox(
-            mtm, "Swipe — horizontal", &actions, sel!(toggleSwipeH:), 24.0, 228.0, 220.0,
+            mtm, "Swipe — horizontal", &actions, sel!(toggleSwipeH:), 24.0, 214.0, 220.0,
         );
         content.addSubview(&swipe_h);
         let swipe_v = checkbox(
-            mtm, "Swipe — vertical", &actions, sel!(toggleSwipeV:), 262.0, 228.0, 220.0,
+            mtm, "Swipe — vertical", &actions, sel!(toggleSwipeV:), 262.0, 214.0, 220.0,
         );
         content.addSubview(&swipe_v);
         let overlay = checkbox(
-            mtm, "Show gesture overlay", &actions, sel!(toggleOverlay:), 24.0, 204.0, 300.0,
+            mtm, "Show gesture overlay", &actions, sel!(toggleOverlay:), 24.0, 190.0, 300.0,
         );
         content.addSubview(&overlay);
 
-        content.addSubview(&section(mtm, "General", 170.0));
+        content.addSubview(&section(mtm, "General", 156.0));
         let login = checkbox(
-            mtm, "Start at login", &actions, sel!(toggleLoginItem:), 24.0, 142.0, 300.0,
+            mtm, "Start at login", &actions, sel!(toggleLoginItem:), 24.0, 128.0, 300.0,
         );
         content.addSubview(&login);
         let login_note = label(
             mtm,
             "Restarts the companion after a crash, not after you quit.",
             44.0,
-            122.0,
+            108.0,
             452.0,
             16.0,
         );
         login_note.setFont(Some(&NSFont::systemFontOfSize(10.0)));
         content.addSubview(&login_note);
 
-        content.addSubview(&section(mtm, "Troubleshooting", 88.0));
+        content.addSubview(&section(mtm, "Troubleshooting", 74.0));
         let perms_btn = push(
             mtm, "Permissions…", &actions, sel!(openPermissions:), 24.0, 56.0, 140.0,
         );
@@ -460,6 +495,8 @@ impl Window {
             cursor_sensitivity_value,
             cursor_exponent,
             cursor_exponent_value,
+            cursor_accel_ref,
+            cursor_accel_ref_value,
             scroll_sensitivity,
             scroll_sensitivity_value,
             natural,
@@ -471,12 +508,14 @@ impl Window {
             login,
             timer: None,
             flush_timer: None,
+            seen_mtime: None,
             _actions: actions,
         }
     }
 
     fn present(&mut self, mtm: MainThreadMarker) {
         self.populate();
+        self.seen_mtime = Self::config_mtime();
         app_kit::activate_for_window(mtm);
         self.window.center();
         self.window.makeKeyAndOrderFront(None);
@@ -496,8 +535,14 @@ impl Window {
         }
     }
 
-    /// Load current values from the file. Called when the window opens,
-    /// so hand edits made while it was closed are reflected.
+    /// Current mtime of the config file, if it has one.
+    fn config_mtime() -> Option<std::time::SystemTime> {
+        config_path()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|m| m.modified().ok())
+    }
+
+    /// Load current values from the file.
     fn populate(&self) {
         let cfg = config_path()
             .and_then(|p| config::load(Some(&p)).ok())
@@ -511,6 +556,8 @@ impl Window {
         self.cursor_sensitivity_value.setStringValue(&fmt(cfg.cursor.sensitivity));
         self.cursor_exponent.setDoubleValue(cfg.cursor.accel_exponent);
         self.cursor_exponent_value.setStringValue(&fmt(cfg.cursor.accel_exponent));
+        self.cursor_accel_ref.setDoubleValue(cfg.cursor.accel_ref);
+        self.cursor_accel_ref_value.setStringValue(&fmt(cfg.cursor.accel_ref));
         self.scroll_sensitivity.setDoubleValue(cfg.scroll.sensitivity);
         self.scroll_sensitivity_value.setStringValue(&fmt(cfg.scroll.sensitivity));
         set_checked(&self.natural, cfg.scroll.natural);
@@ -557,10 +604,12 @@ impl Window {
         self.flush_timer = None;
         let cursor = round1(self.cursor_sensitivity.doubleValue());
         let exponent = round2(self.cursor_exponent.doubleValue());
+        let accel_ref = round1(self.cursor_accel_ref.doubleValue());
         let scroll = round1(self.scroll_sensitivity.doubleValue());
         edit(|c| {
             c.set_f64(&["cursor"], "sensitivity", cursor)?;
             c.set_f64(&["cursor"], "accel_exponent", exponent)?;
+            c.set_f64(&["cursor"], "accel_ref", accel_ref)?;
             c.set_f64(&["scroll"], "sensitivity", scroll)?;
             Ok(())
         });
@@ -568,8 +617,8 @@ impl Window {
 
     /// Restore the defaults for everything this window displays.
     ///
-    /// Deliberately narrow: settings the window doesn't show (such as
-    /// `cursor.accel_ref`) are left alone, and a gesture whose policy is
+    /// Deliberately narrow: settings the window doesn't show (`[log]`,
+    /// `[device]`) are left alone, and a gesture whose policy is
     /// an app list is skipped for the same reason its checkbox is
     /// disabled — a reset shouldn't quietly delete a curated list.
     fn reset_to_defaults(&self) {
@@ -593,6 +642,7 @@ impl Window {
         edit(|c| {
             c.set_f64(&["cursor"], "sensitivity", defaults.cursor.sensitivity)?;
             c.set_f64(&["cursor"], "accel_exponent", defaults.cursor.accel_exponent)?;
+            c.set_f64(&["cursor"], "accel_ref", defaults.cursor.accel_ref)?;
             c.set_f64(&["scroll"], "sensitivity", defaults.scroll.sensitivity)?;
             c.set_bool(&["scroll"], "natural", defaults.scroll.natural)?;
             c.set_bool(&["overlay"], "enable", defaults.overlay.enable)?;
@@ -611,6 +661,20 @@ impl Window {
             Ok(())
         });
         self.populate();
+    }
+
+    /// Re-read the file if it changed underneath us — but never while a
+    /// write of our own is pending, which is the case where the user is
+    /// mid-drag and would have the slider yanked out from under them.
+    fn refresh_if_file_changed(&mut self) {
+        if self.flush_timer.is_some() {
+            return;
+        }
+        let now = Self::config_mtime();
+        if now != self.seen_mtime {
+            self.seen_mtime = now;
+            self.populate();
+        }
     }
 
     fn teardown(&mut self, mtm: MainThreadMarker) {
@@ -667,7 +731,9 @@ extern "C" fn on_tick(_timer: CFRunLoopTimerRef, _info: *mut c_void) {
     };
     SETTINGS.with(|cell| {
         if let Some(w) = cell.borrow_mut().as_mut() {
-            if !w.window.isVisible() {
+            if w.window.isVisible() {
+                w.refresh_if_file_changed();
+            } else {
                 w.teardown(mtm);
             }
         }

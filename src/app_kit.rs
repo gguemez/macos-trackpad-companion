@@ -19,11 +19,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;
+use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSEvent, NSEventModifierFlags, NSEventType,
     NSWindow,
 };
-use objc2_foundation::NSPoint;
+use objc2_foundation::{NSActivityOptions, NSPoint, NSProcessInfo, NSString};
 
 unsafe extern "C" {
     /// libdispatch's main queue. Declared by hand rather than pulling in
@@ -82,6 +83,32 @@ pub fn settle_activation(mtm: MainThreadMarker) {
     if !any_visible {
         ensure_app(mtm).setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     }
+}
+
+thread_local! {
+    /// Held for the life of the process; dropping it ends the activity.
+    static ACTIVITY: RefCell<Option<Retained<ProtocolObject<dyn NSObjectProtocol>>>> =
+        const { RefCell::new(None) };
+}
+
+/// Opt out of App Nap.
+///
+/// A windowless agent is exactly what App Nap targets, and it coalesces
+/// timers hard: a 3-second retry interval was measured firing at ~9
+/// seconds. That matters here because timers are how the companion
+/// recovers — retrying a failed HID open, noticing a config change.
+///
+/// `UserInitiatedAllowingIdleSystemSleep` rather than `UserInitiated`:
+/// the work is user-initiated, but a trackpad daemon has no business
+/// keeping the machine awake.
+pub fn disable_app_nap() {
+    let info = NSProcessInfo::processInfo();
+    let token = info.beginActivityWithOptions_reason(
+        NSActivityOptions::UserInitiatedAllowingIdleSystemSleep,
+        &NSString::from_str("driving a trackpad; timers must fire on schedule"),
+    );
+    ACTIVITY.with(|a| *a.borrow_mut() = Some(token));
+    log::debug!("App Nap disabled for this process");
 }
 
 /// Run the AppKit event loop. Blocks until [`request_stop`] fires.

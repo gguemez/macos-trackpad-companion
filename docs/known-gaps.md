@@ -152,12 +152,19 @@ re-acquisition, not time.
 Mitigations in place: the quit/pause guard, and start-at-login with
 crash-only `KeepAlive`.
 
-### App Nap throttles timers
+### App Nap throttles timers ✅
 
-A windowless agent gets its timers coalesced — a 3 s retry interval was
-observed firing at ~9 s. `ProcessType = Interactive` in the LaunchAgent
-plist addresses it when running under launchd;
-`NSProcessInfo beginActivityWithOptions` would cover the general case.
+`app_kit::disable_app_nap()` begins an
+`NSActivityUserInitiatedAllowingIdleSystemSleep` activity at startup and
+holds it for the life of the process. Timers are how this daemon
+recovers — retrying a failed HID open, noticing a config change — and a
+windowless agent is exactly what App Nap targets (a 3 s interval was
+measured firing at ~9 s).
+
+`AllowingIdleSystemSleep` rather than plain `UserInitiated`: a trackpad
+daemon has no business keeping the machine awake.
+`ProcessType = Interactive` in the LaunchAgent plist covers the same
+ground when running under launchd.
 
 ### macOS can disable the built-in trackpad
 
@@ -174,17 +181,20 @@ looking for which plist changed:
 
 ## UI
 
-### The settings window is partial
+### The settings window is partial ✅ (mostly)
 
-Not exposed: `cursor.accel_ref`, `[log]`, `[device]`, and the
-`only` / `except` app lists (a checkbox can't represent a list, so those
-gestures show a disabled checkbox rather than being flattened to on/off
-and silently losing the list).
+`cursor.accel_ref` is now a control, and the window re-reads the file
+when it changes underneath — but never while a write of its own is
+pending, which is exactly the mid-drag case where a refresh would yank
+a slider out from under the user.
 
-Values are read when the window opens, not continuously. Editing the
-file in a text editor while the window is open leaves the controls
-stale until it is closed and reopened. Live-refreshing would risk
-yanking a slider mid-drag.
+Still not exposed, deliberately:
+
+- `[log]` and `[device]`, which only take effect at startup;
+- the `only` / `except` app lists. A checkbox cannot represent
+  `{ only = [...] }`, so those gestures show a disabled checkbox rather
+  than being flattened to on/off and silently losing the list. A proper
+  list editor is the real answer.
 
 ### No gesture scope
 
