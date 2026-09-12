@@ -20,4 +20,5 @@ pub mod report;
 pub mod scan_clock;
 pub mod settings;
 pub mod status_item;
+pub mod system_prefs;
 pub mod time;

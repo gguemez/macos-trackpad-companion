@@ -154,6 +154,12 @@ pub fn open_input_monitoring_settings() {
     open_url(INPUT_MONITORING_PANE);
 }
 
+/// Accessibility > Pointer Control, where the built-in trackpad can be
+/// kept enabled while an external pointing device is attached.
+pub fn open_pointer_control_settings() {
+    open_url("x-apple.systempreferences:com.apple.preference.universalaccess");
+}
+
 pub fn open_accessibility_settings() {
     open_url(ACCESSIBILITY_PANE);
 }

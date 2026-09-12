@@ -33,6 +33,7 @@ mod report;
 mod scan_clock;
 mod settings;
 mod status_item;
+mod system_prefs;
 mod time;
 
 use anyhow::{Context, Result};
@@ -129,6 +130,11 @@ fn main() -> Result<()> {
              nothing moves on screen."
         );
     }
+
+    log::info!(
+        "pointer policy: macOS ignores built-in trackpad when external present = {}",
+        system_prefs::builtin_trackpad_ignored()
+    );
 
     let emitter = output::Emitter::new(output_config(&cfg));
     let mut manager = hid::Manager::new(hid::Filter {

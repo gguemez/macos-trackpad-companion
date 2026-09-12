@@ -20,7 +20,8 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{AnyThread, MainThreadMarker, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSImage, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+    NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSAlertThirdButtonReturn, NSImage, NSMenu,
+    NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
 };
 use objc2_foundation::{NSData, NSSize, NSString};
 
@@ -76,6 +77,24 @@ define_class!(
 
         #[unsafe(method(quit:))]
         fn quit(&self, _sender: Option<&AnyObject>) {
+            // Quitting can leave the machine with no pointer at all: a
+            // spec-path pad stops responding once nothing is driving
+            // it, and macOS may be ignoring the built-in trackpad
+            // because that pad is attached. Never do that silently.
+            // Only warn when quitting would genuinely leave no pointer:
+            // a pad that goes dormant without us, and no usable built-in
+            // trackpad to fall back on — either because macOS is
+            // ignoring it, or because this Mac hasn't got one.
+            let no_fallback = crate::system_prefs::builtin_trackpad_ignored()
+                || !crate::hid::builtin_trackpad_present();
+            if crate::hid::quit_would_strand_device() && no_fallback {
+                if let Some(mtm) = MainThreadMarker::new() {
+                    if !confirm_quit(mtm) {
+                        log::info!("quit cancelled");
+                        return;
+                    }
+                }
+            }
             log::info!("quit requested from menu");
             // Straight into the sigwait worker installed by
             // `hid::Manager::run`, which stops the event loop and lets
@@ -84,6 +103,42 @@ define_class!(
         }
     }
 );
+
+/// Warn before a quit that would leave no working pointer.
+///
+/// Returns true if the user chose to go ahead.
+fn confirm_quit(mtm: MainThreadMarker) -> bool {
+    // Bring the app forward so the alert isn't stranded behind other
+    // windows — an accessory app's modal can otherwise be easy to miss.
+    app_kit::activate_for_window(mtm);
+
+    let alert = NSAlert::new(mtm);
+    alert.setAlertStyle(NSAlertStyle::Warning);
+    alert.setMessageText(&NSString::from_str("Quit and lose the trackpad?"));
+    alert.setInformativeText(&NSString::from_str(concat!(
+        "This trackpad stops responding while Trackpad Companion isn't running, ",
+        "and macOS may be ignoring your built-in trackpad because an external ",
+        "pointing device is attached — so quitting can leave you with no pointer ",
+        "at all.\n\n",
+        "It works again as soon as the companion is restarted; unplugging is not ",
+        "required.\n\n",
+        "To keep the built-in trackpad available, turn off “Ignore built-in ",
+        "trackpad when mouse or wireless trackpad is present” in Accessibility > ",
+        "Pointer Control.",
+    )));
+    alert.addButtonWithTitle(&NSString::from_str("Quit Anyway"));
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    alert.addButtonWithTitle(&NSString::from_str("Open Accessibility Settings…"));
+
+    let response = alert.runModal();
+    app_kit::settle_activation(mtm);
+
+    if response == NSAlertThirdButtonReturn {
+        crate::permissions::open_pointer_control_settings();
+        return false;
+    }
+    response == NSAlertFirstButtonReturn
+}
 
 impl MenuTarget {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {

@@ -302,6 +302,22 @@ on separate interfaces.
   held seized by the system, which is a common source of
   `kIOReturnExclusiveAccess` (`0xE00002E2`) at startup. It clears on its
   own; the descriptor parse then rejects the device properly.
+- **A spec-path device goes dormant when the companion stops.** On the
+  standard Input Mode path (no RMK vendor report), reverting the device
+  to mouse mode on shutdown is acknowledged but leaves it sending
+  nothing at all — not touch reports, not mouse reports. The pointer
+  comes back when a companion process acquires it again (just relaunch;
+  no replug needed) or when the device is re-enumerated. A 300 ms delay
+  between the revert and closing the manager was tried and made no
+  difference: the device needs re-acquisition, not time.
+
+  This matters because macOS may be configured to ignore the built-in
+  trackpad while an external pointing device is attached (System
+  Settings → Accessibility → Pointer Control), in which case quitting
+  the companion can leave no working pointer at all. Turning that
+  setting off keeps the built-in trackpad as a fallback. Running the
+  companion under a `KeepAlive` LaunchAgent also covers the crash case,
+  since launchd restarts it and the pad revives.
 - **Retries are subject to App Nap.** The retry timer asks for 3 s, but
   a windowless `LSUIElement` agent gets its timers coalesced — observed
   ~9 s in practice. Recovery works, just slower than the interval

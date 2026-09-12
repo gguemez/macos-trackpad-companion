@@ -15,6 +15,8 @@ use crate::scan_clock::ScanTimeClock;
 use crate::time::Timestamp;
 use anyhow::{Result, bail};
 use core_foundation::base::{CFType, TCFType};
+use core_foundation_sys::base::{CFGetTypeID, CFTypeRef};
+use core_foundation_sys::number::{CFBooleanGetTypeID, CFBooleanGetValue, CFBooleanRef};
 use core_foundation::data::CFData;
 use core_foundation::date::CFDate;
 use core_foundation::dictionary::CFDictionary;
@@ -30,6 +32,7 @@ use core_foundation_sys::runloop::{
 use std::ffi::c_void;
 use std::os::raw::c_int;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ---- IOHID types & constants ----
 
@@ -151,6 +154,48 @@ unsafe extern "C" {
     );
 }
 
+/// Whether a device on the spec Input Mode path is currently attached.
+///
+/// Those devices go dormant when the companion stops — see the note on
+/// `DeviceState::drop`. Vendor-path devices have a firmware watchdog
+/// that reverts them automatically, so they don't need the warning.
+static SPEC_PATH_DEVICE: AtomicBool = AtomicBool::new(false);
+
+/// Whether a built-in (internal) HID device has been seen. Used to
+/// decide whether there is any fallback pointer at all — on a desktop
+/// Mac there isn't, so quitting strands the user regardless of how
+/// Pointer Control is configured.
+static BUILTIN_DEVICE_SEEN: AtomicBool = AtomicBool::new(false);
+
+/// True when quitting would leave a trackpad unresponsive until the
+/// companion runs again.
+pub fn quit_would_strand_device() -> bool {
+    SPEC_PATH_DEVICE.load(Ordering::Relaxed)
+}
+
+/// Whether this machine appears to have a built-in trackpad that could
+/// serve as a fallback. Conservative: only true once one has actually
+/// been seen, so an unknown answer errs toward warning the user.
+pub fn builtin_trackpad_present() -> bool {
+    BUILTIN_DEVICE_SEEN.load(Ordering::Relaxed)
+}
+
+/// Read a CoreFoundation boolean property off an IOHID device.
+fn read_bool_property(device: IOHIDDeviceRef, key: &str) -> Option<bool> {
+    let cfkey = CFString::new(key);
+    let raw = unsafe { IOHIDDeviceGetProperty(device, cfkey.as_concrete_TypeRef() as *const _) };
+    if raw.is_null() {
+        return None;
+    }
+    unsafe {
+        if CFGetTypeID(raw as CFTypeRef) == CFBooleanGetTypeID() {
+            Some(CFBooleanGetValue(raw as CFBooleanRef))
+        } else {
+            None
+        }
+    }
+}
+
 // ---- Public API ----
 
 #[derive(Clone, Copy, Debug)]
@@ -202,6 +247,25 @@ struct DeviceState {
 }
 
 impl Drop for DeviceState {
+    /// Revert the device to mouse mode on the way out.
+    ///
+    /// Measured caveat on the spec Input Mode path (0x08 / whatever the
+    /// descriptor declares — 0x25 on the pad this was tested against):
+    /// the SET_FEATURE is acknowledged, but the device then sends
+    /// *nothing*. It has stopped producing touch reports and does not
+    /// start producing mouse reports, so there is no pointer from it at
+    /// all until either it is re-enumerated (unplug/replug) or a
+    /// companion process picks it up again and puts it back into PTP
+    /// mode. Relaunching is enough; the cable is not required.
+    ///
+    /// A 300 ms settle delay between this write and closing the manager
+    /// was tried on the theory that the close was racing the mode
+    /// switch. It made no difference and was removed — the device needs
+    /// re-acquisition, not time.
+    ///
+    /// The vendor path's heartbeat watchdog covers the crash case;
+    /// devices on the spec path have no equivalent, so a SIGKILL leaves
+    /// them dormant in exactly the same way.
     fn drop(&mut self) {
         // Revert the firmware to mouse mode on whichever report this
         // device actually responds to. Fires both on USB removal (after
@@ -570,6 +634,13 @@ unsafe extern "C" fn on_device_matched(
     let product = read_string_property(device, KEY_PRODUCT).unwrap_or_else(|| "<unknown>".into());
     let vid = read_number_property(device, KEY_VENDOR_ID);
     let pid = read_number_property(device, KEY_PRODUCT_ID);
+    if read_bool_property(device, "Built-In") == Some(true) {
+        // Seen before the descriptor check on purpose: the internal
+        // trackpad matches the digitizer filter but is rejected below,
+        // and it is exactly the fallback pointer we care about.
+        BUILTIN_DEVICE_SEEN.store(true, Ordering::Relaxed);
+    }
+
     let desc = match read_data_property(device, KEY_REPORT_DESCRIPTOR) {
         Some(d) => d,
         None => {
@@ -620,6 +691,9 @@ unsafe extern "C" fn on_device_matched(
     // Precision Touchpads, discover the Input Mode and optional configuration
     // feature report IDs from the HID descriptor.
     let control_path = enter_ptp_mode(device, &product, &layout);
+    if control_path == ControlPath::SpecInputMode {
+        SPEC_PATH_DEVICE.store(true, Ordering::Relaxed);
+    }
 
     let buf_len = layout.total_payload_bytes.max(64);
     let mut state = Box::pin(DeviceState {
@@ -787,6 +861,13 @@ unsafe extern "C" fn on_device_removed(
 ) {
     let bridge = unsafe { &mut *(context as *mut Bridge) };
     bridge.devices.retain(|d| d.device != device);
+    SPEC_PATH_DEVICE.store(
+        bridge
+            .devices
+            .iter()
+            .any(|d| d.control_path == ControlPath::SpecInputMode),
+        Ordering::Relaxed,
+    );
     log::info!("device removed");
     if bridge.devices.is_empty() {
         crate::status_item::set_status("Waiting for device…");
