@@ -58,6 +58,15 @@ struct Args {
     /// from the config file when set.
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
+
+    /// Print the HID report descriptor of every matching device and
+    /// exit, without changing any device's mode.
+    ///
+    /// A descriptor is enough to diagnose an unsupported trackpad and
+    /// to turn it into a parser test, so this makes compatibility
+    /// questions answerable by email rather than by owning the hardware.
+    #[arg(long)]
+    dump_descriptors: bool,
 }
 
 fn main() -> Result<()> {
@@ -86,7 +95,14 @@ fn main() -> Result<()> {
     let mut log_builder =
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level.as_str()));
     log_builder.format_timestamp_millis();
-    let log_file_path = cfg.log.file.as_deref().map(config::expand_tilde);
+    // --dump-descriptors is a diagnostic run: its output belongs on
+    // stderr where the user can see it, not appended to the daemon's
+    // log file.
+    let log_file_path = if args.dump_descriptors {
+        None
+    } else {
+        cfg.log.file.as_deref().map(config::expand_tilde)
+    };
     if let Some(path) = log_file_path.as_deref() {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -117,6 +133,12 @@ fn main() -> Result<()> {
 
     // Bound to a non-underscore name so the guard lives until end of
     // main; closing the fd releases the kernel's flock.
+    // Before the instance lock on purpose: inspecting devices changes
+    // nothing, so it must work while the daemon is running.
+    if args.dump_descriptors {
+        return dump_descriptors(&cfg);
+    }
+
     let lock = match instance_lock::acquire() {
         Ok(lock) => lock,
         Err(e) if e.downcast_ref::<instance_lock::AlreadyRunning>().is_some() => {
@@ -178,6 +200,33 @@ fn main() -> Result<()> {
         run(&mut manager, emitter, &cfg, cfg_path)?;
     }
 
+    Ok(())
+}
+
+/// Report what is attached and exit, touching nothing.
+///
+/// Deliberately skips the status item, the setup window, the config
+/// watcher and — most importantly — the PTP mode switch: inspecting a
+/// device should not reconfigure it.
+fn dump_descriptors(cfg: &config::Config) -> Result<()> {
+    hid::set_dump_only(true);
+
+    let mut manager = hid::Manager::new(hid::Filter {
+        vid: cfg.device.vid,
+        pid: cfg.device.pid,
+    })
+    .context("open IOHIDManager")?;
+
+    // Device matching is delivered by callbacks on the run loop, so
+    // give them a moment to arrive and then shut down through the usual
+    // signal path.
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        hid::request_shutdown();
+    });
+
+    log::info!("dumping descriptors for matching devices (3s)...");
+    manager.run(|_frame, _ts| {})?;
     Ok(())
 }
 

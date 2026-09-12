@@ -154,6 +154,14 @@ unsafe extern "C" {
     );
 }
 
+/// Set by `--dump-descriptors`: report what is attached and change
+/// nothing. No mode switching, no input subscription.
+static DUMP_ONLY: AtomicBool = AtomicBool::new(false);
+
+pub fn set_dump_only(on: bool) {
+    DUMP_ONLY.store(on, Ordering::Relaxed);
+}
+
 /// Whether a device on the spec Input Mode path is currently attached.
 ///
 /// Those devices go dormant when the companion stops — see the note on
@@ -661,16 +669,38 @@ unsafe extern "C" fn on_device_matched(
             return;
         }
     };
+    if DUMP_ONLY.load(Ordering::Relaxed) {
+        log::info!(
+            "device \"{product}\" vid={} pid={}\n  descriptor ({} bytes): {}",
+            vid.map(|v| format!("{:#06x}", v as u16)).unwrap_or_else(|| "?".into()),
+            pid.map(|v| format!("{:#06x}", v as u16)).unwrap_or_else(|| "?".into()),
+            desc.len(),
+            hex(&desc),
+        );
+        match descriptor::parse(&desc) {
+            Ok(l) => log::info!("  parsed: {l:?}"),
+            Err(e) => log::info!("  parse failed: {e:#}"),
+        }
+        return;
+    }
+
     let layout = match descriptor::parse(&desc) {
         Ok(l) => l,
         Err(e) => {
+            // The descriptor is the whole story for an unsupported
+            // device, and it is the one thing that can be analysed
+            // without owning the hardware — so log it in full rather
+            // than just its length.
             log::warn!(
-                "matched \"{product}\" but descriptor parse failed: {e:#}; descriptor was {} bytes",
-                desc.len()
+                "matched \"{product}\" but descriptor parse failed: {e:#}\n  \
+                 descriptor ({} bytes): {}",
+                desc.len(),
+                hex(&desc),
             );
             return;
         }
     };
+    log::debug!("\"{product}\" descriptor ({} bytes): {}", desc.len(), hex(&desc));
     log::info!(
         "matched \"{product}\" (vid={} pid={}): {} contacts, logical max {}×{} \
          ({:.1}×{:.1} mm), {} bytes/contact, payload {} bytes total",
@@ -767,13 +797,36 @@ unsafe extern "C" fn on_device_matched(
 /// no point bailing the match flow when the spec path is universally
 /// implemented.
 fn enter_ptp_mode(device: IOHIDDeviceRef, product: &str, layout: &Layout) -> ControlPath {
-    // Prefer the RMK vendor control path when available. It provides
-    // heartbeat protection and preserves the original companion behavior.
-    let rv = set_feature_byte(device, PTP_CONTROL_REPORT_ID, PTP_CONTROL_PTP_HEARTBEAT);
-
-    if rv == kIOReturnSuccess {
-        log::info!("\"{product}\": entered PTP via vendor Report 0x10 (heartbeat-protected)");
-        return ControlPath::Vendor;
+    // Prefer the RMK vendor control path, but never write over a report
+    // the device declared for something else.
+    //
+    // This probe used to be unconditional: a vendor-defined byte written
+    // to every matched digitizer before knowing anything about it. On
+    // RMK firmware report 0x10 means "PTP mode + heartbeat"; elsewhere
+    // it means whatever that vendor decided, and SET_FEATURE succeeding
+    // says only that the bytes were accepted.
+    //
+    // The rule is deliberately narrow. RMK answers 0x10 without
+    // declaring it in its descriptor, so "undeclared" has to stay
+    // probeable or its heartbeat protection disappears. Only a report
+    // declared on a standard usage page is off-limits.
+    if !layout.vendor_probe_would_collide(PTP_CONTROL_REPORT_ID as u8) {
+        let rv = set_feature_byte(device, PTP_CONTROL_REPORT_ID, PTP_CONTROL_PTP_HEARTBEAT);
+        if rv == kIOReturnSuccess {
+            log::info!("\"{product}\": entered PTP via vendor Report 0x10 (heartbeat-protected)");
+            return ControlPath::Vendor;
+        }
+        log::debug!(
+            "\"{product}\": vendor Report 0x10 probe failed ({:#x}); \
+             falling back to the spec path",
+            rv as u32
+        );
+    } else {
+        log::info!(
+            "\"{product}\": report {:#04x} is declared for another purpose; \
+             skipping the vendor probe",
+            PTP_CONTROL_REPORT_ID
+        );
     }
 
     // Otherwise use the standard PTP feature reports discovered from

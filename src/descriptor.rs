@@ -31,12 +31,50 @@ const USAGE_DIG_LATENCY_MODE: u16 = 0x60;
 
 const FINGER_USAGE: u32 = ((PAGE_DIGITIZER as u32) << 16) | (USAGE_DIG_FINGER as u32);
 
+/// A field's position within one contact, in bits relative to the start
+/// of that contact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BitField {
+    pub offset: usize,
+    pub size: usize,
+}
+
+impl BitField {
+    fn end(&self) -> usize {
+        self.offset + self.size
+    }
+}
+
+/// Where each per-contact field lives.
+///
+/// Recorded from the descriptor rather than assumed, so a device that
+/// reports extra per-contact data (Width, Height, Pressure, Azimuth —
+/// all optional in the PTP spec) is handled by reading past it instead
+/// of being rejected for having an unfamiliar stride.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContactFields {
+    /// Optional in the spec; treated as "confident" when absent.
+    pub confidence: Option<BitField>,
+    pub tip: BitField,
+    pub id: BitField,
+    pub x: BitField,
+    pub y: BitField,
+}
+
 #[derive(Debug, Clone)]
 pub struct Layout {
     pub report_id: u8,
     pub contact_slots: usize,
+    /// Contact stride in bytes. Derived from `contact_stride_bits`, and
+    /// kept because it reads better in logs than a bit count.
     pub bytes_per_contact: usize,
     pub fingers_offset: usize,
+    /// Bit position of the first contact, and the stride between them.
+    /// These drive decoding; the byte-granular fields above are for
+    /// display.
+    pub fingers_bit_offset: usize,
+    pub contact_stride_bits: usize,
+    pub contact: ContactFields,
     pub scan_time_offset: usize,
     pub contact_count_offset: usize,
     pub button_offset: usize,
@@ -56,9 +94,31 @@ pub struct Layout {
     pub input_mode_report_id: Option<u8>,
     pub selective_reporting_report_id: Option<u8>,
     pub latency_mode_report_id: Option<u8>,
+    /// Report IDs of feature reports declared on a vendor-defined usage
+    /// page (0xFF00 and above).
+    pub vendor_feature_report_ids: Vec<u8>,
+    /// Report IDs of feature reports declared on a standard usage page.
+    ///
+    /// Together these say whether writing a given feature report would
+    /// be addressing something the device declared for another purpose.
+    pub standard_feature_report_ids: Vec<u8>,
 }
 
 impl Layout {
+    /// Whether probing feature report `id` with vendor semantics would
+    /// be writing over a report this device declared for something else.
+    ///
+    /// The RMK firmware answers report 0x10 without declaring it, so
+    /// "not declared" must stay probeable or its heartbeat path is
+    /// lost. What must not happen is writing a vendor-defined byte into
+    /// a report the device declared on a *standard* page, where it
+    /// means something specific and certainly not ours — SET_FEATURE
+    /// succeeding tells us only that the bytes were accepted.
+    pub fn vendor_probe_would_collide(&self, id: u8) -> bool {
+        self.standard_feature_report_ids.contains(&id)
+            && !self.vendor_feature_report_ids.contains(&id)
+    }
+
     /// Conversion factor from one chip-pixel of X displacement to
     /// millimeters. Density typically differs between axes
     /// (e.g. SoflePLUS2 IQS5xx panel: ~41.8 px/mm on X, ~47.3 px/mm on Y),
@@ -73,10 +133,29 @@ impl Layout {
 
 impl Layout {
     pub fn validate(&self) -> Result<()> {
-        if self.bytes_per_contact != 5 && self.bytes_per_contact != 6 {
+        if self.contact_stride_bits == 0 {
+            bail!("contact stride is zero");
+        }
+        // A sanity bound, not a compatibility rule: a plausible contact
+        // is a few bytes, and anything past 32 means the descriptor was
+        // misread rather than that the device is exotic.
+        if self.contact_stride_bits > 32 * 8 {
             bail!(
-                "unsupported contact layout: {} bytes/contact (expected 5 or 6)",
-                self.bytes_per_contact
+                "implausible contact stride: {} bits",
+                self.contact_stride_bits
+            );
+        }
+
+        let c = &self.contact;
+        let mut furthest = c.tip.end().max(c.id.end()).max(c.x.end()).max(c.y.end());
+        if let Some(conf) = c.confidence {
+            furthest = furthest.max(conf.end());
+        }
+        if furthest > self.contact_stride_bits {
+            bail!(
+                "contact fields run past the stride ({} bits used of {})",
+                furthest,
+                self.contact_stride_bits
             );
         }
         Ok(())
@@ -146,21 +225,25 @@ struct Walker<'a> {
     input_mode_report_id: Option<u8>,
     selective_reporting_report_id: Option<u8>,
     latency_mode_report_id: Option<u8>,
+    vendor_feature_report_ids: Vec<u8>,
+    standard_feature_report_ids: Vec<u8>,
 }
 
 #[derive(Debug)]
 struct FingerBlockBuilder {
     start_bit: usize,
-    has_tip: bool,
-    has_id: bool,
-    has_x: bool,
-    has_y: bool,
+    confidence: Option<BitField>,
+    tip: Option<BitField>,
+    id: Option<BitField>,
+    x: Option<BitField>,
+    y: Option<BitField>,
 }
 
 #[derive(Debug)]
 struct FingerBlock {
     start_bit: usize,
     end_bit: usize,
+    fields: ContactFields,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -207,6 +290,8 @@ impl<'a> Walker<'a> {
             input_mode_report_id: None,
             selective_reporting_report_id: None,
             latency_mode_report_id: None,
+            vendor_feature_report_ids: Vec::new(),
+            standard_feature_report_ids: Vec::new(),
         }
     }
 
@@ -259,6 +344,17 @@ impl<'a> Walker<'a> {
         for usage32 in usages {
             let page = (usage32 >> 16) as u16;
             let usage = (usage32 & 0xffff) as u16;
+
+            // Vendor-defined pages start at 0xFF00. Note the report id
+            // so callers can check a vendor report exists before
+            // writing one.
+            if page >= 0xFF00 {
+                if !self.vendor_feature_report_ids.contains(&self.report_id) {
+                    self.vendor_feature_report_ids.push(self.report_id);
+                }
+            } else if !self.standard_feature_report_ids.contains(&self.report_id) {
+                self.standard_feature_report_ids.push(self.report_id);
+            }
 
             if page != PAGE_DIGITIZER {
                 continue;
@@ -316,10 +412,11 @@ impl<'a> Walker<'a> {
             let cursor = *self.bit_cursor.entry(self.report_id).or_insert(8);
             self.current_finger_block = Some(FingerBlockBuilder {
                 start_bit: cursor,
-                has_tip: false,
-                has_id: false,
-                has_x: false,
-                has_y: false,
+                confidence: None,
+                tip: None,
+                id: None,
+                x: None,
+                y: None,
             });
         }
     }
@@ -335,10 +432,19 @@ impl<'a> Walker<'a> {
             return;
         };
         let end_bit = *self.bit_cursor.get(&self.report_id).unwrap_or(&0);
-        if builder.has_tip && builder.has_id && builder.has_x && builder.has_y {
+        if let (Some(tip), Some(id), Some(x), Some(y)) =
+            (builder.tip, builder.id, builder.x, builder.y)
+        {
             self.finger_blocks.push(FingerBlock {
                 start_bit: builder.start_bit,
                 end_bit,
+                fields: ContactFields {
+                    confidence: builder.confidence,
+                    tip,
+                    id,
+                    x,
+                    y,
+                },
             });
             self.touch_report_id.get_or_insert(self.report_id);
         }
@@ -374,7 +480,10 @@ impl<'a> Walker<'a> {
             match (page, usage) {
                 (PAGE_GENERIC_DESKTOP, USAGE_GD_X) => {
                     if let Some(b) = self.current_finger_block.as_mut() {
-                        b.has_x = true;
+                        b.x.get_or_insert(BitField {
+                            offset: field_bit_offset - b.start_bit,
+                            size: bit_size as usize,
+                        });
                         if self.logical_x_max.is_none() {
                             self.logical_x_max = Some(self.logical_max);
                             self.physical_x_max_mm =
@@ -384,7 +493,10 @@ impl<'a> Walker<'a> {
                 }
                 (PAGE_GENERIC_DESKTOP, USAGE_GD_Y) => {
                     if let Some(b) = self.current_finger_block.as_mut() {
-                        b.has_y = true;
+                        b.y.get_or_insert(BitField {
+                            offset: field_bit_offset - b.start_bit,
+                            size: bit_size as usize,
+                        });
                         if self.logical_y_max.is_none() {
                             self.logical_y_max = Some(self.logical_max);
                             self.physical_y_max_mm =
@@ -394,16 +506,26 @@ impl<'a> Walker<'a> {
                 }
                 (PAGE_DIGITIZER, USAGE_DIG_TIP_SWITCH) => {
                     if let Some(b) = self.current_finger_block.as_mut() {
-                        b.has_tip = true;
+                        b.tip.get_or_insert(BitField {
+                            offset: field_bit_offset - b.start_bit,
+                            size: bit_size as usize,
+                        });
                     }
                 }
                 (PAGE_DIGITIZER, USAGE_DIG_CONFIDENCE) => {
-                    // Useful but optional — track if we ever want to filter
-                    // low-confidence contacts.
+                    if let Some(b) = self.current_finger_block.as_mut() {
+                        b.confidence.get_or_insert(BitField {
+                            offset: field_bit_offset - b.start_bit,
+                            size: bit_size as usize,
+                        });
+                    }
                 }
                 (PAGE_DIGITIZER, USAGE_DIG_CONTACT_ID) => {
                     if let Some(b) = self.current_finger_block.as_mut() {
-                        b.has_id = true;
+                        b.id.get_or_insert(BitField {
+                            offset: field_bit_offset - b.start_bit,
+                            size: bit_size as usize,
+                        });
                     }
                 }
                 (PAGE_DIGITIZER, USAGE_DIG_SCAN_TIME) => {
@@ -504,8 +626,11 @@ impl<'a> Walker<'a> {
             .finger_blocks
             .first()
             .ok_or_else(|| anyhow!("finger collection lacked tip/id/X/Y"))?;
-        let bytes_per_contact = (first.end_bit - first.start_bit) / 8;
+        let contact_stride_bits = first.end_bit - first.start_bit;
+        let bytes_per_contact = contact_stride_bits / 8;
         let fingers_offset = first.start_bit / 8;
+        let fingers_bit_offset = first.start_bit;
+        let contact = first.fields;
 
         let scan_time = self
             .scan_time
@@ -530,6 +655,9 @@ impl<'a> Walker<'a> {
             contact_slots: self.finger_blocks.len(),
             bytes_per_contact,
             fingers_offset,
+            fingers_bit_offset,
+            contact_stride_bits,
+            contact,
             scan_time_offset: scan_time.bit_offset / 8,
             contact_count_offset: contact_count.bit_offset / 8,
             button_offset: button.bit_offset / 8,
@@ -542,6 +670,8 @@ impl<'a> Walker<'a> {
             input_mode_report_id: self.input_mode_report_id,
             selective_reporting_report_id: self.selective_reporting_report_id,
             latency_mode_report_id: self.latency_mode_report_id,
+            vendor_feature_report_ids: self.vendor_feature_report_ids.clone(),
+            standard_feature_report_ids: self.standard_feature_report_ids.clone(),
         };
         layout.validate()?;
         Ok(layout)
@@ -623,6 +753,183 @@ mod tests {
             0x01, 0x95, 0x01, 0x81, 0x02, 0x95, 0x07, 0x81, 0x03, 0xC0,
         ]);
         d
+    }
+
+    fn layout_with(vendor: &[u8], standard: &[u8]) -> Layout {
+        Layout {
+            report_id: 1,
+            contact_slots: 5,
+            bytes_per_contact: 6,
+            fingers_offset: 1,
+            fingers_bit_offset: 8,
+            contact_stride_bits: 48,
+            contact: ContactFields {
+                confidence: Some(BitField { offset: 0, size: 1 }),
+                tip: BitField { offset: 1, size: 1 },
+                id: BitField { offset: 8, size: 8 },
+                x: BitField { offset: 16, size: 16 },
+                y: BitField { offset: 32, size: 16 },
+            },
+            scan_time_offset: 31,
+            contact_count_offset: 33,
+            button_offset: 34,
+            button_bit: 0,
+            logical_x_max: 100,
+            logical_y_max: 100,
+            physical_x_max_mm: 10.0,
+            physical_y_max_mm: 10.0,
+            total_payload_bytes: 35,
+            input_mode_report_id: None,
+            selective_reporting_report_id: None,
+            latency_mode_report_id: None,
+            vendor_feature_report_ids: vendor.to_vec(),
+            standard_feature_report_ids: standard.to_vec(),
+        }
+    }
+
+    #[test]
+    fn undeclared_report_stays_probeable() {
+        // The RMK firmware answers 0x10 without declaring it; losing
+        // that would cost the heartbeat path.
+        let l = layout_with(&[], &[0x25, 0x22]);
+        assert!(!l.vendor_probe_would_collide(0x10));
+    }
+
+    #[test]
+    fn vendor_declared_report_is_probeable() {
+        let l = layout_with(&[0x10], &[0x25]);
+        assert!(!l.vendor_probe_would_collide(0x10));
+    }
+
+    #[test]
+    fn report_declared_on_a_standard_page_is_not_ours_to_write() {
+        let l = layout_with(&[], &[0x10, 0x25]);
+        assert!(l.vendor_probe_would_collide(0x10));
+    }
+
+    /// Real descriptor from a third-party PTP trackpad (vid 0x258a,
+    /// pid 0x0010), captured with `--dump-descriptors`.
+    ///
+    /// Kept verbatim because a descriptor is the entire compatibility
+    /// contract: this pad can be regression-tested forever without
+    /// anyone owning one. Notably it uses a 5-byte contact stride and
+    /// report id 0x1e, neither of which matches the reference firmware.
+    const THIRD_PARTY_PTP_DESCRIPTOR: &str = concat!(
+        "0601000980a10185022501150075010a81000a82000a83009503810695058101",
+        "c0060c000901a10185032501150075010ab5000ab6000a6f000a70000ae2000a",
+        "30000ae9000aea00950881020a83010a94010aae010a88010a8a010a92010ab7",
+        "000acd00950881020a21020a40000a24020a25020a26020a27020a2a020a9601",
+        "950881020aa8020a84010ab1010a82010aae010a30000a07030a010395088102",
+        "c00600ff0901a1018505150026ff001901290575089504b102c00600ff0901a1",
+        "018506150025ff1a01002a0f047508960f04b102c0050d0905a101851e050d09",
+        "22a102150025010947094295027501810295017506253f095181020501150026",
+        "70087510550e651309303500463a039501810246d50126400609318102c0050d",
+        "0922a102150025010947094295027501810295017506253f0951810205011500",
+        "2670087510550e651309303500463a039501810246d50126400609318102c005",
+        "0d0922a102150025010947094295027501810295017506253f09518102050115",
+        "002670087510550e651309303500463a039501810246d50126400609318102c0",
+        "050d0922a102150025010947094295027501810295017506253f095181020501",
+        "15002670087510550e651309303500463a039501810246d50126400609318102",
+        "c0050d0922a102150025010947094295027501810295017506253f0951810205",
+        "0115002670087510550e651309303500463a039501810246d501264006093181",
+        "02c0050d550c66011047ffff000027ffff000075109501095681020954257f95",
+        "01750881020509090109020903250175019503810295058103050d851f095509",
+        "5975049502250fb102852309607501950115002501b1029507b10385200600ff",
+        "09c5150026ff007508960001b102c0050d090ea10185250922a1020952150025",
+        "0a75089501b102c00922a100852209570958750195022501b1029506b103c0c0",
+        "0600ff0901a1018512150026ff001901290775089507b102c006c0ff0901a101",
+        "8513150026ff001a0100292175089521b102c0",
+    );
+
+    fn from_hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    #[test]
+    fn parses_a_real_third_party_ptp_descriptor() {
+        let desc = from_hex(THIRD_PARTY_PTP_DESCRIPTOR);
+        assert_eq!(desc.len(), 755);
+        let layout = parse(&desc).expect("parse");
+
+        assert_eq!(layout.report_id, 0x1e);
+        assert_eq!(layout.contact_slots, 5);
+        assert_eq!(layout.bytes_per_contact, 5);
+        assert_eq!(layout.total_payload_bytes, 30);
+        assert_eq!(layout.logical_x_max, 2160);
+        assert_eq!(layout.logical_y_max, 1600);
+        assert!((layout.physical_x_max_mm - 209.8).abs() < 0.1);
+        assert!((layout.physical_y_max_mm - 119.1).abs() < 0.1);
+
+        // Discovered, not assumed: this device's Input Mode is 0x25.
+        assert_eq!(layout.input_mode_report_id, Some(0x25));
+        assert_eq!(layout.selective_reporting_report_id, Some(0x22));
+        assert_eq!(layout.latency_mode_report_id, Some(0x23));
+
+        // It declares no report 0x10 at all, so the vendor probe stays
+        // available — the case that must not regress for RMK firmware.
+        assert!(!layout.vendor_probe_would_collide(0x10));
+    }
+
+    /// A synthetic pad that reports Width and Height per contact, on top
+    /// of the required fields — both optional in the PTP spec and common
+    /// on real hardware.
+    ///
+    /// Its 10-byte stride was rejected outright until the layout was
+    /// described by per-field positions: `validate` allowed only 5 or 6
+    /// bytes per contact, so any device carrying extra per-contact data
+    /// was refused despite being perfectly parseable.
+    const CONTACT_WITH_WIDTH_HEIGHT: &str = concat!(
+        "050d0905a10185010922a1021500250175019502094709428102950681037508",
+        "9501267f000951810205012670087510550e651309303500463a039501810246",
+        "d50126400609318102050d5500650026ff0f0948810209498102c00956751095",
+        "0127ffff0000810209547508257f810205090901750195012501810295078103",
+        "c0",
+    );
+
+    #[test]
+    fn accepts_contacts_carrying_extra_fields() {
+        let desc = from_hex(CONTACT_WITH_WIDTH_HEIGHT);
+        let layout = parse(&desc).expect("a 10-byte contact stride must parse");
+
+        assert_eq!(layout.bytes_per_contact, 10);
+        assert_eq!(layout.contact_stride_bits, 80);
+
+        // The fields we need are found by usage, wherever they sit; the
+        // Width and Height between them are simply skipped.
+        assert_eq!(layout.contact.confidence, Some(BitField { offset: 0, size: 1 }));
+        assert_eq!(layout.contact.tip, BitField { offset: 1, size: 1 });
+        assert_eq!(layout.contact.id, BitField { offset: 8, size: 8 });
+        assert_eq!(layout.contact.x, BitField { offset: 16, size: 16 });
+        assert_eq!(layout.contact.y, BitField { offset: 32, size: 16 });
+    }
+
+    #[test]
+    fn decodes_a_contact_with_extra_fields() {
+        let desc = from_hex(CONTACT_WITH_WIDTH_HEIGHT);
+        let layout = parse(&desc).expect("parse");
+
+        // report id, flags, id, X, Y, width, height, scan time, count, button
+        let mut report = vec![0u8; layout.total_payload_bytes];
+        report[0] = 0x01;
+        report[1] = 0b0000_0011; // confidence + tip
+        report[2] = 7; // contact id
+        report[3..5].copy_from_slice(&1080u16.to_le_bytes()); // X
+        report[5..7].copy_from_slice(&800u16.to_le_bytes()); // Y
+        report[7..9].copy_from_slice(&1234u16.to_le_bytes()); // width, ignored
+        report[9..11].copy_from_slice(&5678u16.to_le_bytes()); // height, ignored
+        report[layout.contact_count_offset] = 1;
+
+        let frame = crate::report::decode(&layout, &report).expect("decode");
+        assert_eq!(frame.contacts.len(), 1);
+        let c = &frame.contacts[0];
+        assert_eq!(c.id, 7);
+        assert!(c.tip && c.confidence);
+        // Half the pad across, in millimetres.
+        assert!((c.x - 104.9).abs() < 0.5, "x was {}", c.x);
+        assert!((c.y - 59.5).abs() < 0.5, "y was {}", c.y);
     }
 
     #[test]

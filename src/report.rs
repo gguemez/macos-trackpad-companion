@@ -4,7 +4,7 @@
 //! ([`Layout::mm_per_logical_px_x`] / `_y`) so downstream gesture code
 //! works in physical units and is firmware-agnostic.
 
-use crate::descriptor::Layout;
+use crate::descriptor::{BitField, ContactFields, Layout};
 
 #[derive(Clone, Copy, Debug)]
 #[allow(dead_code)]
@@ -26,6 +26,26 @@ pub struct Frame {
     pub button: bool,
 }
 
+/// Extract `count` bits starting at `bit_offset`, LSB-first within each
+/// byte and least-significant byte first — the packing HID uses.
+///
+/// Reproduces the previous hand-written 5- and 6-byte decoders exactly;
+/// those layouts are just two of the shapes this handles.
+fn read_bits(buf: &[u8], bit_offset: usize, count: usize) -> u32 {
+    let mut value: u32 = 0;
+    for i in 0..count.min(32) {
+        let bit = bit_offset + i;
+        let byte = match buf.get(bit / 8) {
+            Some(b) => *b,
+            None => break,
+        };
+        if (byte >> (bit % 8)) & 1 != 0 {
+            value |= 1 << i;
+        }
+    }
+    value
+}
+
 pub fn decode(layout: &Layout, report: &[u8]) -> Option<Frame> {
     if report.len() < layout.total_payload_bytes {
         return None;
@@ -40,41 +60,27 @@ pub fn decode(layout: &Layout, report: &[u8]) -> Option<Frame> {
     let mm_per_px_x = layout.mm_per_logical_px_x();
     let mm_per_px_y = layout.mm_per_logical_px_y();
 
+    let fields = &layout.contact;
     let mut contacts = Vec::with_capacity(n);
     for i in 0..n {
-        let off = layout.fingers_offset + i * layout.bytes_per_contact;
-        if off + layout.bytes_per_contact > report.len() {
+        let base = layout.fingers_bit_offset + i * layout.contact_stride_bits;
+        if (base + layout.contact_stride_bits).div_ceil(8) > report.len() {
             break;
         }
 
-        let flags = report[off];
-
-        let (id, x, y) = match layout.bytes_per_contact {
-            5 => {
-                // Packed PTP layout:
-                // bit 0 = confidence
-                // bit 1 = tip switch
-                // bits 2..7 = 6-bit contact ID
-                // followed by little-endian X and Y.
-                let id = (flags >> 2) & 0x3f;
-                let x = u16::from_le_bytes([report[off + 1], report[off + 2]]) as i32;
-                let y = u16::from_le_bytes([report[off + 3], report[off + 4]]) as i32;
-                (id, x, y)
-            }
-
-            6 => {
-                // Existing companion layout.
-                let id = report[off + 1];
-                let x = u16::from_le_bytes([report[off + 2], report[off + 3]]) as i32;
-                let y = u16::from_le_bytes([report[off + 4], report[off + 5]]) as i32;
-                (id, x, y)
-            }
-
-            _ => unreachable!(),
+        // Read each field where the descriptor said it is, rather than
+        // assuming a stride. Anything the device reports in between —
+        // Width, Height, Pressure, Azimuth — is simply skipped.
+        let id = read_bits(report, base + fields.id.offset, fields.id.size) as u8;
+        let x = read_bits(report, base + fields.x.offset, fields.x.size) as i32;
+        let y = read_bits(report, base + fields.y.offset, fields.y.size) as i32;
+        let tip = read_bits(report, base + fields.tip.offset, fields.tip.size) != 0;
+        // Confidence is optional in the PTP spec; absent means the
+        // device never reports a contact it doubts.
+        let confidence = match fields.confidence {
+            Some(f) => read_bits(report, base + f.offset, f.size) != 0,
+            None => true,
         };
-
-        let confidence = (flags & 0x01) != 0;
-        let tip = (flags & 0x02) != 0;
 
         contacts.push(Contact {
             id,
@@ -108,6 +114,15 @@ mod tests {
             contact_slots: 5,
             bytes_per_contact: 6,
             fingers_offset: 1,
+            fingers_bit_offset: 8,
+            contact_stride_bits: 48,
+            contact: ContactFields {
+                confidence: Some(BitField { offset: 0, size: 1 }),
+                tip: BitField { offset: 1, size: 1 },
+                id: BitField { offset: 8, size: 8 },
+                x: BitField { offset: 16, size: 16 },
+                y: BitField { offset: 32, size: 16 },
+            },
             scan_time_offset: 31,
             contact_count_offset: 33,
             button_offset: 34,
@@ -120,6 +135,8 @@ mod tests {
             input_mode_report_id: None,
             selective_reporting_report_id: None,
             latency_mode_report_id: None,
+            vendor_feature_report_ids: Vec::new(),
+            standard_feature_report_ids: Vec::new(),
         }
     }
 
@@ -168,6 +185,15 @@ mod tests {
             contact_slots: 5,
             bytes_per_contact: 5,
             fingers_offset: 1,
+            fingers_bit_offset: 8,
+            contact_stride_bits: 40,
+            contact: ContactFields {
+                confidence: Some(BitField { offset: 0, size: 1 }),
+                tip: BitField { offset: 1, size: 1 },
+                id: BitField { offset: 2, size: 6 },
+                x: BitField { offset: 8, size: 16 },
+                y: BitField { offset: 24, size: 16 },
+            },
             scan_time_offset: 26,
             contact_count_offset: 28,
             button_offset: 29,
@@ -181,6 +207,8 @@ mod tests {
             input_mode_report_id: Some(0x25),
             selective_reporting_report_id: Some(0x22),
             latency_mode_report_id: Some(0x23),
+            vendor_feature_report_ids: Vec::new(),
+            standard_feature_report_ids: Vec::new(),
         };
 
         let mut buf = vec![0u8; 30];

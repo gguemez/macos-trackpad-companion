@@ -71,6 +71,40 @@ CLI flags (intentionally tiny — everything else lives in the config file):
 | --- | --- | --- |
 | `--config PATH` | XDG default | TOML config path. See **Configuration** below. |
 | `-v`, `-vv` | info | Increase log level. Overrides `[log].level` from the file. |
+| `--dump-descriptors` | off | Print every matching device's HID report descriptor and exit. Read-only: no mode switching, no instance lock, output on stderr — safe to run while the companion is running. |
+
+## The menu bar
+
+The companion's only UI is a status-bar icon.
+
+| Item | What it does |
+| --- | --- |
+| *(status line)* | Device state — waiting, connected, paused, or what's missing. |
+| **Pause / Resume** | Suspends synthesis without stopping the daemon. The device stays acquired, so it doesn't go dormant the way it does when nothing is driving it, and resuming is instant. |
+| **Copy Diagnostics** | Versions, both permission states, the pointer policy, the attached device's geometry, and the config and log paths — onto the clipboard. |
+| **Start at Login** | Installs a LaunchAgent (see below). |
+| **Reveal Log…** | Opens Finder on the log file, when `[log].file` is set. |
+| **Setup…** | Reopens the permissions window. |
+| **Settings…** (⌘,) | Sliders and toggles that write the config file. |
+| **Quit** (⌘Q) | Warns first if it would leave no working pointer. |
+
+Settings written from that window go through the same file the daemon
+watches, so the file stays the single source of truth and the window
+can't drift from it. Comments and formatting are preserved. A gesture
+whose `enable` holds an app list shows a disabled checkbox — a checkbox
+can't express `{ only = [...] }`, and a toggle shouldn't silently
+discard one.
+
+## Start at login
+
+**Start at Login** writes `~/Library/LaunchAgents/net.guemez.trackpad-companion.plist`
+and loads it. `KeepAlive` is `{ SuccessfulExit = false }` on purpose:
+launchd restarts the companion after a *crash*, but leaves a clean quit
+alone — quitting from the menu should stay quit until the next login.
+
+That matters more than convenience. A pad on the spec Input Mode path
+stops responding the moment nothing is driving it, so an unattended
+crash would otherwise leave a dead trackpad until someone noticed.
 
 ## Configuration
 
@@ -164,12 +198,28 @@ permissions. Without them the companion no longer exits — it keeps
 running, reports the problem in its menu-bar menu, and retries in the
 background (see **Caveats**).
 
+A setup window opens automatically when either grant is missing, shows
+live state, and links straight to the right System Settings pane.
+Reopen it later from **Setup…** in the menu.
+
 - **Input Monitoring** — required to read raw HID input reports from
   the trackpad. macOS surfaces error `0xE00002C5` from `IOHIDManagerOpen`
   if this isn't granted.
+
+  In practice macOS often declines to *show* the prompt for a background
+  agent and records a refusal instead, leaving the app absent from the
+  Input Monitoring list — so "Open Settings" lands on a pane with
+  nothing to toggle. Add the app by hand with the `+` button; the grant
+  then sticks. `TODO(permissions)` in `permissions.rs` records what has
+  been tried.
 - **Accessibility** — required to post synthetic CGEvents (cursor moves,
   clicks, scroll, gestures). Granted via System Settings → Privacy &
   Security → Accessibility.
+
+  This is the dangerous one to be missing: without it `CGEventPost`
+  still *succeeds* and macOS discards the events, so the gesture engine
+  runs normally and nothing moves on screen. The companion checks the
+  grant explicitly and says so at startup rather than failing silently.
 
 ## Reading the logs
 
@@ -231,9 +281,19 @@ coordinate scale. To remain compatible:
   - Contact Count — Digitizer 0x54 — 8 bits
   - Button 1 — Button 0x01 — 1 bit (then 7 bits padding)
 
-This produces a **6-byte-per-contact** layout. The companion's
-`Layout::validate` rejects anything else; if you change the per-contact
-field set, update both ends.
+The companion reads each field at the bit offset the descriptor gives
+it, so the per-contact stride is whatever you declare. Optional extras
+(Width, Height, Pressure, Azimuth) are skipped rather than rejected —
+the reference firmware above packs 6 bytes per contact, while the
+third-party pad in `descriptor.rs`'s tests uses 5, and both work
+unchanged. `Layout::validate` only checks that the required fields fit
+inside the stride.
+
+If a device still doesn't work, run `companion --dump-descriptors`: it
+prints every matching device's report descriptor as hex and changes
+nothing (no mode switching, and it doesn't need the instance lock, so it
+runs alongside the daemon). That hex is enough to reproduce the parse
+offline and turn the device into a test case.
 
 The Microsoft "PTPHQA" feature report is needed for Windows certification
 but ignored by macOS, so it's optional from the companion's perspective.
@@ -267,8 +327,16 @@ on separate interfaces.
 | `output.rs` | macOS event synthesis. Public CGEvent for cursor/click/scroll, private CGEvent type/field IDs for pinch/rotate/swipe. |
 | `hid.rs` | IOHIDManager FFI: device matching, descriptor + input-report subscription, run-loop pumping. |
 | `app_kit.rs` | Shared `NSApp` bring-up (accessory policy) and the `[NSApp run]` event loop, plus the cross-thread stop. |
-| `status_item.rs` | Menu-bar status item: template icon, device-state line, Quit. |
+| `status_item.rs` | Menu-bar status item and menu, including the guard that refuses to quit silently when it would leave no pointer. |
+| `permissions.rs` | Input Monitoring and Accessibility state via the real APIs, plus System Settings deep links. |
+| `onboarding.rs` | First-run setup window; opens automatically when either grant is missing. |
+| `settings.rs` | Settings window. Writes the config file; never touches the engine directly. |
 | `config.rs` | TOML config loading and defaults. Unknown keys are rejected. |
+| `config_watch.rs` | Watches the config file and re-applies it live, keeping the previous settings if a file fails to parse. |
+| `config_edit.rs` | Format-preserving writes (`toml_edit`), saved atomically, so the UI can't delete your comments. |
+| `launch_agent.rs` | Start-at-login LaunchAgent: install, remove, and the crash-only `KeepAlive` policy. |
+| `pause.rs` | Suspends synthesis, settling the engine first so nothing is left mid-gesture. |
+| `system_prefs.rs` | Reads whether macOS is set to ignore the built-in trackpad while an external pointer is attached. |
 | `app_context.rs` | Resolves the bundle ID of the app under the cursor, for the per-gesture `only` / `except` filters. |
 | `overlay.rs` | Optional click-through `NSPanel` HUD that flashes the gesture name at lock time. |
 | `scan_clock.rs` | Maps the device's wrapping 100 µs scan-time counter onto host `CLOCK_UPTIME_RAW` timestamps. |
