@@ -12,15 +12,39 @@ device-dependent, and only the fourth is genuinely universal:
 
 | Family | Constants | Status |
 | --- | --- | --- |
-| Size-scaled | `SWIPE_PROGRESS_REF_MM` 50, `SWIPE_AXIS_LOCK_MM` 3, `PARTIAL_LIFT_REJOIN_DRIFT_MM` 10 | **Should come from the descriptor — the data is already parsed and ignored** |
-| Rate-dependent | `DEFAULT_FRAME_DT` 8 ms, `SCROLL_VELOCITY_ALPHA` 0.4, `PARTIAL_LIFT_REJOIN_WINDOW` 80 ms | Measurable from scan time; `scan_clock` already derives real timing |
+| Size-scaled | `SWIPE_PROGRESS_REF_MM` 50 | **Done** — now derived from the pad, see below. `SWIPE_AXIS_LOCK_MM` 3 and `PARTIAL_LIFT_REJOIN_DRIFT_MM` 10 are finger-scale, not pad-scale, and left alone |
+| Rate-dependent | `DEFAULT_FRAME_DT` 8 ms, `SCROLL_VELOCITY_ALPHA` 0.4, `PARTIAL_LIFT_REJOIN_WINDOW` 80 ms | Smaller than first assessed: `DEFAULT_FRAME_DT` only covers the first frame of a gesture, every later frame uses the measured delta. `SCROLL_VELOCITY_ALPHA` is the real one — a fixed EMA weight means a different smoothing time constant at 60 Hz than at 125 Hz |
 | Noise-scaled | `MOTION_DEAD_ZONE_MM` 0.04, `PAN_LOCK_MM` 0.4, `ANCHORED_FINGER_FLOOR_MM` 0.3, `PHYSICAL_DRAG_SELECT_MM` 0.3, `TAP_MAX_MOVE_MM` 1.0 | Needs new measurement (resting-contact variance) |
 | Human | `TAP_MAX_DURATION` 150 ms, `PINCH_ROTATE_HYSTERESIS`, `PINCH_LOCK_RATIO`, `ROTATE_LOCK_RAD` | Correctly device-independent |
 
-The first row is the clearest defect. `SWIPE_PROGRESS_REF_MM = 50` means
-"a full swipe is 50 mm" — a quarter of the surface on a 209 mm pad, most
-of it on the 65 mm reference. Physical dimensions are parsed from the
-descriptor and then unused by every threshold.
+`SWIPE_PROGRESS_REF_MM` is now derived: a full swipe is
+`SWIPE_TRAVEL_FRACTION` (0.6) of the pad's span along that axis, clamped
+to 25–120 mm, falling back to the old fixed 50 mm when no device has
+reported its size. The fraction is a judgement call and the one number
+to change if swipes feel wrong.
+
+Unresolved: which device the original constants were tuned against. 50 mm
+suits a pad about 50 mm tall, which points at the reference firmware
+(65 x 40 mm), but that is an inference from a code comment rather than
+something recorded.
+
+Measured afterwards on the 209 x 119 mm pad, and worth knowing before
+tuning this further: **macOS commits a swipe on velocity, not on
+progress reaching 1.0.** Across a dozen swipes at 150-300 mm/s, every
+one was acted on by macOS and not one reported progress above 0.81 —
+including the deliberately long ones, and including under the old fixed
+50 mm reference.
+
+So this constant does not decide whether a swipe fires. It decides how
+far the Spaces / Mission Control animation tracks the fingers before
+committing. Under the old 50 mm value on a 209 mm pad, a 46 mm flick
+drove the animation to 92% — the animation outran the hand. Scaling to
+the pad makes the tracking proportional, which is the actual
+improvement; firing behaviour was unchanged in testing.
+
+A consequence: velocity-driven completion means short fast flicks fire
+regardless of distance. Whether that produces accidental triggers in
+normal use is untested.
 
 Suggested order: derive the size- and rate-scaled families first
 (deterministic, unit-testable against the two descriptors already in the

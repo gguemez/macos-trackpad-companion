@@ -276,9 +276,23 @@ fn run<O: output::Output + 'static>(
     });
 
     let frame_state = Rc::clone(&state);
+    let mut known_geometry: Option<(f64, f64)> = None;
     manager.run(move |frame, ts| {
         if pause::is_paused() {
             return;
+        }
+        // Cheap per-frame check rather than a callback from the HID
+        // layer: it keeps the gesture engine free of any dependency on
+        // how devices are discovered.
+        let geometry = hid::device_geometry();
+        if geometry != known_geometry {
+            known_geometry = geometry;
+            frame_state
+                .borrow_mut()
+                .set_pad_geometry(geometry.map(|(w, h)| gesture::PadGeometry {
+                    width_mm: w,
+                    height_mm: h,
+                }));
         }
         frame_state.borrow_mut().on_frame_at(frame, ts)
     })

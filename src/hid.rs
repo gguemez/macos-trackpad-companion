@@ -182,6 +182,22 @@ pub fn device_summary() -> Option<String> {
     DEVICE_SUMMARY.with(|d| d.borrow().clone())
 }
 
+thread_local! {
+    /// Physical pad size in millimetres, from the descriptor.
+    ///
+    /// Published because thresholds expressed as absolute distances are
+    /// only meaningful relative to the surface they're measured on, and
+    /// the gesture engine has no other way to learn it without being
+    /// coupled to this module.
+    static DEVICE_GEOMETRY: std::cell::RefCell<Option<(f64, f64)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Width and height of the attached pad in millimetres.
+pub fn device_geometry() -> Option<(f64, f64)> {
+    DEVICE_GEOMETRY.with(|g| *g.borrow())
+}
+
 /// Whether a built-in (internal) HID device has been seen. Used to
 /// decide whether there is any fallback pointer at all — on a desktop
 /// Mac there isn't, so quitting strands the user regardless of how
@@ -730,6 +746,9 @@ unsafe extern "C" fn on_device_matched(
 
     crate::status_item::set_status(&format!("Connected — {product}"));
 
+    DEVICE_GEOMETRY.with(|g| {
+        *g.borrow_mut() = Some((layout.physical_x_max_mm, layout.physical_y_max_mm))
+    });
     DEVICE_SUMMARY.with(|d| {
         *d.borrow_mut() = Some(format!(
             "{product} vid={:#06x} pid={:#06x}, {} contacts, {:.1}x{:.1} mm, \
@@ -951,6 +970,7 @@ unsafe extern "C" fn on_device_removed(
     log::info!("device removed");
     if bridge.devices.is_empty() {
         DEVICE_SUMMARY.with(|d| *d.borrow_mut() = None);
+        DEVICE_GEOMETRY.with(|g| *g.borrow_mut() = None);
         crate::status_item::set_status("Waiting for device…");
     }
 }

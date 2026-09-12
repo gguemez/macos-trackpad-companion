@@ -76,6 +76,39 @@ const SWIPE_AXIS_LOCK_MM: f64 = 3.0;
 /// trigger. Tunable.
 const SWIPE_PROGRESS_REF_MM: f64 = 50.0;
 
+/// Fraction of the pad's span, along the swiped axis, that counts as a
+/// full swipe once the device's physical size is known.
+///
+/// `SWIPE_PROGRESS_REF_MM` above is a fixed 50 mm chosen for a pad about
+/// that tall. Applied unchanged to a 209 mm-wide pad it means a swipe
+/// completes after a quarter of the surface, which is not what "a full
+/// swipe" should mean on any pad — the threshold has to be relative to
+/// the surface it is measured on.
+const SWIPE_TRAVEL_FRACTION: f64 = 0.6;
+
+/// Bounds on the derived value, so an odd descriptor can't produce a
+/// swipe that is impossible to complete or trivially easy to trigger.
+const SWIPE_PROGRESS_MIN_MM: f64 = 25.0;
+const SWIPE_PROGRESS_MAX_MM: f64 = 120.0;
+
+/// Pad dimensions in millimetres, once a device is attached.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PadGeometry {
+    pub width_mm: f64,
+    pub height_mm: f64,
+}
+
+impl PadGeometry {
+    /// Travel that counts as a complete swipe along `axis`.
+    fn swipe_progress_ref_mm(&self, axis: crate::output::SwipeAxis) -> f64 {
+        let span = match axis {
+            crate::output::SwipeAxis::Horizontal => self.width_mm,
+            crate::output::SwipeAxis::Vertical => self.height_mm,
+        };
+        (span * SWIPE_TRAVEL_FRACTION).clamp(SWIPE_PROGRESS_MIN_MM, SWIPE_PROGRESS_MAX_MM)
+    }
+}
+
 /// Window after a 2F → 1F partial-lift transition during which a
 /// subsequent 1F → 2F re-arrival is treated as a continuation of the
 /// same 2F gesture (preserving lock state, tap-eligibility motion
@@ -378,6 +411,10 @@ pub struct State<O: Output> {
     /// curve runs on the right velocity when the value is finally
     /// emitted on the *next* frame.
     pending_motion: Option<(f64, f64, Duration)>,
+    /// Physical pad size, when a device has reported one. `None` keeps
+    /// the historical fixed thresholds, which is what the unit tests
+    /// exercise.
+    pad: Option<PadGeometry>,
     /// Cursor-acceleration curve parameters. Held by the gesture
     /// engine (not the platform output) so `Output::move_cursor_by`
     /// only sees integer pixel deltas — keeps the curve testable
@@ -441,6 +478,35 @@ pub struct State<O: Output> {
 }
 
 impl<O: Output> State<O> {
+    /// Tell the engine how big the pad is, so thresholds expressed as
+    /// absolute distances can be scaled to the surface.
+    pub fn set_pad_geometry(&mut self, pad: Option<PadGeometry>) {
+        if self.pad == pad {
+            return;
+        }
+        if let Some(p) = pad {
+            log::info!(
+                "pad geometry {:.1}x{:.1} mm — full swipe: {:.0} mm horizontal, {:.0} mm vertical \
+                 (was a fixed {:.0} mm)",
+                p.width_mm,
+                p.height_mm,
+                p.swipe_progress_ref_mm(crate::output::SwipeAxis::Horizontal),
+                p.swipe_progress_ref_mm(crate::output::SwipeAxis::Vertical),
+                SWIPE_PROGRESS_REF_MM,
+            );
+        }
+        self.pad = pad;
+    }
+
+    /// Travel that counts as a complete swipe, scaled to the pad when
+    /// its size is known.
+    fn swipe_ref_mm(&self, axis: crate::output::SwipeAxis) -> f64 {
+        match self.pad {
+            Some(pad) => pad.swipe_progress_ref_mm(axis),
+            None => SWIPE_PROGRESS_REF_MM,
+        }
+    }
+
     /// Swap the settings a config reload is allowed to change while
     /// the daemon runs. Deliberately does not touch in-flight gesture
     /// state: a reload mid-gesture adjusts the curve for subsequent
@@ -461,6 +527,7 @@ impl<O: Output> State<O> {
             two_baseline: None,
             multi_baseline: None,
             pending_motion: None,
+            pad: None,
             cursor_accel,
             cursor_carry_x_px: 0.0,
             cursor_carry_y_px: 0.0,
@@ -859,7 +926,7 @@ impl<O: Output> State<O> {
                         SwipeAxis::Horizontal => b.last_centroid.0 - b.initial_centroid.0,
                         SwipeAxis::Vertical => b.last_centroid.1 - b.initial_centroid.1,
                     };
-                    let progress = cumulative_mm / SWIPE_PROGRESS_REF_MM;
+                    let progress = cumulative_mm / self.swipe_ref_mm(axis);
                     let velocity = match axis {
                         SwipeAxis::Horizontal => b.velocity.0,
                         SwipeAxis::Vertical => b.velocity.1,
@@ -1753,9 +1820,10 @@ impl<O: Output> State<O> {
         base.last_centroid = (cx, cy);
         base.last_centroid_time = Some(now);
 
+        let swipe_ref = self.swipe_ref_mm(axis);
         let signed_progress = match axis {
-            SwipeAxis::Horizontal => dx / SWIPE_PROGRESS_REF_MM,
-            SwipeAxis::Vertical => dy / SWIPE_PROGRESS_REF_MM,
+            SwipeAxis::Horizontal => dx / swipe_ref,
+            SwipeAxis::Vertical => dy / swipe_ref,
         };
         let phase = if base.began_posted {
             Phase::Changed
@@ -1918,6 +1986,39 @@ mod tests {
             exponent: 1.0,
             ref_mm_per_sec: 80.0,
         }
+    }
+
+    #[test]
+    fn swipe_reference_scales_with_the_pad() {
+        use crate::output::SwipeAxis;
+
+        // The reference firmware: 65 x 40 mm.
+        let small = PadGeometry { width_mm: 65.0, height_mm: 40.0 };
+        assert!((small.swipe_progress_ref_mm(SwipeAxis::Horizontal) - 39.0).abs() < 0.1);
+        // Below the floor, so clamped rather than becoming trivially easy.
+        assert_eq!(small.swipe_progress_ref_mm(SwipeAxis::Vertical), SWIPE_PROGRESS_MIN_MM);
+
+        // The third-party pad this was found on: 209.8 x 119.1 mm. The
+        // old fixed 50 mm meant a horizontal swipe completed after a
+        // quarter of the surface.
+        let large = PadGeometry { width_mm: 209.8, height_mm: 119.1 };
+        assert!((large.swipe_progress_ref_mm(SwipeAxis::Horizontal) - 120.0).abs() < 0.1);
+        assert!((large.swipe_progress_ref_mm(SwipeAxis::Vertical) - 71.5).abs() < 0.5);
+        assert!(
+            large.swipe_progress_ref_mm(SwipeAxis::Horizontal)
+                > small.swipe_progress_ref_mm(SwipeAxis::Horizontal),
+            "a bigger pad must ask for more travel"
+        );
+    }
+
+    #[test]
+    fn unknown_geometry_keeps_the_historical_threshold() {
+        let out = Recorder::default();
+        let state = State::new(&out, CursorAccel::default());
+        assert_eq!(
+            state.swipe_ref_mm(crate::output::SwipeAxis::Horizontal),
+            SWIPE_PROGRESS_REF_MM
+        );
     }
 
     fn frame(contacts: &[(u8, f64, f64)]) -> Frame {
