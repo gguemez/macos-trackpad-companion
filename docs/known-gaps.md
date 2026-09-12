@@ -13,9 +13,13 @@ device-dependent, and only the fourth is genuinely universal:
 | Family | Constants | Status |
 | --- | --- | --- |
 | Size-scaled | `SWIPE_PROGRESS_REF_MM` 50 | **Done** — now derived from the pad, see below. `SWIPE_AXIS_LOCK_MM` 3 and `PARTIAL_LIFT_REJOIN_DRIFT_MM` 10 are finger-scale, not pad-scale, and left alone |
-| Rate-dependent | `DEFAULT_FRAME_DT` 8 ms, `SCROLL_VELOCITY_ALPHA` 0.4, `PARTIAL_LIFT_REJOIN_WINDOW` 80 ms | Smaller than first assessed: `DEFAULT_FRAME_DT` only covers the first frame of a gesture, every later frame uses the measured delta. `SCROLL_VELOCITY_ALPHA` is the real one — a fixed EMA weight means a different smoothing time constant at 60 Hz than at 125 Hz |
+| Rate-dependent | `DEFAULT_FRAME_DT` 8 ms, `PARTIAL_LIFT_REJOIN_WINDOW` 80 ms | **Done** — the one that mattered was the scroll-velocity EMA weight, since a fixed weight means a different smoothing time constant at 60 Hz than at 125 Hz. It is now `SCROLL_VELOCITY_TAU_SECS`, a duration, with the per-frame weight derived from the measured `dt`. `DEFAULT_FRAME_DT` only covers the first frame of a gesture; every later frame uses the measured delta |
 | Noise-scaled | `MOTION_DEAD_ZONE_MM` 0.04, `PAN_LOCK_MM` 0.4, `ANCHORED_FINGER_FLOOR_MM` 0.3, `PHYSICAL_DRAG_SELECT_MM` 0.3, `TAP_MAX_MOVE_MM` 1.0 | Needs new measurement (resting-contact variance) |
+| Judgement | `PAN_BALANCE_MIN` 0.3, `PAN_ALIGNMENT_COS_MIN` 0.97, the 1.2 margin | Not device-dependent so much as a trade between two failure modes. Loosening one to admit more scrolls admits more anchored pinches, and with one device the damage is invisible — see the gesture scope's note below on why none of these is a setting |
 | Human | `TAP_MAX_DURATION` 150 ms, `PINCH_ROTATE_HYSTERESIS`, `PINCH_LOCK_RATIO`, `ROTATE_LOCK_RAD` | Correctly device-independent |
+
+The table is not exhaustive and never was; it groups the ones whose
+provenance is in question.
 
 `SWIPE_PROGRESS_REF_MM` is now derived: a full swipe is
 `SWIPE_TRAVEL_FRACTION` (0.6) of the pad's span along that axis, clamped
