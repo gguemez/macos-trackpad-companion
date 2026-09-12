@@ -4,7 +4,7 @@
 //! ([`Layout::mm_per_logical_px_x`] / `_y`) so downstream gesture code
 //! works in physical units and is firmware-agnostic.
 
-use crate::descriptor::{BitField, ContactFields, Layout};
+use crate::descriptor::Layout;
 
 #[derive(Clone, Copy, Debug)]
 #[allow(dead_code)]
@@ -107,6 +107,7 @@ pub fn decode(layout: &Layout, report: &[u8]) -> Option<Frame> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::descriptor::{BitField, ContactFields};
 
     fn fake_layout() -> Layout {
         Layout {

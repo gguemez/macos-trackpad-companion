@@ -345,6 +345,11 @@ on separate interfaces.
 | `main.rs` | CLI parsing, logging, wiring. |
 | `bin/gesture_tap.rs` | Separate `gesture-tap` binary: read-only event tap that dumps the gesture events macOS routes, for comparing against a real trackpad. |
 
+## Known gaps
+
+Open problems, unfinished work, and platform behaviour worth knowing
+about are collected in [docs/known-gaps.md](docs/known-gaps.md).
+
 ## Caveats
 
 - **Private CGEvent gesture types are reverse-engineered.** Pinch,

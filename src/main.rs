@@ -22,6 +22,7 @@ mod config;
 mod config_edit;
 mod config_watch;
 mod descriptor;
+mod diagnostics;
 mod gesture;
 mod hid;
 mod instance_lock;

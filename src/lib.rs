@@ -9,6 +9,7 @@ pub mod config;
 pub mod config_edit;
 pub mod config_watch;
 pub mod descriptor;
+pub mod diagnostics;
 pub mod gesture;
 pub mod hid;
 pub mod instance_lock;

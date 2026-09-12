@@ -32,8 +32,8 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{AnyThread, MainThreadMarker, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSBackingStoreType, NSButton, NSControlStateValueOff, NSControlStateValueOn, NSFont, NSSlider,
-    NSTextField, NSWindow, NSWindowStyleMask,
+    NSBackingStoreType, NSButton, NSControlStateValueOff, NSControlStateValueOn, NSFont,
+    NSPasteboard, NSPasteboardTypeString, NSSlider, NSTextField, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
@@ -42,7 +42,7 @@ use crate::config::{self, Config, GestureEnable};
 use crate::config_edit::ConfigFile;
 
 const WINDOW_W: f64 = 520.0;
-const WINDOW_H: f64 = 430.0;
+const WINDOW_H: f64 = 560.0;
 const POLL_SECS: f64 = 1.0;
 /// Quiet period after the last slider movement before the file is
 /// written. Long enough to coalesce a drag, short enough that letting
@@ -110,6 +110,7 @@ struct Window {
     swipe_h: Retained<NSButton>,
     swipe_v: Retained<NSButton>,
     overlay: Retained<NSButton>,
+    login: Retained<NSButton>,
     timer: Option<CFRunLoopTimer>,
     /// Pending debounced write, replaced on each slider movement.
     flush_timer: Option<CFRunLoopTimer>,
@@ -204,6 +205,64 @@ define_class!(
             with_window(|w| w.reset_to_defaults());
         }
 
+        #[unsafe(method(toggleLoginItem:))]
+        fn toggle_login_item(&self, _s: Option<&AnyObject>) {
+            with_window(|w| {
+                let enabling = !crate::launch_agent::is_enabled();
+                let result = if enabling {
+                    crate::launch_agent::enable()
+                } else {
+                    crate::launch_agent::disable()
+                };
+                match result {
+                    Ok(()) => set_checked(&w.login, enabling),
+                    Err(e) => {
+                        log::error!("start-at-login toggle failed: {e:#}");
+                        // Put the checkbox back where reality is.
+                        set_checked(&w.login, crate::launch_agent::is_enabled());
+                    }
+                }
+            });
+        }
+
+        #[unsafe(method(openPermissions:))]
+        fn open_permissions(&self, _s: Option<&AnyObject>) {
+            if let Some(mtm) = MainThreadMarker::new() {
+                crate::onboarding::show(mtm);
+            }
+        }
+
+        #[unsafe(method(copyDiagnostics:))]
+        fn copy_diagnostics(&self, _s: Option<&AnyObject>) {
+            let pb = NSPasteboard::generalPasteboard();
+            pb.clearContents();
+            let ok = unsafe {
+                pb.setString_forType(
+                    &NSString::from_str(&crate::diagnostics::text()),
+                    NSPasteboardTypeString,
+                )
+            };
+            if ok {
+                log::info!("diagnostics copied to the clipboard");
+            } else {
+                log::error!("failed to write diagnostics to the clipboard");
+            }
+        }
+
+        #[unsafe(method(revealLog:))]
+        fn reveal_log(&self, _s: Option<&AnyObject>) {
+            match crate::config_watch::log_file_path() {
+                Some(path) if path.exists() => {
+                    let _ = std::process::Command::new("/usr/bin/open")
+                        .arg("-R")
+                        .arg(&path)
+                        .spawn();
+                }
+                Some(path) => log::info!("no log file at {} yet", path.display()),
+                None => log::info!("logging to stderr; set [log].file to get a file"),
+            }
+        }
+
         #[unsafe(method(revealConfig:))]
         fn reveal_config(&self, _s: Option<&AnyObject>) {
             let Some(path) = config_path() else { return };
@@ -296,93 +355,104 @@ impl Window {
         let actions = Actions::new(mtm);
         let content = window.contentView().expect("NSWindow auto-creates a contentView");
 
-        let title = label(mtm, "Settings", 24.0, 388.0, 300.0, 22.0);
+        let title = label(mtm, "Settings", 24.0, 518.0, 300.0, 22.0);
         title.setFont(Some(&NSFont::boldSystemFontOfSize(15.0)));
         content.addSubview(&title);
         let blurb = label(
             mtm,
             "Saved to the config file and applied within a second.",
             24.0,
-            366.0,
+            496.0,
             472.0,
             18.0,
         );
         blurb.setFont(Some(&NSFont::systemFontOfSize(11.0)));
         content.addSubview(&blurb);
 
-        content.addSubview(&section(mtm, "Cursor", 334.0));
-        content.addSubview(&label(mtm, "Sensitivity", 24.0, 306.0, 120.0, 18.0));
+        content.addSubview(&section(mtm, "Cursor", 464.0));
+        content.addSubview(&label(mtm, "Sensitivity", 24.0, 436.0, 120.0, 18.0));
         let cursor_sensitivity = slider(
-            mtm, 25.0, CURSOR_MIN, CURSOR_MAX, &actions, sel!(cursorSensitivity:), 150.0, 302.0,
+            mtm, 25.0, CURSOR_MIN, CURSOR_MAX, &actions, sel!(cursorSensitivity:), 150.0, 432.0,
         );
         content.addSubview(&cursor_sensitivity);
-        let cursor_sensitivity_value = label(mtm, "", 400.0, 306.0, 90.0, 18.0);
+        let cursor_sensitivity_value = label(mtm, "", 400.0, 436.0, 90.0, 18.0);
         content.addSubview(&cursor_sensitivity_value);
 
-        content.addSubview(&label(mtm, "Acceleration", 24.0, 276.0, 120.0, 18.0));
+        content.addSubview(&label(mtm, "Acceleration", 24.0, 406.0, 120.0, 18.0));
         let cursor_exponent = slider(
-            mtm, 1.0, EXPONENT_MIN, EXPONENT_MAX, &actions, sel!(cursorExponent:), 150.0, 272.0,
+            mtm, 1.0, EXPONENT_MIN, EXPONENT_MAX, &actions, sel!(cursorExponent:), 150.0, 402.0,
         );
         content.addSubview(&cursor_exponent);
-        let cursor_exponent_value = label(mtm, "", 400.0, 276.0, 90.0, 18.0);
+        let cursor_exponent_value = label(mtm, "", 400.0, 406.0, 90.0, 18.0);
         content.addSubview(&cursor_exponent_value);
 
-        content.addSubview(&section(mtm, "Scroll", 242.0));
-        content.addSubview(&label(mtm, "Sensitivity", 24.0, 214.0, 120.0, 18.0));
+        content.addSubview(&section(mtm, "Scroll", 372.0));
+        content.addSubview(&label(mtm, "Sensitivity", 24.0, 344.0, 120.0, 18.0));
         let scroll_sensitivity = slider(
-            mtm, 20.0, SCROLL_MIN, SCROLL_MAX, &actions, sel!(scrollSensitivity:), 150.0, 210.0,
+            mtm, 20.0, SCROLL_MIN, SCROLL_MAX, &actions, sel!(scrollSensitivity:), 150.0, 340.0,
         );
         content.addSubview(&scroll_sensitivity);
-        let scroll_sensitivity_value = label(mtm, "", 400.0, 214.0, 90.0, 18.0);
+        let scroll_sensitivity_value = label(mtm, "", 400.0, 344.0, 90.0, 18.0);
         content.addSubview(&scroll_sensitivity_value);
 
-        let natural = checkbox(mtm, "Natural scrolling", &actions, sel!(naturalScroll:), 150.0, 184.0, 240.0);
+        let natural = checkbox(
+            mtm, "Natural scrolling", &actions, sel!(naturalScroll:), 150.0, 314.0, 240.0,
+        );
         content.addSubview(&natural);
 
-        content.addSubview(&section(mtm, "Gestures", 150.0));
-        let pinch = checkbox(mtm, "Pinch", &actions, sel!(togglePinch:), 24.0, 122.0, 220.0);
+        content.addSubview(&section(mtm, "Gestures", 280.0));
+        let pinch = checkbox(mtm, "Pinch", &actions, sel!(togglePinch:), 24.0, 252.0, 220.0);
         content.addSubview(&pinch);
-        let rotate = checkbox(mtm, "Rotate", &actions, sel!(toggleRotate:), 262.0, 122.0, 220.0);
+        let rotate = checkbox(mtm, "Rotate", &actions, sel!(toggleRotate:), 262.0, 252.0, 220.0);
         content.addSubview(&rotate);
-        let swipe_h = checkbox(mtm, "Swipe — horizontal", &actions, sel!(toggleSwipeH:), 24.0, 98.0, 220.0);
+        let swipe_h = checkbox(
+            mtm, "Swipe — horizontal", &actions, sel!(toggleSwipeH:), 24.0, 228.0, 220.0,
+        );
         content.addSubview(&swipe_h);
-        let swipe_v = checkbox(mtm, "Swipe — vertical", &actions, sel!(toggleSwipeV:), 262.0, 98.0, 220.0);
+        let swipe_v = checkbox(
+            mtm, "Swipe — vertical", &actions, sel!(toggleSwipeV:), 262.0, 228.0, 220.0,
+        );
         content.addSubview(&swipe_v);
-        let overlay = checkbox(mtm, "Show gesture overlay", &actions, sel!(toggleOverlay:), 24.0, 74.0, 300.0);
+        let overlay = checkbox(
+            mtm, "Show gesture overlay", &actions, sel!(toggleOverlay:), 24.0, 204.0, 300.0,
+        );
         content.addSubview(&overlay);
 
-        let reveal = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str("Reveal Config File…"),
-                Some(actions.as_ref() as &AnyObject),
-                Some(sel!(revealConfig:)),
-                mtm,
-            )
-        };
-        reveal.setFrame(NSRect::new(NSPoint::new(24.0, 22.0), NSSize::new(180.0, 28.0)));
-        content.addSubview(&reveal);
-
-        let reset = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str("Reset to Defaults"),
-                Some(actions.as_ref() as &AnyObject),
-                Some(sel!(resetDefaults:)),
-                mtm,
-            )
-        };
-        reset.setFrame(NSRect::new(NSPoint::new(216.0, 22.0), NSSize::new(170.0, 28.0)));
-        content.addSubview(&reset);
-
-        let footnote = label(
+        content.addSubview(&section(mtm, "General", 170.0));
+        let login = checkbox(
+            mtm, "Start at login", &actions, sel!(toggleLoginItem:), 24.0, 142.0, 300.0,
+        );
+        content.addSubview(&login);
+        let login_note = label(
             mtm,
-            "Reset restores what's shown here; app lists are left alone.",
-            24.0,
-            52.0,
-            472.0,
+            "Restarts the companion after a crash, not after you quit.",
+            44.0,
+            122.0,
+            452.0,
             16.0,
         );
-        footnote.setFont(Some(&NSFont::systemFontOfSize(10.0)));
-        content.addSubview(&footnote);
+        login_note.setFont(Some(&NSFont::systemFontOfSize(10.0)));
+        content.addSubview(&login_note);
+
+        content.addSubview(&section(mtm, "Troubleshooting", 88.0));
+        let perms_btn = push(
+            mtm, "Permissions…", &actions, sel!(openPermissions:), 24.0, 56.0, 140.0,
+        );
+        content.addSubview(&perms_btn);
+        let diag_btn = push(
+            mtm, "Copy Diagnostics", &actions, sel!(copyDiagnostics:), 172.0, 56.0, 160.0,
+        );
+        content.addSubview(&diag_btn);
+        let log_btn = push(mtm, "Reveal Log…", &actions, sel!(revealLog:), 340.0, 56.0, 140.0);
+        content.addSubview(&log_btn);
+        let reveal = push(
+            mtm, "Reveal Config File…", &actions, sel!(revealConfig:), 24.0, 20.0, 180.0,
+        );
+        content.addSubview(&reveal);
+        let reset = push(
+            mtm, "Reset to Defaults", &actions, sel!(resetDefaults:), 212.0, 20.0, 170.0,
+        );
+        content.addSubview(&reset);
 
         Self {
             window,
@@ -398,6 +468,7 @@ impl Window {
             swipe_h,
             swipe_v,
             overlay,
+            login,
             timer: None,
             flush_timer: None,
             _actions: actions,
@@ -444,6 +515,8 @@ impl Window {
         self.scroll_sensitivity_value.setStringValue(&fmt(cfg.scroll.sensitivity));
         set_checked(&self.natural, cfg.scroll.natural);
         set_checked(&self.overlay, cfg.overlay.enable);
+        // Not a config value — read the actual agent state each time.
+        set_checked(&self.login, crate::launch_agent::is_enabled());
 
         apply_policy(&self.pinch, "Pinch", &cfg.gestures.pinch.enable);
         apply_policy(&self.rotate, "Rotate", &cfg.gestures.rotate.enable);
@@ -636,6 +709,27 @@ fn slider(
     };
     s.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(240.0, 24.0)));
     s
+}
+
+fn push(
+    mtm: MainThreadMarker,
+    title: &str,
+    target: &Retained<Actions>,
+    action: objc2::runtime::Sel,
+    x: f64,
+    y: f64,
+    w: f64,
+) -> Retained<NSButton> {
+    let b = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            &NSString::from_str(title),
+            Some(target.as_ref() as &AnyObject),
+            Some(action),
+            mtm,
+        )
+    };
+    b.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(w, 28.0)));
+    b
 }
 
 fn checkbox(

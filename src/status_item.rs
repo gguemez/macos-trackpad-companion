@@ -21,8 +21,7 @@ use objc2::runtime::{AnyObject, NSObject};
 use objc2::{AnyThread, MainThreadMarker, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSAlertThirdButtonReturn,
-    NSControlStateValueOff, NSControlStateValueOn, NSImage, NSMenu, NSMenuItem, NSPasteboard,
-    NSPasteboardTypeString, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+    NSImage, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
 };
 use objc2_foundation::{NSData, NSSize, NSString};
 
@@ -61,14 +60,6 @@ define_class!(
     struct MenuTarget;
 
     impl MenuTarget {
-        #[unsafe(method(openSetup:))]
-        fn open_setup(&self, _sender: Option<&AnyObject>) {
-            // Menu actions always arrive on the main thread.
-            if let Some(mtm) = MainThreadMarker::new() {
-                crate::onboarding::show(mtm);
-            }
-        }
-
         #[unsafe(method(togglePause:))]
         fn toggle_pause(&self, sender: Option<&AnyObject>) {
             // Pausing has the same consequence as quitting for a pad
@@ -90,55 +81,6 @@ define_class!(
                 }));
             }
             set_status(if paused { "Paused" } else { "Running" });
-        }
-
-        #[unsafe(method(copyDiagnostics:))]
-        fn copy_diagnostics(&self, _sender: Option<&AnyObject>) {
-            let text = diagnostics();
-            let pb = NSPasteboard::generalPasteboard();
-            pb.clearContents();
-            let ok = unsafe {
-                pb.setString_forType(&NSString::from_str(&text), NSPasteboardTypeString)
-            };
-            if ok {
-                log::info!("diagnostics copied to the clipboard");
-                set_status("Diagnostics copied");
-            } else {
-                log::error!("failed to write diagnostics to the clipboard");
-            }
-        }
-
-        #[unsafe(method(toggleLoginItem:))]
-        fn toggle_login_item(&self, sender: Option<&AnyObject>) {
-            let enabling = !crate::launch_agent::is_enabled();
-            let result = if enabling {
-                crate::launch_agent::enable()
-            } else {
-                crate::launch_agent::disable()
-            };
-            match result {
-                Ok(()) => {
-                    // Reflect the new state on the item that was clicked.
-                    if let Some(item) = sender.and_then(|s| s.downcast_ref::<NSMenuItem>()) {
-                        set_check(item, enabling);
-                    }
-                }
-                Err(e) => log::error!("start-at-login toggle failed: {e:#}"),
-            }
-        }
-
-        #[unsafe(method(openLog:))]
-        fn open_log(&self, _sender: Option<&AnyObject>) {
-            match crate::config_watch::log_file_path() {
-                Some(path) if path.exists() => {
-                    let _ = std::process::Command::new("/usr/bin/open")
-                        .arg("-R")
-                        .arg(&path)
-                        .spawn();
-                }
-                Some(path) => log::info!("no log file at {} yet", path.display()),
-                None => log::info!("logging to stderr; set [log].file to get a file"),
-            }
         }
 
         #[unsafe(method(openSettings:))]
@@ -175,13 +117,6 @@ define_class!(
     }
 );
 
-fn set_check(item: &NSMenuItem, on: bool) {
-    item.setState(if on {
-        NSControlStateValueOn
-    } else {
-        NSControlStateValueOff
-    });
-}
 
 /// Whether stopping now would leave the machine with no usable pointer:
 /// a pad that only responds while we drive it, and no built-in trackpad
@@ -191,52 +126,6 @@ fn no_pointer_fallback() -> bool {
     crate::hid::quit_would_strand_device()
         && (crate::system_prefs::builtin_trackpad_ignored()
             || !crate::hid::builtin_trackpad_present())
-}
-
-/// Everything worth pasting into a bug report.
-fn diagnostics() -> String {
-    let perms = crate::permissions::State::current();
-    let os = std::process::Command::new("/usr/bin/sw_vers")
-        .arg("-productVersion")
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|| "unknown".into());
-
-    format!(
-        "macos-trackpad-companion {version}
-         macOS: {os}
-         executable: {exe}
-         
-         input monitoring: {im:?}
-         accessibility: {ax}
-         ignores built-in trackpad when external present: {ignore}
-         built-in trackpad seen: {builtin}
-         
-         device: {device}
-         paused: {paused}
-         start at login: {login}
-         
-         config: {config}
-         log: {log}
-",
-        version = env!("CARGO_PKG_VERSION"),
-        os = os,
-        exe = std::env::current_exe()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "?".into()),
-        im = perms.input_monitoring,
-        ax = perms.accessibility,
-        ignore = crate::system_prefs::builtin_trackpad_ignored(),
-        builtin = crate::hid::builtin_trackpad_present(),
-        device = crate::hid::device_summary().unwrap_or_else(|| "none attached".into()),
-        paused = crate::pause::is_paused(),
-        login = crate::launch_agent::is_enabled(),
-        config = crate::settings::config_path_display(),
-        log = crate::config_watch::log_file_path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "stderr".into()),
-    )
 }
 
 /// Warn before an action that would leave no working pointer.
@@ -332,7 +221,7 @@ impl StatusItem {
         let header = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 mtm.alloc::<NSMenuItem>(),
-                &NSString::from_str("Trackpad Companion"),
+                &NSString::from_str(concat!("Trackpad Companion ", env!("CARGO_PKG_VERSION"))),
                 None,
                 &NSString::from_str(""),
             )
@@ -359,28 +248,6 @@ impl StatusItem {
 
         // Reopening matters: the setup window auto-opens once at launch,
         // and without this there is no way back to it.
-        let setup = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                mtm.alloc::<NSMenuItem>(),
-                &NSString::from_str("Setup…"),
-                Some(sel!(openSetup:)),
-                &NSString::from_str(""),
-            )
-        };
-        unsafe { setup.setTarget(Some(target.as_ref() as &AnyObject)) };
-        menu.addItem(&setup);
-
-        let settings = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                mtm.alloc::<NSMenuItem>(),
-                &NSString::from_str("Settings…"),
-                Some(sel!(openSettings:)),
-                &NSString::from_str(","),
-            )
-        };
-        unsafe { settings.setTarget(Some(target.as_ref() as &AnyObject)) };
-        menu.addItem(&settings);
-
         let pause_item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 mtm.alloc::<NSMenuItem>(),
@@ -392,39 +259,16 @@ impl StatusItem {
         unsafe { pause_item.setTarget(Some(target.as_ref() as &AnyObject)) };
         menu.addItem(&pause_item);
 
-        let diag = unsafe {
+        let settings = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 mtm.alloc::<NSMenuItem>(),
-                &NSString::from_str("Copy Diagnostics"),
-                Some(sel!(copyDiagnostics:)),
-                &NSString::from_str(""),
+                &NSString::from_str("Settings…"),
+                Some(sel!(openSettings:)),
+                &NSString::from_str(","),
             )
         };
-        unsafe { diag.setTarget(Some(target.as_ref() as &AnyObject)) };
-        menu.addItem(&diag);
-
-        let login = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                mtm.alloc::<NSMenuItem>(),
-                &NSString::from_str("Start at Login"),
-                Some(sel!(toggleLoginItem:)),
-                &NSString::from_str(""),
-            )
-        };
-        unsafe { login.setTarget(Some(target.as_ref() as &AnyObject)) };
-        set_check(&login, crate::launch_agent::is_enabled());
-        menu.addItem(&login);
-
-        let log_item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                mtm.alloc::<NSMenuItem>(),
-                &NSString::from_str("Reveal Log…"),
-                Some(sel!(openLog:)),
-                &NSString::from_str(""),
-            )
-        };
-        unsafe { log_item.setTarget(Some(target.as_ref() as &AnyObject)) };
-        menu.addItem(&log_item);
+        unsafe { settings.setTarget(Some(target.as_ref() as &AnyObject)) };
+        menu.addItem(&settings);
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 
