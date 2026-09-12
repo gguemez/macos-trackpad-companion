@@ -65,16 +65,26 @@ device produces something tuned to make *that* device work, untested
 elsewhere — arguably more fragile than honest constants, because the
 failure hides inside a derivation.
 
-### No capture/replay
+### Capture and replay ✅
 
-Recording raw frames plus the descriptor, and replaying them through the
-engine offline, would let a device be characterised without owning it
-and turn each one into a regression fixture. A `scroll_replay.rs`
-existed at some point; only a stale doc comment survived.
+`companion --record FILE` writes the frame stream as plain text; the
+`replay` binary feeds it back through the same engine with no HID, no
+CGEvents and no permissions, printing what would have been emitted along
+with the engine's own lock reasoning. Replays are deterministic —
+byte-identical across runs — so a capture is a valid regression fixture.
 
-Descriptor parsing is already testable this way — `--dump-descriptors`
-output is enough to reproduce a parse — but nothing covers the gesture
-engine against a real frame stream.
+A trackpad's behaviour is now portable: a device nobody here owns can be
+diagnosed from a file, and a misclassification can be reproduced as many
+times as it takes.
+
+Open question found by the first real capture, and a good example of
+what this is for: three two-finger gestures on the test pad all locked
+to pinch+rotate, with `align` between -0.94 and -1.00 — near-perfectly
+anti-parallel motion — where two of them were intended as scrolls. Pan
+scored highest each time and was disqualified on margin. Either the
+fingers genuinely spread, or contact ids are being swapped between
+frames, which would make parallel motion look anti-parallel. One capture
+showed `balance=0.00`, meaning one finger was completely stationary.
 
 ### Feature reports are read back ✅
 

@@ -5,6 +5,7 @@
 
 pub mod app_context;
 pub mod app_kit;
+pub mod capture;
 pub mod config;
 pub mod config_edit;
 pub mod config_watch;

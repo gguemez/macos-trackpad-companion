@@ -16,28 +16,27 @@
 //! intentionally only carries `--config PATH` and `-v` — see `config.rs`
 //! / README for the full schema.
 
-mod app_context;
-mod app_kit;
-mod config;
-mod config_edit;
-mod config_watch;
-mod descriptor;
-mod diagnostics;
-mod gesture;
-mod hid;
-mod instance_lock;
-mod launch_agent;
-mod onboarding;
-mod output;
-mod overlay;
-mod pause;
-mod permissions;
-mod report;
-mod scan_clock;
-mod settings;
-mod status_item;
-mod system_prefs;
-mod time;
+// The modules live in the library (see lib.rs); this binary uses
+// them rather than declaring them again. Declaring both compiles
+// every module twice and runs every test twice.
+use macos_trackpad_companion::{
+    capture,
+    config,
+    config_watch,
+    gesture,
+    hid,
+    instance_lock,
+    onboarding,
+    output,
+    overlay,
+    pause,
+    permissions,
+    report,
+    settings,
+    status_item,
+    system_prefs,
+    time,
+};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -68,6 +67,14 @@ struct Args {
     /// questions answerable by email rather than by owning the hardware.
     #[arg(long)]
     dump_descriptors: bool,
+
+    /// Record the device's frame stream to a file for offline replay.
+    ///
+    /// Captures what the pad reported, not what the engine did, so the
+    /// same stream can be replayed through a changed engine. See the
+    /// `replay` binary.
+    #[arg(long, value_name = "PATH")]
+    record: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -196,9 +203,9 @@ fn main() -> Result<()> {
     if cfg.overlay.enable {
         let overlay = overlay::Overlay::new(cfg.overlay.duration_ms);
         let wrapped = output::OverlayOutput::new(emitter, overlay);
-        run(&mut manager, wrapped, &cfg, cfg_path)?;
+        run(&mut manager, wrapped, &cfg, cfg_path, args.record.clone())?;
     } else {
-        run(&mut manager, emitter, &cfg, cfg_path)?;
+        run(&mut manager, emitter, &cfg, cfg_path, args.record.clone())?;
     }
 
     Ok(())
@@ -242,6 +249,7 @@ fn run<O: output::Output + 'static>(
     out: O,
     cfg: &config::Config,
     cfg_path: PathBuf,
+    record: Option<PathBuf>,
 ) -> Result<()> {
     let state = Rc::new(RefCell::new(gesture::State::new(out, cursor_accel(cfg))));
 
@@ -275,11 +283,33 @@ fn run<O: output::Output + 'static>(
         );
     });
 
+    let mut recorder = match record {
+        Some(path) => {
+            log::info!("recording frames to {}", path.display());
+            Some(capture::Writer::create(&path)?)
+        }
+        None => None,
+    };
+    let mut recorded_device = false;
+
     let frame_state = Rc::clone(&state);
     let mut known_geometry: Option<(f64, f64)> = None;
     manager.run(move |frame, ts| {
         if pause::is_paused() {
             return;
+        }
+
+        if let Some(w) = recorder.as_mut() {
+            if !recorded_device {
+                recorded_device = true;
+                let summary = hid::device_summary().unwrap_or_else(|| "unknown".into());
+                if let Err(e) = w.device(&summary, hid::device_geometry()) {
+                    log::error!("capture header failed: {e:#}");
+                }
+            }
+            if let Err(e) = w.frame(&frame, ts) {
+                log::error!("capture write failed: {e:#}");
+            }
         }
         // Cheap per-frame check rather than a callback from the HID
         // layer: it keeps the gesture engine free of any dependency on
