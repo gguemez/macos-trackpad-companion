@@ -147,6 +147,18 @@ unsafe extern "C" {
         report_length: isize,
     ) -> IOReturn;
 
+    /// `IOReturn IOHIDDeviceGetReport(IOHIDDeviceRef, IOHIDReportType,
+    /// CFIndex reportID, uint8_t *report, CFIndex *pReportLength)`.
+    /// `report_length` is in/out: capacity going in, bytes read coming
+    /// back.
+    fn IOHIDDeviceGetReport(
+        device: IOHIDDeviceRef,
+        report_type: IOHIDReportType,
+        report_id: isize,
+        report: *mut u8,
+        report_length: *mut isize,
+    ) -> IOReturn;
+
     fn IOHIDDeviceScheduleWithRunLoop(
         device: IOHIDDeviceRef,
         run_loop: *mut c_void,
@@ -317,6 +329,19 @@ impl Drop for DeviceState {
             ControlPath::SpecInputMode => {
                 if let Some(report_id) = self.layout.input_mode_report_id {
                     set_input_mode(self.device, report_id, PTP_INPUT_MODE_MOUSE);
+                    // Read it back: this is the shutdown whose effect was
+                    // previously unknowable, and a device that accepts
+                    // the write without acting on it is exactly the case
+                    // worth naming in the log.
+                    match get_feature_byte(self.device, report_id as isize) {
+                        Some(PTP_INPUT_MODE_MOUSE) => {
+                            log::debug!("reverted to mouse mode (verified)")
+                        }
+                        Some(other) => log::warn!(
+                            "revert to mouse mode reads back as {other:#04x}"
+                        ),
+                        None => log::debug!("revert to mouse mode not verifiable"),
+                    }
                 }
             }
         }
@@ -816,6 +841,17 @@ unsafe extern "C" fn on_device_matched(
 /// no point bailing the match flow when the spec path is universally
 /// implemented.
 fn enter_ptp_mode(device: IOHIDDeviceRef, product: &str, layout: &Layout) -> ControlPath {
+    if let Some(id) = layout.input_mode_report_id {
+        match get_feature_byte(device, id as isize) {
+            Some(PTP_INPUT_MODE_PTP) => log::info!(
+                "\"{product}\": already in PTP mode — a previous run probably \
+                 exited without reverting"
+            ),
+            Some(mode) => log::debug!("\"{product}\": Input Mode currently {mode:#04x}"),
+            None => log::debug!("\"{product}\": Input Mode not readable"),
+        }
+    }
+
     // Prefer the RMK vendor control path, but never write over a report
     // the device declared for something else.
     //
@@ -890,10 +926,21 @@ fn enter_ptp_mode(device: IOHIDDeviceRef, product: &str, layout: &Layout) -> Con
         }
     }
 
-    log::info!(
-        "\"{product}\": entered standard PTP mode via report {:#04x}",
-        input_mode_id,
-    );
+    match get_feature_byte(device, input_mode_id as isize) {
+        Some(PTP_INPUT_MODE_PTP) => log::info!(
+            "\"{product}\": entered standard PTP mode via report {:#04x} (verified)",
+            input_mode_id,
+        ),
+        Some(other) => log::warn!(
+            "\"{product}\": wrote PTP mode to report {:#04x} but it reads back as \
+             {other:#04x} — the device accepted the write without acting on it",
+            input_mode_id,
+        ),
+        None => log::info!(
+            "\"{product}\": entered standard PTP mode via report {:#04x} (not verifiable)",
+            input_mode_id,
+        ),
+    }
 
     ControlPath::SpecInputMode
 }
@@ -949,6 +996,51 @@ fn set_feature_byte(device: IOHIDDeviceRef, report_id: isize, byte: u8) -> IORet
             payload.as_ptr(),
             payload.len() as isize,
         )
+    }
+}
+
+/// Read a one-byte feature report back.
+///
+/// The counterpart to `set_feature_byte`, and the thing that makes a
+/// mode switch verifiable rather than merely acknowledged: SET_FEATURE
+/// returning success says the device accepted the bytes, not that it
+/// acted on them.
+///
+/// Buffer convention is the same ambiguity as on the write side — some
+/// hosts hand back the Report ID at the head of the payload for
+/// numbered reports and some don't — so the raw bytes are logged and
+/// both shapes are accepted.
+fn get_feature_byte(device: IOHIDDeviceRef, report_id: isize) -> Option<u8> {
+    let mut buf = [0u8; 8];
+    let mut len: isize = buf.len() as isize;
+    let rv = unsafe {
+        IOHIDDeviceGetReport(
+            device,
+            kIOHIDReportTypeFeature,
+            report_id,
+            buf.as_mut_ptr(),
+            &mut len,
+        )
+    };
+    if rv != kIOReturnSuccess {
+        log::debug!(
+            "GET_FEATURE report {report_id:#04x} failed: {:#x}",
+            rv as u32
+        );
+        return None;
+    }
+    let n = len.max(0) as usize;
+    log::debug!(
+        "GET_FEATURE report {report_id:#04x} -> {} bytes: {}",
+        n,
+        hex(&buf[..n.min(buf.len())])
+    );
+    match n {
+        0 => None,
+        1 => Some(buf[0]),
+        // Numbered reports come back with the id at the head.
+        _ if buf[0] == report_id as u8 => Some(buf[1]),
+        _ => Some(buf[0]),
     }
 }
 

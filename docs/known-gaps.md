@@ -76,14 +76,21 @@ Descriptor parsing is already testable this way — `--dump-descriptors`
 output is enough to reproduce a parse — but nothing covers the gesture
 engine against a real frame stream.
 
-### Feature reports are only ever written, never read
+### Feature reports are read back ✅
 
-There is no `IOHIDDeviceGetReport` binding. So the companion cannot:
+`get_feature_byte` verifies mode switches rather than trusting that
+SET_FEATURE succeeding means the device acted. Entering PTP mode is
+verified, the shutdown revert is verified, and a device found already in
+PTP mode at startup is reported as the sign of a previous run that
+exited without reverting.
 
-- verify that a mode switch actually took effect (this would have
-  settled "did the revert work?" immediately),
-- read Contact Count Maximum to cross-check the descriptor,
-- detect a device left in PTP mode by a crashed run.
+macOS returns numbered feature reports with the Report ID at the head of
+the payload — confirmed against hardware: reading report `0x25` yields
+`2500`, id then value.
+
+Still not read: Contact Count Maximum (usage `0x55`), which would
+cross-check the descriptor's contact count. The walker doesn't record
+its report id yet.
 
 ## Permissions
 
@@ -110,6 +117,12 @@ Current workaround: the setup window tells the user to add the app with
 ## Platform behaviour
 
 ### A spec-path device goes dormant when nothing drives it
+
+**Measured, not inferred:** the revert is not merely acknowledged, it is
+verified. Reading Input Mode straight back after the write returns
+`0x00` — the device really is in mouse mode — and it still sends
+nothing. So this is firmware behaviour, not a failed write and not a
+race with closing the manager.
 
 Reverting to mouse mode on shutdown is acknowledged, but the device then
 sends nothing at all — not touch reports, not mouse reports. It returns
