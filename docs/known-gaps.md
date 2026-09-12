@@ -76,32 +76,24 @@ like `gesture::CursorAccel`. Both windows carry all six sliders.
 
 ### The descriptor's contact count is not a promise
 
-The test pad's descriptor declares five finger collections, so the
-startup line says `5 contacts` — and the pad tracks four. Measured, not
-inferred: 766 trace-logged reports with four and five fingers on the
-surface, and
+The test pad's descriptor declares five finger collections. An earlier
+766-report capture with four and five fingers showed at most four
+contacts, an unused fifth slot, and IDs 0–3. This supports parallel
+reporting in that capture; it does not establish the advertised maximum
+or prove that firmware can never report a fifth finger.
 
-- the Contact Count field (byte 28) never read above `4`;
-- the fifth 5-byte contact slot was all zeros in *every* report, never
-  once populated;
-- only contact ids 0-3 ever appeared;
-- no report was rejected and no decode failed.
+Startup and diagnostics now distinguish report slots from Contact Count
+Maximum (Digitizer usage `0x55`). The descriptor walker records the
+feature's report ID, bit offset, width and payload size; the host queries
+it and reports `unknown` if the read fails. The feature value on the
+physical test pad still needs verification.
 
-So the firmware allocates five slots in the report and fills at most
-four. The decoder surfaced exactly what arrived; what is wrong is the
-startup line, which reports the *report layout's capacity* as if it
-were the device's capability.
-
-`contact_slots` comes from `finger_blocks.len()` — how many contacts
-the report has room for. The number that actually answers "how many
-fingers does this pad track" is Contact Count Maximum (usage `0x55`),
-a feature report this project still doesn't read (see above: the walker
-doesn't record its report id yet). Reading it would let the startup
-line and the diagnostics say four, and would say whether this firmware
-declares four and over-allocates, or declares five and under-delivers.
-
-Worth knowing before trusting any descriptor-derived capability on
-another device.
+Single- and two-slot hybrid reports are assembled per device using the
+first report's total count and the shared scan time. Partial frames,
+duplicate contact IDs and over-capacity frames do not enter recognition.
+Assembly is bounded to the advertised maximum, with the PTP limit of
+five as the fallback. Hardware coverage remains limited to the devices
+below; hybrid behavior currently has synthetic descriptor/report tests.
 
 ### Only one real device has ever been tested
 
@@ -152,9 +144,8 @@ macOS returns numbered feature reports with the Report ID at the head of
 the payload — confirmed against hardware: reading report `0x25` yields
 `2500`, id then value.
 
-Still not read: Contact Count Maximum (usage `0x55`), which would
-cross-check the descriptor's contact count. The walker doesn't record
-its report id yet.
+Contact Count Maximum (usage `0x55`) is now discovered and queried;
+its returned value on this physical device still needs verification.
 
 ## Permissions
 
@@ -273,8 +264,8 @@ undoing frames, which is sound only because replays are deterministic.
 
 The scope also carries a live-tuning column — the cursor curve
 (`sensitivity`, `accel_exponent`, `accel_ref`) and now the scroll curve
-to match — applied to the engine on the drag with the config file
-written behind it, debounced. A write that fails reverts both the
+to match — applied to the engine when slider tracking ends, with the
+config file written behind it, debounced. A write that fails reverts both the
 slider and the engine to what is on disk rather than leaving the engine
 running on a value the file never accepted.
 
@@ -294,6 +285,18 @@ debounce plus a 1 s watcher poll, and a slider you feel 1.25 s later is
 not a slider you can tune with. The file still converges — the watcher
 re-applies the identical values — and both windows round through the
 same helpers so neither can produce a value the other wouldn't.
+
+Slider tracking uses an explicit AppKit tracking lifetime, with live
+readouts and one final commit. Clicked tuning sliders receive keyboard
+focus even with system Keyboard navigation disabled. Pending writes own
+invalidating timer guards; window-close notifications flush committed
+values immediately and cancel timers before the window is reused.
+
+The scope preserves raw accidental contacts for inspection, marks them
+as excluded, and displays textual gate status alongside colour. Scores
+show raw → effective values. Rendering still shares the main run loop
+with HID: an Instruments latency/allocation comparison with the scope
+open and closed remains outstanding.
 
 Deliberately *not* exposed: any recognition threshold. Those trade two
 failure modes against each other, and the scope only ever shows the

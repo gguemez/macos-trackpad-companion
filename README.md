@@ -487,13 +487,13 @@ on separate interfaces.
 
 ## Testing
 
-`cargo test` covers the parser, the gesture engine, the capture format
-and the scope's own state — everything that can be checked without a
-screen or a hand.
+`cargo test` covers the parser, gesture engine, capture format, scroll
+pixel conversion and native AppKit controls. The AppKit test uses a
+temporary config and local events, opens no HID devices, and requires a
+macOS graphical session with Launch Services access. Run it alone with
+`cargo test --test appkit`; use `cargo test --lib` for the library tests.
+The physical-device checks remain in [the scope test plan](docs/scope-test-plan.md).
 
-The rest can't be. [docs/scope-test-plan.md](docs/scope-test-plan.md)
-is the manual pass for the gesture scope: what to do, what should
-happen, numbered so a failure can be reported as "4.2".
 
 ## Known gaps
 

@@ -145,6 +145,51 @@ pub fn accelerate_scroll(v_mm_per_sec: f64, curve: ScrollAccel) -> f64 {
     v_mm_per_sec.signum() * linear * mag.powf(curve.exponent)
 }
 
+/// Conversion to the actual pixel fields, independent of CGEvent posting.
+#[derive(Default)]
+struct ScrollMotion {
+    carry: (f64, f64),
+    last_time: Option<Timestamp>,
+}
+
+#[derive(Debug, PartialEq)]
+struct ScrollSample {
+    integer: (i32, i32),
+    precise: (f64, f64),
+}
+
+impl ScrollMotion {
+    fn sample(
+        &mut self,
+        delta: (f64, f64),
+        phase: Phase,
+        now: Timestamp,
+        curve: ScrollAccel,
+        natural: bool,
+    ) -> Option<ScrollSample> {
+        if phase == Phase::Began {
+            *self = Self::default();
+        }
+        let dt = self.last_time.replace(now).map_or(1.0 / 60.0, |prev| {
+            now.saturating_duration_since(prev)
+                .as_secs_f64()
+                .clamp(0.001, 0.1)
+        });
+        let sign = if natural { 1.0 } else { -1.0 };
+        let precise = (
+            sign * accelerate_scroll(delta.0 / dt, curve) * dt,
+            sign * accelerate_scroll(delta.1 / dt, curve) * dt,
+        );
+        let total = (self.carry.0 + precise.0, self.carry.1 + precise.1);
+        let integer = (total.0.trunc() as i32, total.1.trunc() as i32);
+        self.carry = (total.0 - integer.0 as f64, total.1 - integer.1 as f64);
+        if phase == Phase::Changed && integer == (0, 0) {
+            return None;
+        }
+        Some(ScrollSample { integer, precise })
+    }
+}
+
 // ---------- Public CGEvent constants (mirrored from CGEventTypes.h) ----------
 
 const kCGEventLeftMouseDown: u32 = 1;
@@ -1093,19 +1138,8 @@ pub struct Emitter {
     /// sources count as one multi-click sequence.
     last_click: Cell<Option<(MouseButton, Timestamp, CGPoint)>>,
     click_count: Cell<i64>,
-    /// Sub-pixel carry for active scroll, by axis. Each `scroll()` call's
-    /// f64 pixel value gets accumulated; the integer part drives the
-    /// CGEvent's PointDelta / wheel fields, and the fractional part rolls
-    /// over to the next event. Without this, integer truncation drops up
-    /// to one pixel per event, which on a 60+ Hz event stream is a
-    /// noticeable drift on slow scrolls.
-    scroll_carry_x_px: Cell<f64>,
-    scroll_carry_y_px: Cell<f64>,
-    /// Wall-clock time of the most recent `scroll()` call. Used to derive
-    /// per-frame `dt` so the acceleration curve can run on velocity
-    /// (mm/s) rather than raw per-frame mm — keeps feel consistent
-    /// across pad frame rates.
-    scroll_last_time: Cell<Option<Timestamp>>,
+    /// Pure pixel conversion state; shared by the real emitter and tests.
+    scroll_motion: RefCell<ScrollMotion>,
     /// Inertia state plus its CFRunLoopTimer. Boxed for a stable address
     /// — the timer's C context holds a raw pointer back here. Allocated
     /// once at `new()`; the timer ref inside is None except while a
@@ -1183,9 +1217,7 @@ impl Emitter {
             event_source,
             last_click: Cell::new(None),
             click_count: Cell::new(0),
-            scroll_carry_x_px: Cell::new(0.0),
-            scroll_carry_y_px: Cell::new(0.0),
-            scroll_last_time: Cell::new(None),
+            scroll_motion: RefCell::new(ScrollMotion::default()),
             momentum: Box::new(Momentum {
                 scroll_accel: Cell::new(scroll_accel),
                 event_source,
@@ -1400,47 +1432,26 @@ impl Emitter {
     /// Per-frame mm is converted to mm/s via wall-clock dt so the
     /// acceleration curve runs on a frame-rate-independent velocity.
     pub fn scroll(&self, dx_mm: f64, dy_mm: f64, phase: Phase) {
-        let sign = if self.cfg.borrow().natural_scroll {
-            1.0
-        } else {
-            -1.0
-        };
         let now = self.event_timestamp();
-        // Reset per-stroke state on Began. Carry would otherwise leak a
-        // fraction-of-a-pixel from the previous stroke; `scroll_last_time`
-        // would inflate dt across the gap between strokes and corrupt the
-        // first Changed event's velocity.
-        if matches!(phase, Phase::Began) {
-            self.scroll_carry_x_px.set(0.0);
-            self.scroll_carry_y_px.set(0.0);
-            self.scroll_last_time.set(None);
-        }
-        let prev_time = self.scroll_last_time.replace(Some(now));
-        let dt = match prev_time {
-            Some(t) => (now - t).as_secs_f64().clamp(0.001, 0.1),
-            None => 1.0 / 60.0,
-        };
-        let vx = dx_mm / dt;
-        let vy = dy_mm / dt;
-        let dx_px = sign * accelerate_scroll(vx, self.cfg.borrow().scroll_accel) * dt;
-        let dy_px = sign * accelerate_scroll(vy, self.cfg.borrow().scroll_accel) * dt;
-        let total_x = self.scroll_carry_x_px.get() + dx_px;
-        let total_y = self.scroll_carry_y_px.get() + dy_px;
-        let int_x = total_x.trunc() as i32;
-        let int_y = total_y.trunc() as i32;
-        self.scroll_carry_x_px.set(total_x - int_x as f64);
-        self.scroll_carry_y_px.set(total_y - int_y as f64);
-        if matches!(phase, Phase::Changed) && int_x == 0 && int_y == 0 {
-            return;
-        }
-        post_scroll_event(
-            self.event_source,
-            (int_x, int_y),
-            (dx_px, dy_px),
+        let cfg = self.cfg.borrow();
+        let sample = self.scroll_motion.borrow_mut().sample(
+            (dx_mm, dy_mm),
             phase,
-            /* momentum */ Phase::Cancelled,
             now,
+            cfg.scroll_accel,
+            cfg.natural_scroll,
         );
+        drop(cfg);
+        if let Some(sample) = sample {
+            post_scroll_event(
+                self.event_source,
+                sample.integer,
+                sample.precise,
+                phase,
+                /* momentum */ Phase::Cancelled,
+                now,
+            );
+        }
     }
 
     /// Seed inertia from the just-ended pan. Cancels any in-flight coast
@@ -2115,5 +2126,114 @@ mod tests {
         assert!(!p.evaluate(|| Some("com.apple.Terminal".into())));
         assert!(p.evaluate(|| Some("com.apple.Safari".into())));
         assert!(p.evaluate(|| None), "no app under cursor → Except admits");
+    }
+    #[test]
+    fn scroll_acceleration_matches_the_original_curve_goldens() {
+        let curve = ScrollAccel::default();
+        for (velocity, pixels) in [
+            (0.0, 0.0),
+            (15.0, 197.92618661593413),
+            (30.0, 487.3514378137413),
+            (60.0, 1200.0),
+            (120.0, 2954.746592027799),
+        ] {
+            for sign in [1.0, -1.0] {
+                assert!((accelerate_scroll(sign * velocity, curve) - sign * pixels).abs() < 1e-9);
+            }
+        }
+        let linear = ScrollAccel {
+            px_per_mm_at_ref: 12.0,
+            exponent: 1.0,
+            ref_mm_per_sec: 80.0,
+        };
+        assert_eq!(accelerate_scroll(-3.0, linear), -36.0);
+        let square = ScrollAccel {
+            px_per_mm_at_ref: 10.0,
+            exponent: 2.0,
+            ref_mm_per_sec: 100.0,
+        };
+        assert_eq!(accelerate_scroll(50.0, square), 250.0);
+    }
+
+    fn scroll_time(ms: u64) -> Timestamp {
+        Timestamp::from_nanos(1_000_000_000 + ms * 1_000_000)
+    }
+
+    #[test]
+    fn pixel_conversion_preserves_carry_direction_and_phase_boundaries() {
+        let curve = ScrollAccel {
+            px_per_mm_at_ref: 1.0,
+            exponent: 1.0,
+            ref_mm_per_sec: 60.0,
+        };
+        for natural in [true, false] {
+            let mut motion = ScrollMotion::default();
+            let sign = if natural { 1 } else { -1 };
+            assert_eq!(
+                motion
+                    .sample((0.0, 0.0), Phase::Began, scroll_time(0), curve, natural)
+                    .unwrap()
+                    .integer,
+                (0, 0)
+            );
+            assert!(
+                motion
+                    .sample((0.4, -0.4), Phase::Changed, scroll_time(10), curve, natural)
+                    .is_none()
+            );
+            assert!(
+                motion
+                    .sample((0.4, -0.4), Phase::Changed, scroll_time(20), curve, natural)
+                    .is_none()
+            );
+            assert_eq!(
+                motion
+                    .sample((0.4, -0.4), Phase::Changed, scroll_time(30), curve, natural)
+                    .unwrap()
+                    .integer,
+                (sign, -sign)
+            );
+            assert!(
+                motion
+                    .sample((0.0, 0.0), Phase::Ended, scroll_time(40), curve, natural)
+                    .is_some()
+            );
+            motion.sample((0.0, 0.0), Phase::Began, scroll_time(500), curve, natural);
+            assert!(
+                motion
+                    .sample(
+                        (0.9, -0.9),
+                        Phase::Changed,
+                        scroll_time(510),
+                        curve,
+                        natural
+                    )
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn pixel_conversion_clamps_time_and_resets_the_previous_stroke_clock() {
+        let curve = ScrollAccel {
+            px_per_mm_at_ref: 1.0,
+            exponent: 2.0,
+            ref_mm_per_sec: 1.0,
+        };
+        let mut motion = ScrollMotion::default();
+        let first = motion
+            .sample((1.0, 0.0), Phase::Began, scroll_time(100), curve, true)
+            .unwrap();
+        assert!((first.precise.0 - 60.0).abs() < 1e-9);
+        for (ms, expected) in [(100, 1000.0), (99, 1000.0), (10000, 10.0)] {
+            let sample = motion
+                .sample((1.0, 0.0), Phase::Changed, scroll_time(ms), curve, true)
+                .unwrap();
+            assert!((sample.precise.0 - expected).abs() < 1e-9);
+        }
+        let next = motion
+            .sample((1.0, 0.0), Phase::Began, scroll_time(20000), curve, true)
+            .unwrap();
+        assert_eq!(first, next);
     }
 }

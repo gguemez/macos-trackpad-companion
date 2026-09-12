@@ -1,8 +1,13 @@
 # Gesture scope — manual test plan
 
-Everything here needs hands and eyes, which is why it isn't in
-`cargo test`. Work through it and report by number; "4.2 failed" is
-enough to find the problem.
+The native `cargo test --test appkit` suite covers tracking, keyboard
+focus with both navigation modes, resizing, callback re-entry, pending
+writes, close/reopen and activation with multiple windows. It runs on
+the process main thread with a temporary config and local AppKit events;
+it needs a macOS graphical session and access to Launch Services.
+
+The remaining device feel and visual checks below still need hands and
+eyes. Report by number; "4.2 failed" is enough to find the problem.
 
 Setup: the companion running from
 `~/Applications/Trackpad Companion.app` (launched with `open -n`, never
@@ -18,7 +23,7 @@ scope from the menu-bar icon ▸ **Gesture Scope…**.
 | --- | --- | --- |
 | 1.1 | One finger on the pad, move it around | A filled dot follows your finger. A small cross marks where it landed, and a line trails behind it |
 | 1.2 | Put the finger down near each corner in turn | The dot reaches each corner of the drawn rectangle. If it stops short, or the pad looks the wrong shape, the geometry mapping is wrong |
-| 1.3 | Four fingers at once | Four dots, four colours, each labelled with its contact id. **On the test pad four is the maximum** — its firmware fills four of the five contact slots its descriptor advertises, so a fifth finger is not a scope bug (see `known-gaps.md`). On other hardware, expect as many dots as the pad reports |
+| 1.3 | Four fingers at once | Four dots, four colours, each labelled with its contact id. **The existing capture showed at most four contacts.** Compare the startup capability query and raw reports before diagnosing a missing fifth finger (see `known-gaps.md`). On other hardware, expect as many dots as the pad reports |
 | 1.4 | Lift everything | Tracks stay on screen, dimmed |
 | 1.5 | Touch again | The dimmed tracks vanish as the new touch starts |
 
@@ -28,7 +33,7 @@ scope from the menu-bar icon ▸ **Gesture Scope…**.
 | --- | --- | --- |
 | 2.1 | Two fingers down, hold still | `2F deciding` in amber, `tap window open` |
 | 2.2 | Keep holding past ~150 ms without moving | `tap window open` disappears; still `2F deciding` |
-| 2.3 | Scroll | Kind becomes `2F scroll`; the **pan** bar crossed the middle tick; `margin`, `align`/`balance` in green |
+| 2.3 | Scroll | Kind becomes `2F scroll`; the **pan** bar crossed the middle tick; textual `margin`, `align`/`balance` ok/fail states accompany colour; pan needs margin AND (align OR balance) |
 | 2.4 | Pinch | Kind becomes `2F pinch+rotate`; the **pinch** bar crossed; `pan` likely shows `disq:margin` in red |
 | 2.5 | Compare the frozen **LOCKED →** banner with the newest `2F lock=…` line in `~/Library/Logs/macos-trackpad-companion.log` | Identical numbers, same order. **Any disagreement here is a real bug** |
 | 2.6 | Lift after a lock | Banner dims to `last gesture · … · fingers lifted` |
@@ -55,7 +60,7 @@ are the highest-risk items in this list.
 | --- | --- | --- |
 | 4.1 | Drag **Cursor ▸ Speed** and let go, then move one finger | The cursor feels different **immediately** on release — no perceptible delay |
 | 4.1a | While still holding the knob | The number tracks, but the pointer does **not** change speed under you — the knob keeps following your finger |
-| 4.1b | Click a slider once, then press <kbd>←</kbd> / <kbd>→</kbd> | It nudges, and applies at once. This is the way to tune without dragging at all |
+| 4.1b | Click a slider once, then press <kbd>←</kbd> / <kbd>→</kbd> | It nudges, and applies at once, with system Keyboard navigation both on and off |
 | 4.2 | Wait a second, then `cat ~/.config/macos-trackpad-companion/config.toml` | `cursor.sensitivity` is the new value, and every comment in the file is still there |
 | 4.3 | Move one finger slowly, then quickly | The `cursor … mm/s → … px/s` line tracks. *Effective px/mm* rises with speed when Acceleration is above 1.00 |
 | 4.4 | Set Acceleration to 1.00 | *Effective px/mm* stops changing with speed and sits on the Speed slider's value |
@@ -73,7 +78,8 @@ are the highest-risk items in this list.
 | --- | --- | --- |
 | 5.1 | Click **Close** | Window closes; the trackpad keeps working |
 | 5.2 | Reopen from the menu | Opens clean — no tracks, no lock banner, sliders on the file's current values |
-| 5.3 | Drag a slider and hit **Close** within a quarter-second | The value still reaches the config file |
+| 5.3 | Release a slider and hit **Close** within a quarter-second; then edit the config file | The committed value is saved on close; the later edit is never overwritten by a leftover timer |
+| 5.4 | Enlarge the window horizontally and vertically | Tuning labels, values and sliders remain together; the column stays at the top right |
 | 5.4 | Press <kbd>esc</kbd> with the scope focused | Closes, same as **Close** |
 
 ## 6. Replay and its transport

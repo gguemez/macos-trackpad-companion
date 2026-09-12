@@ -24,15 +24,11 @@
 //! stop on the frame where the lock went the wrong way.
 
 use std::cell::{Cell, RefCell};
-use std::ffi::c_void;
+use std::rc::Rc;
 use std::time::Duration;
 
-use core_foundation::base::TCFType;
+use crate::run_loop_timer::Timer;
 use core_foundation::date::CFAbsoluteTimeGetCurrent;
-use core_foundation::runloop::{
-    CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext, kCFRunLoopCommonModes,
-};
-use core_foundation_sys::runloop::{CFRunLoopTimerInvalidate, CFRunLoopTimerRef};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{AnyThread, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
@@ -96,7 +92,7 @@ const FALLBACK_PAD_MM: (f64, f64) = (100.0, 60.0);
 thread_local! {
     static WINDOW: RefCell<Option<Window>> = const { RefCell::new(None) };
     static SCOPE: RefCell<ScopeState> = RefCell::new(ScopeState::default());
-    static TRANSPORT: RefCell<Option<Box<dyn Transport>>> = const { RefCell::new(None) };
+    static TRANSPORT: RefCell<Option<Rc<dyn Transport>>> = const { RefCell::new(None) };
     /// Mirrors `WINDOW.is_some() && visible`. Read once per frame by
     /// the observer, which runs in the HID callback.
     static OPEN: Cell<bool> = const { Cell::new(false) };
@@ -105,6 +101,8 @@ thread_local! {
     /// numbers mean, `main` knows how to reach the engine, and neither
     /// needs the other's knowledge.
     static LIVE_APPLY: RefCell<Option<LiveApply>> = const { RefCell::new(None) };
+    /// Deliver external hooks after releasing the window's RefCell borrow.
+    static PENDING_APPLY: Cell<Option<Tuning>> = const { Cell::new(None) };
     /// Last known values of the tunables, so the canvas can show
     /// what the curves do even when there is no column (a replay reads
     /// them from the config file like everything else).
@@ -114,7 +112,7 @@ thread_local! {
 // -------------------------------------------------------------- tuning
 
 /// Where a slider drag lands. `main` supplies one; see [`set_live_apply`].
-type LiveApply = Box<dyn Fn(Tuning)>;
+type LiveApply = Rc<dyn Fn(Tuning)>;
 
 /// The settings the scope can change while you gesture.
 ///
@@ -167,7 +165,7 @@ impl Tuning {
 /// closure that reaches the running engine; without it the scope shows
 /// no tuning column at all.
 pub fn set_live_apply(f: impl Fn(Tuning) + 'static) {
-    LIVE_APPLY.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    LIVE_APPLY.with(|h| *h.borrow_mut() = Some(Rc::new(f)));
 }
 
 fn current_tuning() -> Tuning {
@@ -224,11 +222,12 @@ pub trait Transport {
 /// Install playback controls. Call before [`show`]; the transport row
 /// is built with the window.
 pub fn set_transport(transport: Box<dyn Transport>) {
-    TRANSPORT.with(|t| *t.borrow_mut() = Some(transport));
+    TRANSPORT.with(|t| *t.borrow_mut() = Some(Rc::from(transport)));
 }
 
 fn with_transport<R>(f: impl FnOnce(&dyn Transport) -> R) -> Option<R> {
-    TRANSPORT.with(|t| t.borrow().as_ref().map(|t| f(t.as_ref())))
+    let transport = TRANSPORT.with(|t| t.borrow().clone());
+    transport.map(|t| f(t.as_ref()))
 }
 
 // --------------------------------------------------------- scope state
@@ -400,14 +399,14 @@ define_class!(
             let mut handled = true;
             match key.chars().next() {
                 Some(' ') => {
-                    with_transport(|t| t.toggle_play());
+                    handled = with_transport(|t| t.toggle_play()).is_some();
                 }
                 // NSLeftArrowFunctionKey / NSRightArrowFunctionKey.
                 Some('\u{F702}') => {
-                    with_transport(|t| t.step(-stride));
+                    handled = with_transport(|t| t.step(-stride)).is_some();
                 }
                 Some('\u{F703}') => {
-                    with_transport(|t| t.step(stride));
+                    handled = with_transport(|t| t.step(stride)).is_some();
                 }
                 // Escape. A diagnostic window you opened to glance at
                 // should close without aiming at anything.
@@ -479,12 +478,13 @@ define_class!(
 
         #[unsafe(method(scrub:))]
         fn scrub(&self, _s: Option<&AnyObject>) {
-            WINDOW.with(|cell| {
-                if let Some(ui) = cell.borrow().as_ref().and_then(|w| w.transport.as_ref()) {
-                    let frame = ui.slider.doubleValue().round().max(0.0) as usize;
-                    with_transport(|t| t.seek(frame));
-                }
+            let frame = WINDOW.with(|cell| {
+                cell.borrow().as_ref().and_then(|w| w.transport.as_ref())
+                    .map(|ui| ui.slider.doubleValue().round().max(0.0) as usize)
             });
+            if let Some(frame) = frame {
+                with_transport(|t| t.seek(frame));
+            }
         }
     }
 );
@@ -505,12 +505,22 @@ fn close() {
 
 /// Every tuning slider lands here; which one moved doesn't matter,
 /// since all are written together.
+fn deliver_pending_apply() {
+    if let Some(values) = PENDING_APPLY.with(Cell::take) {
+        let callback = LIVE_APPLY.with(|h| h.borrow().clone());
+        if let Some(callback) = callback {
+            callback(values);
+        }
+    }
+}
+
 fn slider_moved() {
     WINDOW.with(|cell| {
         if let Some(w) = cell.borrow_mut().as_mut() {
             w.slider_moved();
         }
     });
+    deliver_pending_apply();
 }
 
 impl Actions {
@@ -548,8 +558,20 @@ struct TuneUi {
 }
 
 impl TuneUi {
-    /// What the sliders currently read, rounded the same way the
-    /// settings window rounds them so the two write identical values.
+    fn is_tracking(&self) -> bool {
+        [
+            &self.sensitivity,
+            &self.exponent,
+            &self.accel_ref,
+            &self.scroll,
+            &self.scroll_exponent,
+            &self.scroll_accel_ref,
+        ]
+        .iter()
+        .any(|s| crate::tuning_slider::is_tracking(s))
+    }
+
+    /// What the sliders currently read, using the settings window's rounding.
     fn values(&self) -> Tuning {
         Tuning {
             cursor_sensitivity: crate::settings::round1(self.sensitivity.doubleValue()),
@@ -608,34 +630,51 @@ impl TuneUi {
 struct Window {
     window: Retained<NSWindow>,
     view: Retained<ScopeView>,
-    timer: Option<CFRunLoopTimer>,
+    timer: Option<Timer>,
     transport: Option<TransportUi>,
     tune: Option<TuneUi>,
     _close: Option<Retained<NSButton>>,
     /// Pending debounced write of the tunables. The engine already
     /// has them; this is only about not rewriting the file sixty times
     /// a second during a drag.
-    flush_timer: Option<CFRunLoopTimer>,
+    flush_timer: Option<Timer>,
     /// Config mtime as of the last read, so an edit made in the
     /// settings window or by hand lands here too.
     seen_mtime: Option<std::time::SystemTime>,
     last_config_poll: f64,
     _actions: Retained<Actions>,
+    _delegate: Retained<crate::window_lifecycle::CloseDelegate>,
 }
 
 /// Open the scope, creating it on first use.
 pub fn show(mtm: MainThreadMarker) {
-    WINDOW.with(|cell| {
+    let needs_window = WINDOW.with(|cell| cell.borrow().is_none());
+    if needs_window {
+        let built = Window::build(mtm);
+        WINDOW.with(|cell| *cell.borrow_mut() = Some(built));
+    }
+    let window = WINDOW.with(|cell| {
         let mut slot = cell.borrow_mut();
-        if slot.is_none() {
-            *slot = Some(Window::build(mtm));
-        }
-        if let Some(w) = slot.as_mut() {
-            w.present(mtm);
-        }
+        let w = slot.as_mut().unwrap();
+        w.prepare();
+        w.window.clone()
     });
+    app_kit::activate_for_window(mtm);
+    window.center();
+    window.makeKeyAndOrderFront(None);
+    let view = WINDOW.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .filter(|w| w.transport.is_some())
+            .map(|w| w.view.clone())
+    });
+    if let Some(view) = view {
+        window.makeFirstResponder(Some(&view));
+    }
     SCOPE.with(|s| s.borrow_mut().reset());
     OPEN.with(|o| o.set(true));
+    deliver_pending_apply();
+    WINDOW.with(|cell| cell.borrow_mut().as_mut().unwrap().start_timer());
 }
 
 impl Window {
@@ -664,7 +703,7 @@ impl Window {
         // Same trap as the settings window: the default frees the
         // window on close, dangling the `Retained` held here.
         unsafe { window.setReleasedWhenClosed(false) };
-        window.setMinSize(NSSize::new(560.0 + tune_w, 520.0));
+        window.setContentMinSize(NSSize::new(CANVAS_W + tune_w, WINDOW_H));
         app_kit::register_window(window.clone());
 
         let content = window
@@ -759,6 +798,7 @@ impl Window {
             content.addSubview(b);
         }
 
+        let delegate = crate::window_lifecycle::CloseDelegate::install(&window, on_close);
         let mut me = Self {
             window,
             view,
@@ -770,6 +810,7 @@ impl Window {
             seen_mtime: None,
             last_config_poll: 0.0,
             _actions: actions,
+            _delegate: delegate,
         };
         me.adopt_file(false);
         me
@@ -782,7 +823,16 @@ impl Window {
         content: &Retained<NSView>,
         actions: &Retained<Actions>,
     ) -> TuneUi {
-        let x = CANVAS_W + 16.0;
+        let column = NSView::initWithFrame(
+            mtm.alloc(),
+            NSRect::new(NSPoint::new(CANVAS_W, 0.0), NSSize::new(TUNE_W, WINDOW_H)),
+        );
+        column.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewMinXMargin | NSAutoresizingMaskOptions::ViewMinYMargin,
+        );
+        content.addSubview(&column);
+        let content = &column;
+        let x = 16.0;
         let w = TUNE_W - 32.0;
         let mut y = WINDOW_H - 34.0;
 
@@ -811,16 +861,13 @@ impl Window {
             value.setAlignment(NSTextAlignment::Right);
             content.addSubview(&value);
             *y -= 24.0;
-            let slider = unsafe {
-                NSSlider::sliderWithValue_minValue_maxValue_target_action(
-                    min,
-                    min,
-                    max,
-                    Some(actions.as_ref() as &AnyObject),
-                    Some(action),
-                    mtm,
-                )
-            };
+            let slider = crate::tuning_slider::TuningSlider::control(
+                mtm,
+                min,
+                max,
+                actions.as_ref(),
+                action,
+            );
             slider.setFrame(NSRect::new(NSPoint::new(x, *y), NSSize::new(w, 20.0)));
             slider.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
             content.addSubview(&slider);
@@ -928,6 +975,10 @@ impl Window {
     /// A keyboard change (arrow keys on a focused slider) has no button
     /// held, so it applies at once.
     fn slider_moved(&mut self) {
+        // Tracking may unwind after the window has already closed.
+        if !self.window.isVisible() {
+            return;
+        }
         let Some(ui) = self.tune.as_ref() else {
             return;
         };
@@ -935,46 +986,32 @@ impl Window {
         // The number under the slider tracks the drag regardless — you
         // should be able to see where you are heading.
         ui.relabel(values);
-        if NSEvent::pressedMouseButtons() & 1 != 0 {
+        if ui.is_tracking() {
             return;
         }
         // Only now, with the engine actually taking the value, does the
         // canvas get to draw the curve — a readout showing a curve the
         // engine isn't running would be worse than none.
         TUNING.with(|t| t.set(values));
-        LIVE_APPLY.with(|h| {
-            if let Some(f) = h.borrow().as_ref() {
-                f(values);
-            }
-        });
+        PENDING_APPLY.with(|v| v.set(Some(values)));
         self.schedule_flush();
     }
 
     fn schedule_flush(&mut self) {
-        if let Some(timer) = self.flush_timer.take() {
-            unsafe { CFRunLoopTimerInvalidate(timer.as_concrete_TypeRef()) };
-        }
-        let mut ctx = CFRunLoopTimerContext {
-            version: 0,
-            info: std::ptr::null_mut(),
-            retain: None,
-            release: None,
-            copyDescription: None,
-        };
-        let fire_at = unsafe { CFAbsoluteTimeGetCurrent() } + FLUSH_DELAY_SECS;
-        let timer = CFRunLoopTimer::new(fire_at, 0.0, 0, 0, on_flush, &mut ctx);
-        CFRunLoop::get_current().add_timer(&timer, unsafe { kCFRunLoopCommonModes });
-        self.flush_timer = Some(timer);
+        self.flush_timer = None;
+        self.flush_timer = Some(Timer::new(FLUSH_DELAY_SECS, 0.0, on_flush));
     }
 
     /// Write every value in one format-preserving edit, through the
     /// settings window's own helper.
     fn flush(&mut self) {
         self.flush_timer = None;
-        let Some(ui) = self.tune.as_ref() else {
+        if self.tune.is_none() {
             return;
-        };
-        let v = ui.values();
+        }
+        // Persist committed values, never an in-progress drag. A previous
+        // debounce may expire while AppKit tracks the next drag.
+        let v = current_tuning();
         let written = crate::settings::edit(|c| {
             c.set_f64(&["cursor"], "sensitivity", v.cursor_sensitivity)?;
             c.set_f64(&["cursor"], "accel_exponent", v.cursor_accel_exponent)?;
@@ -1020,62 +1057,36 @@ impl Window {
             ui.show(values);
         }
         if to_engine {
-            LIVE_APPLY.with(|h| {
-                if let Some(f) = h.borrow().as_ref() {
-                    f(values);
-                }
-            });
+            PENDING_APPLY.with(|v| v.set(Some(values)));
         }
         self.seen_mtime = Self::config_mtime();
     }
 
-    fn present(&mut self, mtm: MainThreadMarker) {
-        self.adopt_file(false);
-        app_kit::activate_for_window(mtm);
-        self.window.center();
-        self.window.makeKeyAndOrderFront(None);
-        // Keyboard transport only works if the canvas is first
-        // responder; the buttons would otherwise steal it on first
-        // click and never give it back. Only where there is a transport
-        // to drive, though — in the daemon the canvas has no keys of
-        // its own worth claiming, and holding first responder would
-        // stop a click from focusing a tuning slider, which is how you
-        // nudge one with the arrow keys instead of dragging it.
-        if self.transport.is_some() {
-            self.window.makeFirstResponder(Some(&self.view));
+    fn prepare(&mut self) {
+        if self.flush_timer.is_none() && !self.tune.as_ref().is_some_and(|ui| ui.is_tracking()) {
+            self.adopt_file(false);
         }
+    }
 
+    fn start_timer(&mut self) {
         if self.timer.is_none() {
             let interval = 1.0 / REDRAW_HZ;
-            let mut ctx = CFRunLoopTimerContext {
-                version: 0,
-                info: std::ptr::null_mut(),
-                retain: None,
-                release: None,
-                copyDescription: None,
-            };
-            let fire_at = unsafe { CFAbsoluteTimeGetCurrent() } + interval;
-            let timer = CFRunLoopTimer::new(fire_at, interval, 0, 0, on_tick, &mut ctx);
-            // Common modes, not default: a menu tracking loop would
-            // otherwise freeze the scope exactly when someone opens the
-            // menu to look at it.
-            CFRunLoop::get_current().add_timer(&timer, unsafe { kCFRunLoopCommonModes });
-            self.timer = Some(timer);
+            self.timer = Some(Timer::new(interval, interval, on_tick));
         }
     }
 
     /// Repaint if a frame arrived, and keep the two control rows honest.
-    fn tick(&mut self) {
+    fn tick(&mut self, position: Option<(usize, usize, bool)>) {
         let dirty = SCOPE.with(|s| std::mem::replace(&mut s.borrow_mut().dirty, false));
         if dirty {
             self.view.setNeedsDisplay(true);
         }
         self.tick_tuning();
-        self.tick_transport();
+        self.tick_transport(position);
     }
 
     fn tick_tuning(&mut self) {
-        if self.tune.is_none() {
+        if self.tune.as_ref().is_none_or(|ui| ui.is_tracking()) {
             return;
         }
         // Never while a write of our own is pending — that is exactly
@@ -1104,11 +1115,11 @@ impl Window {
         }
     }
 
-    fn tick_transport(&mut self) {
+    fn tick_transport(&mut self, position: Option<(usize, usize, bool)>) {
         let Some(ui) = self.transport.as_ref() else {
             return;
         };
-        let Some((frame, total, playing)) = with_transport(|t| t.position()) else {
+        let Some((frame, total, playing)) = position else {
             return;
         };
         ui.play
@@ -1120,17 +1131,14 @@ impl Window {
             .setStringValue(&NSString::from_str(&format!("{frame} / {total}")));
     }
 
-    fn teardown(&mut self, mtm: MainThreadMarker) {
-        if let Some(timer) = self.timer.take() {
-            unsafe { CFRunLoopTimerInvalidate(timer.as_concrete_TypeRef()) };
-        }
+    fn teardown(&mut self) {
+        self.timer = None;
         // A pending write must still land — closing the window mid-drag
         // shouldn't lose the value the engine is already running on.
         if self.flush_timer.is_some() {
             self.flush();
         }
         OPEN.with(|o| o.set(false));
-        app_kit::settle_activation(mtm);
     }
 }
 
@@ -1147,27 +1155,41 @@ fn label(
     f
 }
 
-extern "C" fn on_flush(_timer: CFRunLoopTimerRef, _info: *mut c_void) {
+fn on_close() {
+    WINDOW.with(|cell| {
+        if let Some(w) = cell.borrow_mut().as_mut() {
+            w.teardown();
+        }
+    });
+    deliver_pending_apply();
+}
+
+fn on_flush() {
     WINDOW.with(|cell| {
         if let Some(w) = cell.borrow_mut().as_mut() {
             w.flush();
         }
     });
+    deliver_pending_apply();
 }
 
-extern "C" fn on_tick(_timer: CFRunLoopTimerRef, _info: *mut c_void) {
-    let Some(mtm) = MainThreadMarker::new() else {
+fn on_tick() {
+    // Transport hooks may call back into the scope. No window borrow
+    // may be held while invoking them.
+    let position = with_transport(|t| t.position());
+    let Some(_mtm) = MainThreadMarker::new() else {
         return;
     };
     WINDOW.with(|cell| {
         if let Some(w) = cell.borrow_mut().as_mut() {
             if w.window.isVisible() {
-                w.tick();
+                w.tick(position);
             } else {
-                w.teardown(mtm);
+                w.teardown();
             }
         }
     });
+    deliver_pending_apply();
 }
 
 fn push(
@@ -1194,8 +1216,8 @@ fn push(
 // ------------------------------------------------------------ drawing
 //
 // Everything below is pure rendering of a `Snapshot`. It reads state;
-// it never asks the engine anything, and there is nothing here the
-// engine could be made to wait on.
+// it never asks the engine anything. Drawing still shares the main run
+// loop with HID dispatch, so its latency must be profiled with the scope open.
 
 /// Contact colours. Five, because that is the contact count the
 /// descriptors in this project report; a sixth finger wraps around
@@ -1620,11 +1642,20 @@ fn draw_contacts(area: NSRect, top: f64, snap: &Snapshot, mono: &NSFont) -> f64 
             c.max_move_mm,
             c.age.as_secs_f64() * 1000.0,
         );
-        let w = text(&line, x, y, mono, &ink());
-        if !c.confidence {
-            // The device's own doubt about this contact — usually a
-            // palm. Worth seeing, because the engine acts on it anyway.
-            text("unconfident", x + w + 16.0, y, mono, &warn());
+        text(&line, x, y, mono, &ink());
+        if c.excluded {
+            text(
+                if c.confidence {
+                    "ignored: cancelled gesture"
+                } else {
+                    "ignored: low confidence"
+                },
+                x,
+                y + 18.0,
+                mono,
+                &warn(),
+            );
+            y += 18.0;
         }
         y += 18.0;
     }
@@ -1684,7 +1715,7 @@ fn draw_two_finger(area: NSRect, top: f64, m: &TwoFingerMetrics, mono: &NSFont) 
         );
 
         text(name, x, y + 3.0, mono, &ink());
-        let value = format!("{raw:.2}");
+        let value = format!("{raw:.2} → {gated:.2}");
         let w = text(&value, bar_x + bar_w + 10.0, y + 3.0, mono, &ink());
         if !tag.is_empty() {
             let color = if tag.starts_with(" disq") {
@@ -1718,22 +1749,32 @@ fn draw_two_finger(area: NSRect, top: f64, m: &TwoFingerMetrics, mono: &NSFont) 
         mono,
         &ink(),
     ) + 16.0;
-    cx += text(
+    text(
         &format!("margin {}", if m.margin_ok { "ok" } else { "fail" }),
         cx,
         y,
         mono,
         &gate(m.margin_ok),
-    ) + 16.0;
+    );
+    y += 18.0;
+    let mut cx = x;
     cx += text(
-        &format!("align {:+.3}", m.alignment),
+        &format!(
+            "align {:+.3} {}",
+            m.alignment,
+            if m.aligned { "ok" } else { "fail" }
+        ),
         cx,
         y,
         mono,
         &gate(m.aligned),
     ) + 16.0;
     text(
-        &format!("balance {:.2}", m.balance),
+        &format!(
+            "balance {:.2} {}",
+            m.balance,
+            if m.balance_ok { "ok" } else { "fail" }
+        ),
         cx,
         y,
         mono,
@@ -1741,6 +1782,14 @@ fn draw_two_finger(area: NSRect, top: f64, m: &TwoFingerMetrics, mono: &NSFont) 
     );
     y += 18.0;
 
+    text(
+        "pan needs margin AND (align OR balance)",
+        x,
+        y,
+        mono,
+        &dim(),
+    );
+    y += 18.0;
     let mut cx = x;
     cx += text(
         &format!(
@@ -2000,6 +2049,7 @@ mod tests {
                     max_move_mm: 0.0,
                     age: Duration::from_millis(10),
                     confidence: true,
+                    excluded: false,
                 })
                 .collect(),
             since_start: Duration::from_millis(120),

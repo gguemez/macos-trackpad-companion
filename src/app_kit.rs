@@ -46,8 +46,8 @@ static LAUNCHED: AtomicBool = AtomicBool::new(false);
 /// Must run on the main thread; the `MainThreadMarker` enforces it.
 pub fn ensure_app(mtm: MainThreadMarker) -> Retained<NSApplication> {
     let app = NSApplication::sharedApplication(mtm);
-    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     if !LAUNCHED.swap(true, Ordering::SeqCst) {
+        app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
         app.finishLaunching();
     }
     app
@@ -75,7 +75,16 @@ pub fn activate_for_window(mtm: MainThreadMarker) {
 /// Drop back to a menu-bar-only agent, but only once every registered
 /// window is closed.
 pub fn settle_activation(mtm: MainThreadMarker) {
-    let any_visible = WINDOWS.with(|w| w.borrow().iter().any(|win| win.isVisible()));
+    settle_activation_except(mtm, None);
+}
+
+pub(crate) fn settle_activation_except(mtm: MainThreadMarker, closing: Option<&NSWindow>) {
+    // windowWillClose: precedes AppKit hiding the window. Exclude it
+    // explicitly while still respecting every other visible window.
+    let windows = WINDOWS.with(|w| w.borrow().clone());
+    let any_visible = windows
+        .iter()
+        .any(|win| Some(&**win) != closing && win.isVisible());
     if !any_visible {
         ensure_app(mtm).setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     }

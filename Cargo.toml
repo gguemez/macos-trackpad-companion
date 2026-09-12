@@ -17,6 +17,11 @@ path = "src/bin/gesture_tap.rs"
 name = "replay"
 path = "src/bin/replay.rs"
 
+[[test]]
+name = "appkit"
+path = "tests/appkit.rs"
+harness = false
+
 [dependencies]
 core-foundation     = "0.10"
 core-foundation-sys = "0.8"

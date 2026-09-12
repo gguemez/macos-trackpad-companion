@@ -291,6 +291,7 @@ struct DeviceState {
     device: IOHIDDeviceRef,
     run_loop: CFRunLoop,
     layout: Layout,
+    frames: report::FrameAssembler,
     buf: Vec<u8>,
     bridge: *mut Bridge,
     /// Per-device scan-time → host-time estimator. Each device has its
@@ -769,8 +770,39 @@ unsafe extern "C" fn on_device_matched(
         desc.len(),
         hex(&desc)
     );
+    let contact_maximum = layout.contact_count_max.and_then(|field| {
+        let mut bytes = vec![0; field.payload_bytes + usize::from(field.report_id != 0)];
+        let mut len = bytes.len() as isize;
+        let result = unsafe {
+            IOHIDDeviceGetReport(
+                device,
+                kIOHIDReportTypeFeature,
+                field.report_id as isize,
+                bytes.as_mut_ptr(),
+                &mut len,
+            )
+        };
+        if result != kIOReturnSuccess || len < 0 || len as usize > bytes.len() {
+            log::warn!(
+                "could not read Contact Count Maximum from report {:#04x}",
+                field.report_id
+            );
+            return None;
+        }
+        let maximum = field.read(&bytes[..len as usize]);
+        match maximum {
+            Some(n @ 1..=5) => Some(n as u8),
+            _ => {
+                log::warn!("invalid Contact Count Maximum: {maximum:?}");
+                None
+            }
+        }
+    });
+    let maximum_label = contact_maximum
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "unknown".into());
     log::info!(
-        "matched \"{product}\" (vid={} pid={}): {} contacts, logical max {}×{} \
+        "matched \"{product}\" (vid={} pid={}): {} report slots, contact maximum {maximum_label}, logical max {}×{} \
          ({:.1}×{:.1} mm), {} bytes/contact, payload {} bytes total",
         vid.map(|v| format!("{:#06x}", v as u16))
             .unwrap_or_else(|| "?".into()),
@@ -802,7 +834,7 @@ unsafe extern "C" fn on_device_matched(
         .with(|g| *g.borrow_mut() = Some((layout.physical_x_max_mm, layout.physical_y_max_mm)));
     DEVICE_SUMMARY.with(|d| {
         *d.borrow_mut() = Some(format!(
-            "{product} vid={:#06x} pid={:#06x}, {} contacts, {:.1}x{:.1} mm, \
+            "{product} vid={:#06x} pid={:#06x}, {} report slots, contact maximum {maximum_label}, {:.1}x{:.1} mm, \
              {} bytes/contact, payload {} bytes",
             vid.unwrap_or(0) as u16,
             pid.unwrap_or(0) as u16,
@@ -830,6 +862,7 @@ unsafe extern "C" fn on_device_matched(
         device,
         run_loop: CFRunLoop::get_current(),
         layout,
+        frames: report::FrameAssembler::new(contact_maximum),
         buf: vec![0u8; buf_len],
         bridge: bridge as *mut Bridge,
         scan_clock: ScanTimeClock::new(),
@@ -1124,9 +1157,13 @@ unsafe extern "C" fn on_input_report(
     if log::log_enabled!(log::Level::Trace) {
         log::trace!("input report ({} bytes): {}", bytes.len(), hex(bytes));
     }
-    let Some(frame) = report::decode(&state.layout, bytes) else {
-        log::debug!("decode failed for {}-byte report", bytes.len());
-        return;
+    let frame = match state.frames.push(&state.layout, bytes) {
+        Ok(Some(frame)) => frame,
+        Ok(None) => return,
+        Err(reason) => {
+            log::debug!("discarding touch report: {reason}");
+            return;
+        }
     };
     if log::log_enabled!(log::Level::Trace) {
         log::trace!(

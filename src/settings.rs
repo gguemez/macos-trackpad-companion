@@ -19,15 +19,9 @@
 //! "on" over one would throw the user's list away.
 
 use std::cell::RefCell;
-use std::ffi::c_void;
 use std::path::PathBuf;
 
-use core_foundation::base::TCFType;
-use core_foundation::date::CFAbsoluteTimeGetCurrent;
-use core_foundation::runloop::{
-    CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext, kCFRunLoopCommonModes,
-};
-use core_foundation_sys::runloop::{CFRunLoopTimerInvalidate, CFRunLoopTimerRef};
+use crate::run_loop_timer::Timer;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{AnyThread, MainThreadMarker, define_class, msg_send, sel};
@@ -139,13 +133,14 @@ struct Window {
     swipe_v: Retained<NSButton>,
     overlay: Retained<NSButton>,
     login: Retained<NSButton>,
-    timer: Option<CFRunLoopTimer>,
+    timer: Option<Timer>,
     /// Pending debounced write, replaced on each slider movement.
-    flush_timer: Option<CFRunLoopTimer>,
+    flush_timer: Option<Timer>,
     /// Config mtime as of the last populate, so an edit made in a text
     /// editor while this window is open is picked up.
     seen_mtime: Option<std::time::SystemTime>,
     _actions: Retained<Actions>,
+    _delegate: Retained<crate::window_lifecycle::CloseDelegate>,
 }
 
 define_class!(
@@ -382,15 +377,21 @@ fn fmt(v: f64) -> Retained<NSString> {
 
 /// Open the settings window, creating it on first use.
 pub fn show(mtm: MainThreadMarker) {
-    SETTINGS.with(|cell| {
+    let needs_window = SETTINGS.with(|cell| cell.borrow().is_none());
+    if needs_window {
+        let built = Window::build(mtm);
+        SETTINGS.with(|cell| *cell.borrow_mut() = Some(built));
+    }
+    let window = SETTINGS.with(|cell| {
         let mut slot = cell.borrow_mut();
-        if slot.is_none() {
-            *slot = Some(Window::build(mtm));
-        }
-        if let Some(w) = slot.as_mut() {
-            w.present(mtm);
-        }
+        let w = slot.as_mut().unwrap();
+        w.prepare();
+        w.window.clone()
     });
+    app_kit::activate_for_window(mtm);
+    window.center();
+    window.makeKeyAndOrderFront(None);
+    SETTINGS.with(|cell| cell.borrow_mut().as_mut().unwrap().start_timer());
 }
 
 impl Window {
@@ -671,6 +672,7 @@ impl Window {
         );
         content.addSubview(&reset);
 
+        let delegate = crate::window_lifecycle::CloseDelegate::install(&window, on_close);
         Self {
             window,
             cursor_sensitivity,
@@ -696,28 +698,18 @@ impl Window {
             flush_timer: None,
             seen_mtime: None,
             _actions: actions,
+            _delegate: delegate,
         }
     }
 
-    fn present(&mut self, mtm: MainThreadMarker) {
+    fn prepare(&mut self) {
         self.populate();
         self.seen_mtime = Self::config_mtime();
-        app_kit::activate_for_window(mtm);
-        self.window.center();
-        self.window.makeKeyAndOrderFront(None);
+    }
 
+    fn start_timer(&mut self) {
         if self.timer.is_none() {
-            let mut ctx = CFRunLoopTimerContext {
-                version: 0,
-                info: std::ptr::null_mut(),
-                retain: None,
-                release: None,
-                copyDescription: None,
-            };
-            let fire_at = unsafe { CFAbsoluteTimeGetCurrent() } + POLL_SECS;
-            let timer = CFRunLoopTimer::new(fire_at, POLL_SECS, 0, 0, on_tick, &mut ctx);
-            CFRunLoop::get_current().add_timer(&timer, unsafe { kCFRunLoopCommonModes });
-            self.timer = Some(timer);
+            self.timer = Some(Timer::new(POLL_SECS, POLL_SECS, on_tick));
         }
     }
 
@@ -782,21 +774,11 @@ impl Window {
     /// (Re)arm the debounced write. Each movement pushes the deadline
     /// out, so only the settled value reaches the file.
     fn schedule_flush(&mut self) {
-        if let Some(timer) = self.flush_timer.take() {
-            unsafe { CFRunLoopTimerInvalidate(timer.as_concrete_TypeRef()) };
+        if !self.window.isVisible() {
+            return;
         }
-        let mut ctx = CFRunLoopTimerContext {
-            version: 0,
-            info: std::ptr::null_mut(),
-            retain: None,
-            release: None,
-            copyDescription: None,
-        };
-        let fire_at = unsafe { CFAbsoluteTimeGetCurrent() } + FLUSH_DELAY_SECS;
-        // Non-repeating: one shot per quiet period.
-        let timer = CFRunLoopTimer::new(fire_at, 0.0, 0, 0, on_flush, &mut ctx);
-        CFRunLoop::get_current().add_timer(&timer, unsafe { kCFRunLoopCommonModes });
-        self.flush_timer = Some(timer);
+        self.flush_timer = None;
+        self.flush_timer = Some(Timer::new(FLUSH_DELAY_SECS, 0.0, on_flush));
     }
 
     /// Write every slider value in a single edit.
@@ -889,16 +871,13 @@ impl Window {
         }
     }
 
-    fn teardown(&mut self, mtm: MainThreadMarker) {
-        if let Some(timer) = self.timer.take() {
-            unsafe { CFRunLoopTimerInvalidate(timer.as_concrete_TypeRef()) };
-        }
+    fn teardown(&mut self) {
+        self.timer = None;
         // A pending write must still land — closing the window mid-drag
         // shouldn't discard the change.
         if self.flush_timer.is_some() {
             self.flush();
         }
-        app_kit::settle_activation(mtm);
     }
 }
 
@@ -935,12 +914,20 @@ fn set_checked(b: &Retained<NSButton>, on: bool) {
     });
 }
 
-extern "C" fn on_flush(_timer: CFRunLoopTimerRef, _info: *mut c_void) {
+fn on_close() {
+    SETTINGS.with(|cell| {
+        if let Some(w) = cell.borrow_mut().as_mut() {
+            w.teardown();
+        }
+    });
+}
+
+fn on_flush() {
     with_window_mut(|w| w.flush());
 }
 
-extern "C" fn on_tick(_timer: CFRunLoopTimerRef, _info: *mut c_void) {
-    let Some(mtm) = MainThreadMarker::new() else {
+fn on_tick() {
+    let Some(_mtm) = MainThreadMarker::new() else {
         return;
     };
     SETTINGS.with(|cell| {
@@ -948,7 +935,7 @@ extern "C" fn on_tick(_timer: CFRunLoopTimerRef, _info: *mut c_void) {
             if w.window.isVisible() {
                 w.refresh_if_file_changed();
             } else {
-                w.teardown(mtm);
+                w.teardown();
             }
         }
     });
@@ -984,16 +971,8 @@ fn slider(
     x: f64,
     y: f64,
 ) -> Retained<NSSlider> {
-    let s = unsafe {
-        NSSlider::sliderWithValue_minValue_maxValue_target_action(
-            value,
-            min,
-            max,
-            Some(target.as_ref() as &AnyObject),
-            Some(action),
-            mtm,
-        )
-    };
+    let s = crate::tuning_slider::TuningSlider::control(mtm, min, max, target.as_ref(), action);
+    s.setDoubleValue(value);
     s.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(240.0, 24.0)));
     s
 }

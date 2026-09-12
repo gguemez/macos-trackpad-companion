@@ -25,6 +25,7 @@ const USAGE_DIG_TIP_SWITCH: u16 = 0x42;
 const USAGE_DIG_CONFIDENCE: u16 = 0x47;
 const USAGE_DIG_CONTACT_ID: u16 = 0x51;
 const USAGE_DIG_CONTACT_COUNT: u16 = 0x54;
+const USAGE_DIG_CONTACT_COUNT_MAX: u16 = 0x55;
 const USAGE_DIG_SCAN_TIME: u16 = 0x56;
 
 const USAGE_DIG_INPUT_MODE: u16 = 0x52;
@@ -50,12 +51,50 @@ pub struct BitField {
 /// of being rejected for having an unfamiliar stride.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContactFields {
-    /// Optional in the spec; treated as "confident" when absent.
+    /// Missing on some legacy devices; treated as "confident" when absent.
     pub confidence: Option<BitField>,
     pub tip: BitField,
     pub id: BitField,
     pub x: BitField,
     pub y: BitField,
+}
+
+/// A feature field, with offsets relative to its payload (without report ID).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeatureField {
+    pub report_id: u8,
+    pub bit_offset: usize,
+    pub bit_size: usize,
+    pub payload_bytes: usize,
+}
+
+impl FeatureField {
+    /// IOHID may return a numbered report with or without its ID prefix.
+    /// Distinguish by exact descriptor length, never by payload byte value.
+    pub fn read(&self, bytes: &[u8]) -> Option<u32> {
+        if self.bit_size == 0
+            || self.bit_size > 32
+            || self.payload_bytes > MAX_REPORT_BYTES
+            || self.bit_offset.checked_add(self.bit_size)? > self.payload_bytes.checked_mul(8)?
+        {
+            return None;
+        }
+        let payload = if bytes.len() == self.payload_bytes {
+            bytes
+        } else if self.report_id != 0
+            && bytes.len() == self.payload_bytes + 1
+            && bytes[0] == self.report_id
+        {
+            &bytes[1..]
+        } else {
+            return None;
+        };
+        Some(crate::report::read_bits(
+            payload,
+            self.bit_offset,
+            self.bit_size,
+        ))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +127,7 @@ pub struct Layout {
     pub total_payload_bytes: usize,
 
     // PTP Extensions
+    pub contact_count_max: Option<FeatureField>,
     pub input_mode_report_id: Option<u8>,
     pub selective_reporting_report_id: Option<u8>,
     pub latency_mode_report_id: Option<u8>,
@@ -241,6 +281,8 @@ struct Walker<'a> {
     /// buffer (which includes the report-ID byte at offset 0). Always
     /// starts at 8 for any non-zero report ID.
     bit_cursor: HashMap<u8, usize>,
+    feature_cursor: HashMap<u8, usize>,
+    contact_count_max: Option<(u8, FieldRef)>,
 
     touch_report_id: Option<u8>,
     finger_blocks: Vec<FingerBlock>,
@@ -321,6 +363,8 @@ impl<'a> Walker<'a> {
             usage_max: None,
             collections: Vec::new(),
             bit_cursor: HashMap::new(),
+            feature_cursor: HashMap::new(),
+            contact_count_max: None,
             touch_report_id: None,
             finger_blocks: Vec::new(),
             current_finger_block: None,
@@ -385,10 +429,16 @@ impl<'a> Walker<'a> {
         Ok(())
     }
 
-    fn handle_feature(&mut self) {
+    fn handle_feature(&mut self, flags: u32) -> Result<()> {
+        let start = self.feature_cursor.entry(self.report_id).or_default();
+        let base = *start;
+        *start = start
+            .checked_add(self.report_size as usize * self.report_count as usize)
+            .filter(|end| *end <= MAX_REPORT_BITS)
+            .ok_or_else(|| anyhow!("feature report too large"))?;
         let usages = self.expanded_usages(self.report_count as usize);
 
-        for usage32 in usages {
+        for (index, usage32) in usages.into_iter().enumerate() {
             let page = (usage32 >> 16) as u16;
             let usage = (usage32 & 0xffff) as u16;
 
@@ -403,11 +453,29 @@ impl<'a> Walker<'a> {
                 self.standard_feature_report_ids.push(self.report_id);
             }
 
-            if page != PAGE_DIGITIZER {
+            // Constant fields reserve the report ID too, but do not
+            // advertise readable capabilities or writable controls.
+            if page != PAGE_DIGITIZER || flags & 1 != 0 {
                 continue;
             }
 
             match usage {
+                USAGE_DIG_CONTACT_COUNT_MAX
+                    if self.report_size > 0
+                        && self.report_size <= 32
+                        && self
+                            .collections
+                            .iter()
+                            .any(|c| c.kind == 1 && c.primary_usage == 0x000d_0005) =>
+                {
+                    self.contact_count_max.get_or_insert((
+                        self.report_id,
+                        FieldRef {
+                            bit_offset: base + index * self.report_size as usize,
+                            bit_size: self.report_size as usize,
+                        },
+                    ));
+                }
                 USAGE_DIG_INPUT_MODE => {
                     self.input_mode_report_id.get_or_insert(self.report_id);
                 }
@@ -424,6 +492,7 @@ impl<'a> Walker<'a> {
                 _ => {}
             }
         }
+        Ok(())
     }
 
     fn handle_main(&mut self, tag: u8, udata: u32) -> Result<()> {
@@ -441,7 +510,7 @@ impl<'a> Walker<'a> {
         }
         match tag {
             0b1000 => self.handle_input(udata)?,
-            0b1011 => self.handle_feature(),
+            0b1011 => self.handle_feature(udata)?,
             0b1010 => self.open_collection(udata)?,
             0b1100 => self.close_collection(),
             _ => {}
@@ -777,6 +846,14 @@ impl<'a> Walker<'a> {
             physical_x_max_mm,
             physical_y_max_mm,
             total_payload_bytes: total_bits.div_ceil(8),
+            contact_count_max: self
+                .contact_count_max
+                .map(|(report_id, field)| FeatureField {
+                    report_id,
+                    bit_offset: field.bit_offset,
+                    bit_size: field.bit_size,
+                    payload_bytes: self.feature_cursor[&report_id].div_ceil(8),
+                }),
             input_mode_report_id: self.input_mode_report_id,
             selective_reporting_report_id: self.selective_reporting_report_id,
             latency_mode_report_id: self.latency_mode_report_id,
@@ -991,6 +1068,7 @@ mod tests {
             physical_x_max_mm: 10.0,
             physical_y_max_mm: 10.0,
             total_payload_bytes: 35,
+            contact_count_max: None,
             input_mode_report_id: None,
             selective_reporting_report_id: None,
             latency_mode_report_id: None,
@@ -1276,5 +1354,77 @@ mod tests {
         assert_eq!(layout.input_mode_report_id, Some(0x25));
         assert_eq!(layout.selective_reporting_report_id, Some(0x22));
         assert_eq!(layout.latency_mode_report_id, Some(0x23));
+    }
+    #[test]
+    fn discovers_packed_contact_maximum_feature_from_real_descriptor() {
+        let layout = parse(&from_hex(THIRD_PARTY_PTP_DESCRIPTOR)).unwrap();
+        let field = layout.contact_count_max.unwrap();
+        assert_eq!(
+            field,
+            FeatureField {
+                report_id: 0x1f,
+                bit_offset: 0,
+                bit_size: 4,
+                payload_bytes: 1
+            }
+        );
+        assert_eq!(field.read(&[0x14]), Some(4));
+        assert_eq!(field.read(&[0x1f, 0x15]), Some(5));
+        assert_eq!(field.read(&[0x20, 0x15]), None);
+    }
+
+    #[test]
+    fn feature_extraction_handles_bit_boundaries_prefix_ambiguity_and_truncation() {
+        let field = FeatureField {
+            report_id: 4,
+            bit_offset: 7,
+            bit_size: 5,
+            payload_bytes: 2,
+        };
+        assert_eq!(field.read(&[0x84, 0x02]), Some(5));
+        assert_eq!(field.read(&[4, 0x84, 0x02]), Some(5));
+        assert_eq!(field.read(&[4, 0x02]), Some(4)); // First payload byte happens to equal ID.
+        assert_eq!(field.read(&[0x84]), None);
+        assert_eq!(
+            FeatureField {
+                bit_offset: usize::MAX,
+                ..field
+            }
+            .read(&[0; 2]),
+            None
+        );
+        assert_eq!(
+            FeatureField {
+                bit_size: 33,
+                ..field
+            }
+            .read(&[0; 2]),
+            None
+        );
+    }
+    #[test]
+    fn constant_standard_features_still_protect_their_report_ids() {
+        let mut walker = Walker::new(&[]);
+        walker.report_id = 5;
+        walker.report_size = 8;
+        walker.report_count = 1;
+        walker.usages.push(0x000d_0052);
+        walker.handle_feature(1).unwrap();
+        assert!(walker.standard_feature_report_ids.contains(&5));
+        assert!(walker.input_mode_report_id.is_none());
+    }
+
+    #[test]
+    fn contact_maximum_belongs_to_touchpad_not_a_sibling_touchscreen() {
+        let mut descriptor = from_hex("050d0904a1018510095575089501b102c0");
+        descriptor.extend(from_hex(THIRD_PARTY_PTP_DESCRIPTOR));
+        assert_eq!(
+            parse(&descriptor)
+                .unwrap()
+                .contact_count_max
+                .unwrap()
+                .report_id,
+            0x1f
+        );
     }
 }

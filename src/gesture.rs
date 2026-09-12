@@ -607,6 +607,9 @@ struct PendingTwoFingerTap {
 pub struct State<O: Output> {
     out: O,
     contacts: HashMap<u8, Tracked>,
+    /// Accidental contacts and participants in a cancelled gesture stay
+    /// excluded until physical lift. IDs are bytes, so storage is bounded.
+    rejected_contacts: [bool; 256],
     kind: GestureKind,
     started_at: Timestamp,
     /// Worst-case movement of any contact since the gesture started.
@@ -744,6 +747,7 @@ impl<O: Output> State<O> {
         Self {
             out,
             contacts: HashMap::new(),
+            rejected_contacts: [false; 256],
             kind: GestureKind::Idle,
             started_at: now,
             max_move_sq: 0.0,
@@ -771,10 +775,19 @@ impl<O: Output> State<O> {
     /// report, this cannot recognize a tap, seed inertia or commit a swipe.
     pub fn cancel_at(&mut self, now: Timestamp) {
         self.out.set_event_time(now);
-        self.out.cancel_inertia();
+        self.cancel_contacts_at(now);
         if self.prev_button {
             self.out.set_left_button_held(false);
         }
+        self.prev_button = false;
+        self.physical_button_used = false;
+        self.rejected_contacts.fill(false);
+        self.observe(&[], &[], now, false, false);
+    }
+
+    /// Cancel contact recognition without fabricating a physical button-up.
+    fn cancel_contacts_at(&mut self, now: Timestamp) {
+        self.out.cancel_inertia();
         match self.kind {
             GestureKind::TwoFingerPan => {
                 // Scroll uses Ended to close its active phase; Cancelled
@@ -824,11 +837,8 @@ impl<O: Output> State<O> {
         self.two_finger_recent = None;
         self.born_during_coast = false;
         self.suppress_one_finger_click = false;
-        self.prev_button = false;
-        self.physical_button_used = false;
         self.physical_drag_contact_id = None;
         self.physical_drag_pending_motion = None;
-        self.observe(&[], now, false, false);
     }
 
     /// Attach (or detach) the observer that receives a [`Snapshot`] per
@@ -901,7 +911,37 @@ impl<O: Output> State<O> {
             }
         }
 
-        let active: Vec<Contact> = frame.contacts.iter().copied().filter(|c| c.tip).collect();
+        // A confidence loss is cancellation, not a normal lift. Cancel
+        // the whole affected gesture and quarantine its participants so
+        // a remaining finger cannot become a fresh tap on its way up.
+        let lost_confidence = frame
+            .contacts
+            .iter()
+            .any(|c| !c.confidence && self.contacts.contains_key(&c.id));
+        let mut down = [false; 256];
+        for c in frame.contacts.iter().filter(|c| c.tip) {
+            down[c.id as usize] = true;
+        }
+        for (id, rejected) in self.rejected_contacts.iter_mut().enumerate() {
+            *rejected &= down[id];
+        }
+        if lost_confidence {
+            for id in self.contacts.keys() {
+                self.rejected_contacts[*id as usize] = down[*id as usize];
+            }
+            self.cancel_contacts_at(now);
+        }
+        for c in &frame.contacts {
+            if c.tip && !c.confidence {
+                self.rejected_contacts[c.id as usize] = true;
+            }
+        }
+        let active: Vec<Contact> = frame
+            .contacts
+            .iter()
+            .copied()
+            .filter(|c| c.tip && !self.rejected_contacts[c.id as usize])
+            .collect();
 
         // Refresh tracked-contact state (prev → current).
         let mut next: HashMap<u8, Tracked> = HashMap::with_capacity(active.len());
@@ -954,7 +994,7 @@ impl<O: Output> State<O> {
             }
 
             self.dispatch_physical_drag(&active, frame_dt);
-            self.observe(&active, now, frame.button, true);
+            self.observe(&active, &frame.contacts, now, frame.button, true);
             return;
         }
 
@@ -965,8 +1005,8 @@ impl<O: Output> State<O> {
         if !active.is_empty() {
             self.dispatch(&active, now, frame_dt);
         }
-        self.observe(&active, now, frame.button, false);
-        if active.is_empty() && !frame.button {
+        self.observe(&active, &frame.contacts, now, frame.button, false);
+        if !down.iter().any(|down| *down) && !frame.button {
             self.physical_button_used = false;
         }
     }
@@ -980,7 +1020,14 @@ impl<O: Output> State<O> {
     /// recomputing costs a few multiplications on frames where someone
     /// is watching, and stashing would have put a field on the engine
     /// that exists only for the benefit of a UI.
-    fn observe(&self, active: &[Contact], now: Timestamp, button: bool, physical_drag: bool) {
+    fn observe(
+        &self,
+        active: &[Contact],
+        raw: &[Contact],
+        now: Timestamp,
+        button: bool,
+        physical_drag: bool,
+    ) {
         let Some(obs) = self.observer.as_ref() else {
             return;
         };
@@ -988,8 +1035,9 @@ impl<O: Output> State<O> {
             return;
         }
 
-        let contacts = active
+        let contacts = raw
             .iter()
+            .filter(|c| c.tip)
             .map(|c| {
                 let tracked = self.contacts.get(&c.id);
                 ContactTrack {
@@ -1002,6 +1050,7 @@ impl<O: Output> State<O> {
                     age: tracked
                         .map_or(Duration::ZERO, |t| now.saturating_duration_since(t.down_at)),
                     confidence: c.confidence,
+                    excluded: self.rejected_contacts[c.id as usize],
                 }
             })
             .collect();
@@ -1071,7 +1120,8 @@ impl<O: Output> State<O> {
             contacts,
             since_start,
             max_move_mm,
-            tap_window_open: !self.physical_button_used
+            tap_window_open: !active.is_empty()
+                && !self.physical_button_used
                 && max_move_mm < TAP_MAX_MOVE_MM
                 && since_start < TAP_MAX_DURATION,
             two_finger,
@@ -2276,6 +2326,8 @@ pub struct ContactTrack {
     pub max_move_mm: f64,
     pub age: Duration,
     pub confidence: bool,
+    /// Still visible to observers, but excluded from gesture recognition.
+    pub excluded: bool,
 }
 
 /// The 2F lock decision vector. See [`TwoFingerBaseline::metrics`].
@@ -2809,6 +2861,76 @@ mod tests {
                 .any(|l| l.starts_with("swipe Horizontal +0.200") && l.ends_with("Changed")),
             "{log:?}"
         );
+    }
+
+    #[test]
+    fn accidental_contacts_never_move_or_tap_and_stay_rejected_until_lift() {
+        let out = Recorder::default();
+        let mut s = State::new(&out, test_accel());
+        let mut palm = frame(&[(1, 0.2, 0.4)]);
+        palm.contacts[0].confidence = false;
+        s.on_frame_at(palm, at_ms(0));
+        // Even erroneous confidence recovery must not revive this contact.
+        s.on_frame_at(frame(&[(1, 0.5, 0.4)]), at_ms(20));
+        s.on_frame_at(frame(&[(1, 0.6, 0.4)]), at_ms(30));
+        s.on_frame_at(frame(&[]), at_ms(50));
+        assert!(out.pop().is_empty());
+        // Reusing the ID after a real lift starts a valid new contact.
+        s.on_frame_at(frame(&[(1, 0.2, 0.4)]), at_ms(100));
+        s.on_frame_at(frame(&[]), at_ms(150));
+        assert!(out.pop().contains(&"click Left".to_owned()));
+    }
+
+    #[test]
+    fn confidence_loss_cancels_without_taps_inertia_or_swipe_commit() {
+        for count in 1..=4 {
+            let out = Recorder::default();
+            let mut s = State::new(&out, test_accel());
+            let contacts: Vec<_> = (0..count)
+                .map(|id| (id, 0.2 + id as f64 * 0.15, 0.4))
+                .collect();
+            s.on_frame_at(frame(&contacts), at_ms(0));
+            if count > 1 {
+                let moved: Vec<_> = contacts
+                    .iter()
+                    .map(|&(id, x, y)| (id, x, y + 0.2))
+                    .collect();
+                s.on_frame_at(frame(&moved), at_ms(20));
+            }
+            out.pop();
+            let mut rejected = frame(&contacts);
+            rejected.contacts[0].confidence = false;
+            s.on_frame_at(rejected, at_ms(30));
+            s.on_frame_at(frame(&contacts[1..]), at_ms(40));
+            s.on_frame_at(frame(&[]), at_ms(50));
+            let log = out.pop();
+            assert!(
+                !log.iter().any(|l| l.starts_with("click")
+                    || l.starts_with("scroll_inertia")
+                    || (l.starts_with("swipe") && l.ends_with("Ended"))),
+                "{count}: {log:?}"
+            );
+            if count >= 3 {
+                assert!(
+                    log.iter()
+                        .any(|l| l.starts_with("swipe") && l.ends_with("Cancelled")),
+                    "{log:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejecting_a_contact_preserves_physical_button_edges() {
+        let out = Recorder::default();
+        let mut s = State::new(&out, test_accel());
+        s.on_frame_at(frame_with_button(&[(1, 0.2, 0.4)], true), at_ms(0));
+        let mut palm = frame_with_button(&[(1, 0.2, 0.4)], true);
+        palm.contacts[0].confidence = false;
+        s.on_frame_at(palm, at_ms(20));
+        assert!(!out.pop().iter().any(|l| l == "set_left_button_held false"));
+        s.on_frame_at(frame(&[]), at_ms(50));
+        assert_eq!(out.pop(), vec!["set_left_button_held false"]);
     }
 
     #[test]
