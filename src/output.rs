@@ -13,7 +13,7 @@
 
 use core_foundation::base::TCFType;
 use core_foundation::date::CFAbsoluteTimeGetCurrent;
-use core_foundation::runloop::{CFRunLoop, kCFRunLoopDefaultMode};
+use core_foundation::runloop::{CFRunLoop, kCFRunLoopCommonModes};
 use core_foundation_sys::runloop::{
     CFRunLoopAddTimer, CFRunLoopTimerContext, CFRunLoopTimerCreate, CFRunLoopTimerInvalidate,
     CFRunLoopTimerRef,
@@ -1772,7 +1772,9 @@ impl Momentum {
             CFRunLoopAddTimer(
                 CFRunLoop::get_current().as_concrete_TypeRef() as *mut _,
                 timer,
-                kCFRunLoopDefaultMode,
+                // Common modes: a coast in progress must keep ticking
+                // while a menu is open or a window is being dragged.
+                kCFRunLoopCommonModes,
             );
         }
         self.timer_ref.set(timer);

@@ -20,7 +20,7 @@ use core_foundation::date::CFDate;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::CFNumber;
 use core_foundation::runloop::{
-    CFRunLoop, CFRunLoopRun, CFRunLoopTimer, kCFRunLoopDefaultMode,
+    CFRunLoop, CFRunLoopRun, CFRunLoopTimer, kCFRunLoopCommonModes,
 };
 use objc2::MainThreadMarker;
 use core_foundation::string::CFString;
@@ -264,10 +264,15 @@ impl Manager {
                 on_device_removed,
                 bridge_ptr as *mut c_void,
             );
+            // Common modes, not default mode. AppKit runs a nested run
+            // loop in event-tracking mode while a menu is open or a
+            // window is being dragged or resized; a source registered
+            // only in the default mode is not serviced then, which
+            // stalls input for as long as the menu is up.
             IOHIDManagerScheduleWithRunLoop(
                 self.raw,
                 CFRunLoop::get_current().as_concrete_TypeRef() as *mut _,
-                kCFRunLoopDefaultMode as *const _,
+                kCFRunLoopCommonModes as *const _,
             );
         }
 
@@ -361,10 +366,11 @@ fn install_heartbeat_timer(bridge_ptr: *mut Bridge) -> CFRunLoopTimer {
         on_heartbeat_tick,
         &mut context,
     );
-    // `kCFRunLoopDefaultMode` is the static common-mode CFString — safe
-    // to read its pointer value and pass through; CFRunLoopAddTimer
-    // copies/retains as needed.
-    let mode = unsafe { kCFRunLoopDefaultMode };
+    // Common modes, so the heartbeat keeps firing while a menu is open
+    // or a window is being dragged. The firmware reverts to mouse mode
+    // if it misses heartbeats for ~12 s, and a menu can easily be open
+    // that long.
+    let mode = unsafe { kCFRunLoopCommonModes };
     CFRunLoop::get_current().add_timer(&timer, mode);
     timer
 }
@@ -428,7 +434,7 @@ fn install_open_retry_timer(manager: IOHIDManagerRef) -> CFRunLoopTimer {
         on_open_retry,
         &mut context,
     );
-    let mode = unsafe { kCFRunLoopDefaultMode };
+    let mode = unsafe { kCFRunLoopCommonModes };
     CFRunLoop::get_current().add_timer(&timer, mode);
     timer
 }
@@ -631,10 +637,13 @@ unsafe extern "C" fn on_device_matched(
         let buf_len_isize = s.buf.len() as isize;
         let ctx_ptr = s as *mut DeviceState as *mut c_void;
 
+        // Common modes: input reports must keep arriving while a menu
+        // is open or a window is being dragged. See the note on the
+        // manager's scheduling above.
         IOHIDDeviceScheduleWithRunLoop(
             device,
             CFRunLoop::get_current().as_concrete_TypeRef() as *mut _,
-            kCFRunLoopDefaultMode as *const _,
+            kCFRunLoopCommonModes as *const _,
         );
 
         IOHIDDeviceRegisterInputReportCallback(

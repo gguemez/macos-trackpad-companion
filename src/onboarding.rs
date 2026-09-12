@@ -25,8 +25,7 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{AnyThread, MainThreadMarker, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSFont, NSTextField,
-    NSWindow, NSWindowStyleMask,
+    NSBackingStoreType, NSButton, NSFont, NSTextField, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
@@ -191,6 +190,8 @@ impl Setup {
         // same window again.
         unsafe { window.setReleasedWhenClosed(false) };
 
+        app_kit::register_window(window.clone());
+
         let actions = Actions::new(mtm);
         let content = window.contentView().expect("NSWindow auto-creates a contentView");
 
@@ -264,11 +265,7 @@ impl Setup {
     }
 
     fn present(&mut self, mtm: MainThreadMarker) {
-        // An accessory app can show a window but can't properly take
-        // focus; switch to a regular app for as long as it's up.
-        let app = NSApplication::sharedApplication(mtm);
-        app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
-        app.activate();
+        app_kit::activate_for_window(mtm);
 
         self.window.center();
         self.window.makeKeyAndOrderFront(None);
@@ -343,9 +340,9 @@ impl Setup {
         if let Some(timer) = self.timer.take() {
             unsafe { CFRunLoopTimerInvalidate(timer.as_concrete_TypeRef()) };
         }
-        // Back to a menu-bar-only agent.
-        NSApplication::sharedApplication(mtm)
-            .setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+        // Back to a menu-bar-only agent — unless the settings window
+        // is still open.
+        app_kit::settle_activation(mtm);
     }
 }
 

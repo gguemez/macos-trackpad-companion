@@ -19,6 +19,7 @@
 mod app_context;
 mod app_kit;
 mod config;
+mod config_edit;
 mod config_watch;
 mod descriptor;
 mod gesture;
@@ -30,6 +31,7 @@ mod overlay;
 mod permissions;
 mod report;
 mod scan_clock;
+mod settings;
 mod status_item;
 mod time;
 
@@ -140,6 +142,7 @@ fn main() -> Result<()> {
     // bar, so it has to live as long as `main` does.
     let mtm = objc2::MainThreadMarker::new()
         .ok_or_else(|| anyhow::anyhow!("main() must run on the main thread"))?;
+    settings::set_config_path(cfg_path.clone());
     let _status_item = status_item::StatusItem::install(mtm);
 
     // Auto-open when either grant is missing: without Accessibility the

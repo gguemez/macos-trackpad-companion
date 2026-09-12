@@ -67,6 +67,13 @@ define_class!(
             }
         }
 
+        #[unsafe(method(openSettings:))]
+        fn open_settings(&self, _sender: Option<&AnyObject>) {
+            if let Some(mtm) = MainThreadMarker::new() {
+                crate::settings::show(mtm);
+            }
+        }
+
         #[unsafe(method(quit:))]
         fn quit(&self, _sender: Option<&AnyObject>) {
             log::info!("quit requested from menu");
@@ -171,6 +178,17 @@ impl StatusItem {
         };
         unsafe { setup.setTarget(Some(target.as_ref() as &AnyObject)) };
         menu.addItem(&setup);
+
+        let settings = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                mtm.alloc::<NSMenuItem>(),
+                &NSString::from_str("Settings…"),
+                Some(sel!(openSettings:)),
+                &NSString::from_str(","),
+            )
+        };
+        unsafe { settings.setTarget(Some(target.as_ref() as &AnyObject)) };
+        menu.addItem(&settings);
 
         let quit = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(

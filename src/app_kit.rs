@@ -13,6 +13,7 @@
 //! but swallows every click. IOHID sources scheduled on the main run
 //! loop still fire, since `[NSApp run]` pumps that same run loop.
 
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -20,6 +21,7 @@ use objc2::MainThreadMarker;
 use objc2::rc::Retained;
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSEvent, NSEventModifierFlags, NSEventType,
+    NSWindow,
 };
 use objc2_foundation::NSPoint;
 
@@ -52,6 +54,34 @@ pub fn ensure_app(mtm: MainThreadMarker) -> Retained<NSApplication> {
         app.finishLaunching();
     }
     app
+}
+
+thread_local! {
+    /// Windows this app owns. Registered so that closing one doesn't
+    /// drop the app back to accessory while another is still open.
+    static WINDOWS: RefCell<Vec<Retained<NSWindow>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Track a window for activation-policy purposes. Call once per window.
+pub fn register_window(window: Retained<NSWindow>) {
+    WINDOWS.with(|w| w.borrow_mut().push(window));
+}
+
+/// Become a regular app so a window can take focus properly. An
+/// accessory app can show a window but can't key it reliably.
+pub fn activate_for_window(mtm: MainThreadMarker) {
+    let app = ensure_app(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+    app.activate();
+}
+
+/// Drop back to a menu-bar-only agent, but only once every registered
+/// window is closed.
+pub fn settle_activation(mtm: MainThreadMarker) {
+    let any_visible = WINDOWS.with(|w| w.borrow().iter().any(|win| win.isVisible()));
+    if !any_visible {
+        ensure_app(mtm).setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    }
 }
 
 /// Run the AppKit event loop. Blocks until [`request_stop`] fires.

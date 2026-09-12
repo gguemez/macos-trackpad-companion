@@ -6,6 +6,7 @@
 pub mod app_context;
 pub mod app_kit;
 pub mod config;
+pub mod config_edit;
 pub mod config_watch;
 pub mod descriptor;
 pub mod gesture;
@@ -17,5 +18,6 @@ pub mod overlay;
 pub mod permissions;
 pub mod report;
 pub mod scan_clock;
+pub mod settings;
 pub mod status_item;
 pub mod time;

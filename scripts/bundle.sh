@@ -82,6 +82,22 @@ echo "  version   : $VERSION"
 echo "  signed by : $SIGN_IDENTITY"
 # The designated requirement is what TCC matches on across rebuilds.
 codesign -d -r- "$APP" 2>&1 | sed -n 's/^designated => /  requirement: /p'
+
+# Optional install. The bundle in target/ is rebuilt (and rm -rf'd) on
+# every run, so a copy under ~/Applications is what you actually launch
+# day to day — and TCC grants follow the bundle id, not the path, so
+# both copies share one set of permissions.
+if [ "${INSTALL:-0}" = "1" ]; then
+	INSTALL_DIR=${INSTALL_DIR:-$HOME/Applications}
+	DEST="$INSTALL_DIR/Trackpad Companion.app"
+	mkdir -p "$INSTALL_DIR"
+	rm -rf "$DEST"
+	cp -R "$APP" "$DEST"
+	codesign --verify --strict "$DEST"
+	echo "  installed : $DEST"
+fi
+
 echo
 echo "run it:  open $APP"
 echo "or CLI:  $ROOT/target/release/companion -v"
+echo "install: INSTALL=1 $0"
