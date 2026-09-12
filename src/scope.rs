@@ -103,7 +103,7 @@ thread_local! {
     /// numbers mean, `main` knows how to reach the engine, and neither
     /// needs the other's knowledge.
     static LIVE_APPLY: RefCell<Option<LiveApply>> = const { RefCell::new(None) };
-    /// Last known values of the four tunables, so the canvas can show
+    /// Last known values of the tunables, so the canvas can show
     /// what the curves do even when there is no column (a replay reads
     /// them from the config file like everything else).
     static TUNING: Cell<Tuning> = Cell::new(Tuning::fallback());
@@ -114,9 +114,9 @@ thread_local! {
 /// Where a slider drag lands. `main` supplies one; see [`set_live_apply`].
 type LiveApply = Box<dyn Fn(Tuning)>;
 
-/// The four settings the scope can change while you gesture.
+/// The settings the scope can change while you gesture.
 ///
-/// Deliberately only these four: they are *feel*, not recognition. A
+/// Deliberately only these: they are *feel*, not recognition. A
 /// slider that moved a lock threshold would let you fix the gesture in
 /// front of you while silently breaking the one you tried yesterday,
 /// and with a single test device there would be no way to notice. See
@@ -140,7 +140,7 @@ impl Tuning {
         Self::from_config(&crate::config::Config::default())
     }
 
-    /// The four scroll numbers in the shape the emitter's curve wants.
+    /// The scroll numbers in the shape the emitter's curve wants.
     fn scroll_curve(&self) -> crate::output::ScrollAccel {
         crate::output::ScrollAccel {
             px_per_mm_at_ref: self.scroll_sensitivity,
@@ -172,7 +172,7 @@ fn current_tuning() -> Tuning {
     TUNING.with(Cell::get)
 }
 
-/// Read the four values off disk. The config file stays the shape of
+/// Read the tunables off disk. The config file stays the shape of
 /// truth even while the engine is running ahead of it.
 fn tuning_from_file() -> Tuning {
     crate::settings::config_path()
@@ -491,11 +491,13 @@ define_class!(
 /// timer, releasing the activation policy — is the one already proven
 /// by the red button rather than a second copy of it.
 fn close() {
-    WINDOW.with(|cell| {
-        if let Some(w) = cell.borrow().as_ref() {
-            w.window.performClose(None);
-        }
-    });
+    // Take a reference out of the borrow before calling into AppKit:
+    // performClose: is a message send, and holding a `RefCell` borrow
+    // across one is how a re-entrant callback turns into a panic.
+    let window = WINDOW.with(|cell| cell.borrow().as_ref().map(|w| w.window.clone()));
+    if let Some(window) = window {
+        window.performClose(None);
+    }
 }
 
 /// Every tuning slider lands here; which one moved doesn't matter,
@@ -589,7 +591,7 @@ struct Window {
     transport: Option<TransportUi>,
     tune: Option<TuneUi>,
     _close: Option<Retained<NSButton>>,
-    /// Pending debounced write of the four tunables. The engine already
+    /// Pending debounced write of the tunables. The engine already
     /// has them; this is only about not rewriting the file sixty times
     /// a second during a drag.
     flush_timer: Option<CFRunLoopTimer>,
@@ -768,7 +770,7 @@ impl Window {
         y -= 34.0;
         let note = label(
             mtm,
-            "Applies as you drag, then saves to the config file.",
+            "Applies when you let go.",
             x,
             y,
             w,
@@ -950,7 +952,7 @@ impl Window {
         self.flush_timer = Some(timer);
     }
 
-    /// Write the four values in one format-preserving edit, through the
+    /// Write every value in one format-preserving edit, through the
     /// settings window's own helper.
     fn flush(&mut self) {
         self.flush_timer = None;
@@ -1489,12 +1491,24 @@ fn draw_panel(
     let x = area.origin.x;
 
     // Status line.
-    let kind_color = match snap.kind {
-        GestureKind::Idle => dim(),
-        GestureKind::TwoFingerUnclassified => warn(),
-        _ => ink(),
+    // A held button with two or more fingers short-circuits the whole
+    // classification pipeline, so `kind` is left holding whatever it
+    // was before the press — a stale "2F scroll" next to "gestures
+    // suppressed" reads as a contradiction. Say what is actually
+    // happening instead.
+    let (kind_label, kind_color) = if snap.physical_drag {
+        ("physical drag", warn())
+    } else {
+        (
+            kind_name(snap.kind),
+            match snap.kind {
+                GestureKind::Idle => dim(),
+                GestureKind::TwoFingerUnclassified => warn(),
+                _ => ink(),
+            },
+        )
     };
-    let used = text(kind_name(snap.kind), x, y, mono_big, &kind_color);
+    let used = text(kind_label, x, y, mono_big, &kind_color);
     let mut sx = x + used + 16.0;
     sx += text(
         &format!("{} contacts", snap.contacts.len()),
@@ -1525,7 +1539,13 @@ fn draw_panel(
         sx += text("BUTTON", sx, y + 3.0, mono, &good()) + 14.0;
     }
     if snap.physical_drag {
-        text("physical drag — gestures suppressed", sx, y + 3.0, mono, &warn());
+        text(
+            "gestures suppressed while the button is held",
+            sx,
+            y + 3.0,
+            mono,
+            &warn(),
+        );
     }
     y += 26.0;
 

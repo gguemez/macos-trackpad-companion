@@ -302,6 +302,16 @@ With one test device that failure is invisible. Making the thresholds
 visible is the useful half; making them adjustable would reintroduce
 exactly the unfalsifiability this file argues against above.
 
+One narrow race, known and not fixed. Both the settings window and the
+scope write *every* slider value on any one slider moving, because the
+debounce coalesces a drag without tracking which key changed. With both
+windows open, a drag in one within a second of a drag in the other —
+before the mtime poll has re-read the file — writes that window's
+second-old value over the other's change. It is visible, correctable,
+and needs both windows open at once, which the scope exists to make
+unnecessary. The real fix is per-key dirty tracking in both flushes;
+worth doing only if anyone ever hits it.
+
 Also not done, deliberately: nothing in the scope is recorded. Watching
 is not capturing — `--record` already exists for that, and a scope that
 quietly wrote files would be a surprise.

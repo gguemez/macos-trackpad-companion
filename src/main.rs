@@ -266,7 +266,7 @@ fn run<O: output::Output + 'static>(
     state.borrow_mut().set_observer(Some(Box::new(scope::Feed)));
 
     // The config currently in force. The scope's tuning sliders change
-    // four of its fields and hand the result straight to the engine;
+    // six of its fields and hand the result straight to the engine;
     // the file watcher below replaces the whole thing when the file
     // changes. Both paths end at the same `apply_config`, so a slider
     // is felt immediately and the file — which the slider also writes,

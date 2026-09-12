@@ -54,7 +54,7 @@ pub fn text() -> String {
 
 /// The config values themselves, not just the path to them.
 ///
-/// Load-bearing since the gesture scope started changing four of these
+/// Load-bearing since the gesture scope started changing six of these
 /// while you gesture: someone can tune by feel, hit something odd and
 /// paste this, and without the values there is no way to tell whether
 /// they were running anything like the defaults. Read from the file,

@@ -50,7 +50,7 @@ const POLL_SECS: f64 = 1.0;
 const FLUSH_DELAY_SECS: f64 = 0.25;
 
 // Slider ranges. `pub(crate)` because the gesture scope carries the
-// same four sliders and must not invent its own bounds — two windows
+// same sliders and must not invent its own bounds — two windows
 // editing one key through different ranges is a bug waiting to happen.
 pub(crate) const CURSOR_MIN: f64 = 5.0;
 pub(crate) const CURSOR_MAX: f64 = 80.0;
@@ -366,7 +366,7 @@ fn on_off(on: bool) -> &'static str {
 }
 
 // Shared with the gesture scope's sliders: both windows write the same
-// four keys, and a value that rounded differently depending on which
+// same keys, and a value that rounded differently depending on which
 // window you dragged would show up as a phantom file change.
 pub(crate) fn round1(v: f64) -> f64 {
     (v * 10.0).round() / 10.0
