@@ -31,6 +31,8 @@ use crate::app_kit;
 
 const WINDOW_W: f64 = 420.0;
 const WINDOW_H: f64 = 190.0;
+/// Left edge of the icon, and of the attribution lines beneath it.
+const ICON_X: f64 = 28.0;
 /// Left edge of the text column, clear of the icon.
 const TEXT_X: f64 = 112.0;
 const TEXT_W: f64 = 284.0;
@@ -130,7 +132,7 @@ impl About {
         if let Some(icon) = app_kit::ensure_app(mtm).applicationIconImage() {
             let view = NSImageView::initWithFrame(
                 mtm.alloc(),
-                NSRect::new(NSPoint::new(28.0, 94.0), NSSize::new(64.0, 64.0)),
+                NSRect::new(NSPoint::new(ICON_X, 94.0), NSSize::new(64.0, 64.0)),
             );
             view.setImage(Some(&icon));
             content.addSubview(&view);
@@ -170,9 +172,12 @@ impl About {
         // can actually find, and it names the copyright holder rather
         // than this fork, because the LICENSE-MIT we ship is his.
         //
-        // Full width from the left margin rather than the text column:
-        // these two lines sit below the icon, so the column's inset
-        // would only make them wrap sooner for no alignment gained.
+        // Aligned to the icon's left edge, not the text column: these
+        // two lines sit below the icon, so the column's inset would
+        // only make them wrap sooner for no alignment gained. The right
+        // edge lands on the Close button's, so the block is bounded by
+        // the two things it sits between rather than by a margin of its
+        // own.
         for (i, line) in [
             "© 2026 Scott Lamb — MIT or Apache-2.0, at your option",
             "A fork of scottlamb/macos-trackpad-companion",
@@ -183,9 +188,9 @@ impl About {
             let note = label(
                 mtm,
                 line,
-                24.0,
+                ICON_X,
                 68.0 - 18.0 * i as f64,
-                WINDOW_W - 48.0,
+                WINDOW_W - 24.0 - ICON_X,
                 16.0,
             );
             note.setFont(Some(&NSFont::systemFontOfSize(11.0)));
