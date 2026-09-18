@@ -92,7 +92,7 @@ impl Default for Update {
 /// the page makes every installed copy fail its update check while the
 /// download it names is perfectly reachable.
 pub const DEFAULT_FEED_URL: &str =
-    "https://dl.trackpad-companion.guemez.net/appcast.json";
+    "https://dl.bridge.guemez.net/appcast.json";
 
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields, default)]

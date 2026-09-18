@@ -903,7 +903,7 @@ mod tests {
         let feed: Feed = serde_json::from_str(
             r#"{
   "version": "0.9.3",
-  "url": "https://dl.trackpad-companion.guemez.net/Trackpad-Companion-0.9.3.dmg",
+  "url": "https://dl.bridge.guemez.net/Trackpad-Companion-0.9.3.dmg",
   "notes": "https://github.com/gguemez/macos-trackpad-companion/blob/main/CHANGELOG.md",
   "sha256": "8f1ccd68f0d96b2e0f9b5b9f1a2c3d4e5f60718293a4b5c6d7e8f9012345678a",
   "size": 4194304

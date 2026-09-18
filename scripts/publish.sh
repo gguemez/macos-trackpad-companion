@@ -35,7 +35,7 @@ ROOT=$(pwd)
 
 R2_ACCOUNT_ID=${R2_ACCOUNT_ID:-1eae95e644e792224b62fdc521c01398}
 R2_BUCKET=${R2_BUCKET:-trackpad-companion-releases}
-PUBLIC_BASE=${PUBLIC_BASE:-https://dl.trackpad-companion.guemez.net}
+PUBLIC_BASE=${PUBLIC_BASE:-https://dl.bridge.guemez.net}
 
 # Seconds between the artifact going up and the feed that points at it.
 # See the two-phase note below for why this is not zero. Overridable for

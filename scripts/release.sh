@@ -22,7 +22,7 @@
 #   3. A stored notarytool credential profile. An app-specific password,
 #      NOT the Apple ID password:
 #        xcrun notarytool store-credentials "trackpad-companion-notary" \
-#          --apple-id guillermo@guemez.net --team-id DUT656TLYP
+#          --apple-id gg@guemez.net --team-id DUT656TLYP
 #      Any existing profile works too — it is the same Apple ID and team:
 #        NOTARY_PROFILE=runic-notary scripts/release.sh
 #
@@ -52,7 +52,7 @@ fi
 if ! xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1; then
 	echo "ERROR: no stored notarytool credential named '$NOTARY_PROFILE'."
 	echo "       xcrun notarytool store-credentials \"$NOTARY_PROFILE\" \\"
-	echo "         --apple-id guillermo@guemez.net --team-id DUT656TLYP"
+	echo "         --apple-id gg@guemez.net --team-id DUT656TLYP"
 	echo "       or point at an existing one:"
 	echo "         NOTARY_PROFILE=runic-notary $0"
 	exit 1
