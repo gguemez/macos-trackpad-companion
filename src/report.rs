@@ -63,7 +63,11 @@ fn decode_contacts(layout: &Layout, report: &[u8], count: Option<usize>) -> Opti
         return None;
     }
 
-    let contact_count = report[layout.contact_count_offset] as usize;
+    // The button bit can share the count byte on narrow-count packings
+    // (7-bit count + button bit 7 on the Brydge); the mask keeps it
+    // from inflating the count. Full-byte counts have a 0xFF mask, so
+    // this is behavior-identical there.
+    let contact_count = (report[layout.contact_count_offset] & layout.contact_count_mask) as usize;
     let n = count.unwrap_or(contact_count).min(layout.contact_slots);
 
     let mm_per_px_x = layout.mm_per_logical_px_x();
@@ -153,7 +157,7 @@ impl FrameAssembler {
             return Ok(None);
         }
         let mut frame = decode(layout, bytes).ok_or("invalid touch report")?;
-        let count = bytes[layout.contact_count_offset] as usize;
+        let count = (bytes[layout.contact_count_offset] & layout.contact_count_mask) as usize;
         if count > self.maximum {
             return Err("contact count exceeds device maximum");
         }
@@ -278,6 +282,7 @@ mod tests {
             },
             scan_time_offset: 31,
             contact_count_offset: 33,
+            contact_count_mask: 0xFF,
             button_offset: 34,
             button_bit: 0,
             logical_x_max: 3936,
@@ -356,6 +361,7 @@ mod tests {
             },
             scan_time_offset: 26,
             contact_count_offset: 28,
+            contact_count_mask: 0xFF,
             button_offset: 29,
             button_bit: 0,
             logical_x_max: 2160,
