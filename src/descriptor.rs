@@ -113,6 +113,12 @@ pub struct Layout {
     pub contact: ContactFields,
     pub scan_time_offset: usize,
     pub contact_count_offset: usize,
+    /// Mask ANDed with the byte at `contact_count_offset` before use.
+    /// `0xFF` when the count field occupies a full byte; narrower on
+    /// devices where the count shares its byte with the button bit
+    /// (e.g. the Brydge 12.3 Pro+ keyboard trackpad declares a 7-bit
+    /// Contact Count with Button 1 in bit 7 of the same byte).
+    pub contact_count_mask: u8,
     pub button_offset: usize,
     pub button_bit: u8,
     pub logical_x_max: i32,
@@ -814,7 +820,8 @@ impl<'a> Walker<'a> {
 
         if scan_time.bit_size != 16
             || scan_time.bit_offset % 8 != 0
-            || contact_count.bit_size != 8
+            || contact_count.bit_size == 0
+            || contact_count.bit_size > 8
             || contact_count.bit_offset % 8 != 0
             || button.bit_size != 1
         {
@@ -839,6 +846,7 @@ impl<'a> Walker<'a> {
             contact,
             scan_time_offset: scan_time.bit_offset / 8,
             contact_count_offset: contact_count.bit_offset / 8,
+            contact_count_mask: ((1u16 << contact_count.bit_size) - 1) as u8,
             button_offset: button.bit_offset / 8,
             button_bit: (button.bit_offset % 8) as u8,
             logical_x_max: self.logical_x_max.unwrap_or(1),
@@ -1061,6 +1069,7 @@ mod tests {
             },
             scan_time_offset: 31,
             contact_count_offset: 33,
+            contact_count_mask: 0xFF,
             button_offset: 34,
             button_bit: 0,
             logical_x_max: 100,
