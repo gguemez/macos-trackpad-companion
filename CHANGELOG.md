@@ -13,6 +13,25 @@ What is understood but *not* done — and what is not understood — stays in
 [`docs/known-gaps.md`](docs/known-gaps.md). That file is a standing record
 rather than a per-version one, so it is not duplicated here.
 
+## [Unreleased]
+
+### Added
+
+- Single-finger tap-then-drag for text selection and dragging without a
+  physical button, releasing immediately when the finger lifts.
+- Optional USB-triggered startup and exit on unplug, using a per-user
+  LaunchAgent and IOKit notifications. The setup script preserves the config
+  path, installs a stable app copy, and supports permission-reopen recovery.
+- A HongMall P-T066 descriptor fixture and a troubleshooting guide covering
+  device mode, macOS 27 swipe output, and USB activation.
+
+### Fixed
+
+- HongMall P-T066 (`048D:8911`) initialization now uses its declared standard
+  PTP controls instead of accepting a misleading RMK vendor-report success.
+- Synthetic swipes on macOS 27 now include the IOHID DockSwipe payload the
+  Dock consumes. Earlier macOS versions retain field-based output.
+
 ## [0.9.3] — 2026-09-12
 
 ### Added

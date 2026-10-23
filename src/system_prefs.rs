@@ -1,10 +1,11 @@
 //! System settings the companion has to reason about but must never
 //! change on the user's behalf.
 //!
-//! Currently one: whether macOS is configured to ignore the built-in
+//! Includes whether macOS is configured to ignore the built-in
 //! trackpad while an external pointing device is attached. That decides
 //! whether quitting can leave the machine with no pointer at all, and
-//! so whether the quit warning is worth showing or just noise.
+//! so whether the quit warning is worth showing or just noise. Also
+//! reads natural scrolling to compensate macOS 27's DockSwipe direction.
 
 use core_foundation::base::TCFType;
 use core_foundation::string::CFString;
@@ -38,6 +39,15 @@ const DOMAINS: [&str; 2] = [
 /// normal state rather than an error.
 pub fn builtin_trackpad_ignored() -> bool {
     DOMAINS.iter().any(|domain| read_flag(domain, KEY))
+}
+
+/// macOS 27's Dock applies this global preference to raw IOHID swipes.
+/// Missing means the system default (natural scrolling enabled).
+pub fn natural_scrolling() -> bool {
+    use objc2_foundation::{NSString, NSUserDefaults};
+    let defaults = NSUserDefaults::standardUserDefaults();
+    let key = NSString::from_str("com.apple.swipescrolldirection");
+    defaults.objectForKey(&key).is_none() || defaults.boolForKey(&key)
 }
 
 fn read_flag(domain: &str, key: &str) -> bool {

@@ -47,9 +47,9 @@ const kIOHIDReportTypeFeature: IOHIDReportType = 2;
 /// A single SET_FEATURE flips both flags atomically on the firmware
 /// side, so the firmware can recover from companion SIGKILL by reverting
 /// to mouse after a heartbeat timeout — no equivalent on the spec 0x08
-/// path. Standard PTP devices don't expose this report; we detect that
-/// case by trying 0x10 first and falling back to 0x08 on
-/// `kIOReturnUnsupported`. See `rmk/rmk/src/hid.rs::PTP_REPORT_DEADLINE_TICKS`.
+/// path. Devices that reject the probe fall back to descriptor-declared
+/// Input Mode controls. Known devices that falsely acknowledge the probe
+/// must skip it. See `rmk/rmk/src/hid.rs::PTP_REPORT_DEADLINE_TICKS`.
 const PTP_CONTROL_REPORT_ID: isize = 0x10;
 const PTP_CONTROL_PTP_HEARTBEAT: u8 = 0x83; // mode=3 + bit7
 const PTP_CONTROL_MOUSE: u8 = 0x00;
@@ -270,9 +270,8 @@ struct Bridge {
     devices: Vec<Pin<Box<DeviceState>>>,
 }
 
-/// Which mode-control report this device responds to. Decided once at
-/// match time by trying the vendor path first; the spec path is a
-/// universal fallback.
+/// Mode-control protocol selected at match time. Known standard-only
+/// devices bypass the vendor probe; other devices retain vendor-first setup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ControlPath {
     /// RMK vendor Report 0x10 — single-byte combined mode + heartbeat
@@ -846,10 +845,10 @@ unsafe extern "C" fn on_device_matched(
         ))
     });
 
-    // Prefer the RMK vendor control path when supported. For standard
-    // Precision Touchpads, discover the Input Mode and optional configuration
-    // feature report IDs from the HID descriptor.
-    let control_path = enter_ptp_mode(device, &product, &layout);
+    // The HongMall acknowledges unknown vendor writes, so it must use
+    // its descriptor-declared controls even if the RMK probe would succeed.
+    let standard_only = uses_standard_controls_only(vid, pid);
+    let control_path = enter_ptp_mode(device, &product, &layout, standard_only);
     if control_path == ControlPath::SpecInputMode {
         SPEC_PATH_DEVICE.store(true, Ordering::Relaxed);
     }
@@ -896,16 +895,44 @@ unsafe extern "C" fn on_device_matched(
     bridge.devices.push(state);
 }
 
-/// Probe + enter PTP mode. Tries the RMK vendor 0x10 report first
-/// (single-byte combined mode + heartbeat opt-in). On
-/// `kIOReturnUnsupported` — what every standard PTP device returns for
-/// our vendor report — silently falls back to the spec 0x08 path. Other
-/// errors fall back too but are logged: typical case is a USB hiccup,
-/// no point bailing the match flow when the spec path is universally
-/// implemented.
-fn enter_ptp_mode(device: IOHIDDeviceRef, product: &str, layout: &Layout) -> ControlPath {
-    if let Some(id) = layout.input_mode_report_id {
-        match get_feature_byte(device, id as isize) {
+/// HongMall P-T066: unknown feature writes can succeed without changing
+/// mode. Its mode readback also returns a bogus one-byte zero. Use the
+/// descriptor's controls and verify operation through input frames instead.
+fn uses_standard_controls_only(vid: Option<i32>, pid: Option<i32>) -> bool {
+    (vid, pid) == (Some(0x048d), Some(0x8911))
+}
+
+fn enter_ptp_mode(
+    device: IOHIDDeviceRef,
+    product: &str,
+    layout: &Layout,
+    standard_only: bool,
+) -> ControlPath {
+    configure_ptp(
+        product,
+        layout,
+        standard_only,
+        |id, value| set_feature_byte(device, id as isize, value),
+        |id| get_feature_byte(device, id as isize),
+    )
+}
+
+/// Configure mode through injectable feature I/O. SET_FEATURE success alone
+/// is not evidence that a vendor protocol is implemented by a device.
+fn configure_ptp(
+    product: &str,
+    layout: &Layout,
+    standard_only: bool,
+    mut set: impl FnMut(u8, u8) -> IOReturn,
+    mut get: impl FnMut(u8) -> Option<u8>,
+) -> ControlPath {
+    if standard_only {
+        log::info!(
+            "\"{product}\": using descriptor-declared PTP controls; skipping RMK vendor probe and unreliable mode readback"
+        );
+    }
+    if !standard_only && let Some(id) = layout.input_mode_report_id {
+        match get(id) {
             Some(PTP_INPUT_MODE_PTP) => log::info!(
                 "\"{product}\": already in PTP mode — a previous run probably \
                  exited without reverting"
@@ -926,10 +953,10 @@ fn enter_ptp_mode(device: IOHIDDeviceRef, product: &str, layout: &Layout) -> Con
     //
     // The rule is deliberately narrow. RMK answers 0x10 without
     // declaring it in its descriptor, so "undeclared" has to stay
-    // probeable or its heartbeat protection disappears. Only a report
-    // declared on a standard usage page is off-limits.
-    if !layout.vendor_probe_would_collide(PTP_CONTROL_REPORT_ID as u8) {
-        let rv = set_feature_byte(device, PTP_CONTROL_REPORT_ID, PTP_CONTROL_PTP_HEARTBEAT);
+    // probeable or its heartbeat protection disappears. Reports declared
+    // for a standard purpose and known standard-only devices are off-limits.
+    if !standard_only && !layout.vendor_probe_would_collide(PTP_CONTROL_REPORT_ID as u8) {
+        let rv = set(PTP_CONTROL_REPORT_ID as u8, PTP_CONTROL_PTP_HEARTBEAT);
         if rv == kIOReturnSuccess {
             log::info!("\"{product}\": entered PTP via vendor Report 0x10 (heartbeat-protected)");
             return ControlPath::Vendor;
@@ -939,7 +966,7 @@ fn enter_ptp_mode(device: IOHIDDeviceRef, product: &str, layout: &Layout) -> Con
              falling back to the spec path",
             rv as u32
         );
-    } else {
+    } else if !standard_only {
         log::info!(
             "\"{product}\": report {:#04x} is declared for another purpose; \
              skipping the vendor probe",
@@ -954,7 +981,7 @@ fn enter_ptp_mode(device: IOHIDDeviceRef, product: &str, layout: &Layout) -> Con
         return ControlPath::SpecInputMode;
     };
 
-    let rv = set_feature_byte(device, input_mode_id as isize, PTP_INPUT_MODE_PTP);
+    let rv = set(input_mode_id, PTP_INPUT_MODE_PTP);
 
     if rv != kIOReturnSuccess {
         log::warn!(
@@ -966,7 +993,7 @@ fn enter_ptp_mode(device: IOHIDDeviceRef, product: &str, layout: &Layout) -> Con
     }
 
     if let Some(id) = layout.selective_reporting_report_id {
-        let rv = set_feature_byte(device, id as isize, PTP_SELECTIVE_REPORT_ALL);
+        let rv = set(id, PTP_SELECTIVE_REPORT_ALL);
 
         if rv != kIOReturnSuccess {
             log::warn!(
@@ -978,7 +1005,7 @@ fn enter_ptp_mode(device: IOHIDDeviceRef, product: &str, layout: &Layout) -> Con
     }
 
     if let Some(id) = layout.latency_mode_report_id {
-        let rv = set_feature_byte(device, id as isize, PTP_LATENCY_NORMAL);
+        let rv = set(id, PTP_LATENCY_NORMAL);
 
         if rv != kIOReturnSuccess {
             log::warn!(
@@ -989,7 +1016,13 @@ fn enter_ptp_mode(device: IOHIDDeviceRef, product: &str, layout: &Layout) -> Con
         }
     }
 
-    match get_feature_byte(device, input_mode_id as isize) {
+    // This model's successful SET is followed by touch reports, not by a
+    // trustworthy feature read. Do not misreport its bogus zero as a failure.
+    match if standard_only {
+        None
+    } else {
+        get(input_mode_id)
+    } {
         Some(PTP_INPUT_MODE_PTP) => log::info!(
             "\"{product}\": entered standard PTP mode via report {:#04x} (verified)",
             input_mode_id,
@@ -1288,6 +1321,89 @@ mod tests {
     use core_foundation_sys::base::CFGetRetainCount;
     use std::cell::Cell;
     use std::rc::Rc;
+
+    fn hongmall_layout() -> Layout {
+        let descriptor: Vec<u8> = include_str!("../tests/fixtures/hongmall-pt066-descriptor.hex")
+            .split_whitespace()
+            .map(|byte| u8::from_str_radix(byte, 16).unwrap())
+            .collect();
+        assert_eq!(descriptor.len(), 628);
+        descriptor::parse(&descriptor).unwrap()
+    }
+
+    #[test]
+    fn hongmall_uses_declared_mode_and_reporting_even_when_vendor_write_would_succeed() {
+        let layout = hongmall_layout();
+        assert_eq!(layout.input_mode_report_id, Some(3));
+        assert_eq!(layout.selective_reporting_report_id, Some(5));
+        assert_eq!(layout.latency_mode_report_id, Some(7));
+        let mut writes = Vec::new();
+        let path = configure_ptp(
+            "HongMall",
+            &layout,
+            uses_standard_controls_only(Some(0x048d), Some(0x8911)),
+            |id, value| {
+                writes.push((id, value));
+                kIOReturnSuccess
+            },
+            |_| panic!("HongMall mode readback must not be trusted"),
+        );
+        assert_eq!(path, ControlPath::SpecInputMode);
+        assert_eq!(writes, [(3, 3), (5, 3), (7, 0)]);
+    }
+
+    #[test]
+    fn other_devices_keep_vendor_heartbeat_when_the_probe_succeeds() {
+        let layout = hongmall_layout();
+        let mut writes = Vec::new();
+        let path = configure_ptp(
+            "Other device",
+            &layout,
+            uses_standard_controls_only(Some(0x048d), Some(0x8912)),
+            |id, value| {
+                writes.push((id, value));
+                kIOReturnSuccess
+            },
+            |_| None,
+        );
+        assert_eq!(path, ControlPath::Vendor);
+        assert_eq!(writes, [(0x10, 0x83)]);
+    }
+
+    #[test]
+    fn failed_vendor_probe_falls_back_to_the_discovered_standard_reports() {
+        let layout = hongmall_layout();
+        let mut writes = Vec::new();
+        let path = configure_ptp(
+            "Other device",
+            &layout,
+            false,
+            |id, value| {
+                writes.push((id, value));
+                if id == 0x10 { -1 } else { kIOReturnSuccess }
+            },
+            |_| None,
+        );
+        assert_eq!(path, ControlPath::SpecInputMode);
+        assert_eq!(writes, [(0x10, 0x83), (3, 3), (5, 3), (7, 0)]);
+    }
+
+    #[test]
+    fn failed_hongmall_mode_write_does_not_enable_reporting_or_try_vendor_control() {
+        let layout = hongmall_layout();
+        let mut writes = Vec::new();
+        configure_ptp(
+            "HongMall",
+            &layout,
+            uses_standard_controls_only(Some(0x048d), Some(0x8911)),
+            |id, value| {
+                writes.push((id, value));
+                -1
+            },
+            |_| panic!("mode readback is unreliable"),
+        );
+        assert_eq!(writes, [(3, 3)]);
+    }
 
     #[test]
     fn manager_drop_releases_its_create_reference_without_opening_devices() {

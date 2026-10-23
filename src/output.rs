@@ -320,6 +320,8 @@ const GESTURE_SUBTYPE_MAGNIFY: u32 = 0x08;
 // without animating — `jurplel/iss`'s "instant switch" shortcut.)
 // `Emitter::swipe_synthetic` is live-driven by the gesture engine:
 // each chip frame produces one Changed, lift produces Ended.
+// On macOS 27 the Dock reads the embedded IOHID representation instead
+// of these fields; `dock_swipe.rs` encodes that payload as field 4205.
 //
 // Sources used:
 //   - Field names and indices: Apple's WebKit test SPI header
@@ -472,6 +474,8 @@ unsafe extern "C" {
     fn CFDataAppendBytes(data: *mut c_void, bytes: *const u8, length: i64);
     fn CFDataDeleteBytes(data: *mut c_void, range: CFRange);
     fn CFDataGetLength(data: *const c_void) -> i64;
+    fn CFDataGetBytePtr(data: *const c_void) -> *const u8;
+    fn CFDataCreate(allocator: *const c_void, bytes: *const u8, length: i64) -> *mut c_void;
 }
 
 struct Event(CGEventRef);
@@ -508,6 +512,30 @@ impl Event {
     }
     fn set_dbl(&self, field: u32, value: f64) {
         unsafe { CGEventSetDoubleValueField(self.0, field, value) };
+    }
+    fn serialized(&self) -> Option<Vec<u8>> {
+        let data = unsafe { CGEventCreateData(std::ptr::null(), self.0) };
+        if data.is_null() {
+            return None;
+        }
+        let len = unsafe { CFDataGetLength(data) };
+        let ptr = unsafe { CFDataGetBytePtr(data) };
+        let result = if len > 0 && !ptr.is_null() {
+            Some(unsafe { std::slice::from_raw_parts(ptr, len as usize) }.to_vec())
+        } else {
+            None
+        };
+        unsafe { CFRelease(data) };
+        result
+    }
+    fn from_serialized(bytes: &[u8]) -> Option<Self> {
+        let data = unsafe { CFDataCreate(std::ptr::null(), bytes.as_ptr(), bytes.len() as i64) };
+        if data.is_null() {
+            return None;
+        }
+        let event = unsafe { CGEventCreateFromData(std::ptr::null(), data) };
+        unsafe { CFRelease(data) };
+        Self::from_raw(event)
     }
     fn post(&self) {
         unsafe { CGEventPost(kCGHIDEventTap, self.0) };
@@ -994,6 +1022,11 @@ pub trait Output {
     /// path and chained with [`Self::click`] (a tap followed by a
     /// quick hardware press counts as one multi-click sequence).
     fn set_left_button_held(&self, held: bool);
+    /// Start character-level tap dragging. Unlike a hardware re-press, this
+    /// continues the first tap's selection rather than double-clicking a word.
+    fn begin_tap_drag(&self) {
+        self.set_left_button_held(true);
+    }
     fn scroll(&self, dx_mm: f64, dy_mm: f64, phase: Phase);
     /// Seed scroll inertia from a just-ended pan. `vx_mm_per_sec` and
     /// `vy_mm_per_sec` are the EMA-smoothed centroid velocity at lift.
@@ -1082,6 +1115,9 @@ impl<O: Output> Output for OverlayOutput<O> {
     fn set_left_button_held(&self, held: bool) {
         self.inner.set_left_button_held(held);
     }
+    fn begin_tap_drag(&self) {
+        self.inner.begin_tap_drag();
+    }
     fn scroll(&self, dx_mm: f64, dy_mm: f64, phase: Phase) {
         if matches!(phase, Phase::Began) {
             self.flash("SCROLL");
@@ -1150,6 +1186,9 @@ pub struct Emitter {
     /// gesture, sparing the Dock a stuck rubber-band. None when no
     /// swipe is active.
     swipe_axis: Cell<Option<SwipeAxis>>,
+    /// macOS 27 applies the system natural-scroll direction to IOHID
+    /// swipes. Sample its compensation at Began and hold until lift.
+    swipe_wire_sign: Cell<f64>,
     /// Host-aligned scan timestamp for the frame currently being
     /// processed by the gesture engine. Set via `set_event_time` at
     /// the top of `on_frame_at`; consulted by every per-frame emit
@@ -1230,6 +1269,7 @@ impl Emitter {
                 began_posted: Cell::new(false),
             }),
             swipe_axis: Cell::new(None),
+            swipe_wire_sign: Cell::new(-1.0),
             event_time: Cell::new(None),
             left_button_held: Cell::new(None),
         }
@@ -1300,6 +1340,9 @@ impl Emitter {
         };
         e.set_int(kCGMouseEventDeltaX, i64::from(dx_px));
         e.set_int(kCGMouseEventDeltaY, i64::from(dy_px));
+        if let Some(count) = self.left_button_held.get() {
+            e.set_int(kCGMouseEventClickState, count);
+        }
         unsafe { CGEventSetTimestamp(e.0, self.event_timestamp().as_nanos()) };
         log::trace!(
             "post: {} d=({:+},{:+})px to=({:.0},{:.0})",
@@ -1342,9 +1385,17 @@ impl Emitter {
             let c = self.left_button_held.replace(None).unwrap_or(1);
             (kCGEventLeftMouseUp, c)
         };
+        self.post_left_button(event_type, count, p, now);
+    }
+
+    fn post_left_button(&self, event_type: u32, count: i64, p: CGPoint, now: Timestamp) {
         log::debug!(
             "post: leftMouse{} count={} at=({:.0},{:.0})",
-            if held { "Down" } else { "Up" },
+            if event_type == kCGEventLeftMouseDown {
+                "Down"
+            } else {
+                "Up"
+            },
             count,
             p.x,
             p.y,
@@ -1356,6 +1407,24 @@ impl Emitter {
             unsafe { CGEventSetTimestamp(e.0, now.as_nanos()) };
             e.post();
         }
+    }
+
+    pub fn begin_tap_drag(&self) {
+        if self.left_button_held.get().is_some() {
+            return;
+        }
+        // A tap already emitted a click. Counting the drag press as its
+        // second click would turn character selection into word selection.
+        // The drag also ends the multi-click sequence; its matching move/up
+        // events use the count stored with the held button.
+        self.last_click.set(None);
+        self.left_button_held.set(Some(1));
+        self.post_left_button(
+            kCGEventLeftMouseDown,
+            1,
+            self.cursor(),
+            self.event_timestamp(),
+        );
     }
 
     /// Decide the `kCGMouseEventClickState` for a fresh press of `button`
@@ -1520,11 +1589,9 @@ impl Emitter {
     ///
     /// Input sign convention (gesture-engine): positive `signed_progress`
     /// = finger centroid moved in the +X (right) / +Y (down) direction
-    /// from the gesture's start. The Dock's wire convention is the
-    /// opposite on both axes — measured at the keyboard, fingers-right
-    /// matches a negative horizontal `origin_offset` and fingers-up
-    /// (Mission Control) matches a positive vertical `origin_offset` —
-    /// so this function negates both before sending.
+    /// from the gesture's start. The legacy Dock convention negates
+    /// both axes. macOS 27 also applies the system natural-scrolling
+    /// preference; `swipe_synthetic` compensates at gesture start.
     pub fn swipe(
         &self,
         axis: SwipeAxis,
@@ -1560,8 +1627,8 @@ impl Emitter {
         }
     }
 
-    /// Live-animated DockSwipe synthesis. Posts an event pair per
-    /// gesture-engine frame; user can reverse or abort mid-gesture.
+    /// Live-animated DockSwipe synthesis. Posts per gesture-engine
+    /// frame; user can reverse or abort mid-gesture.
     /// See [`post_dock_swipe`] for the event shape and attribution.
     fn swipe_synthetic(
         &self,
@@ -1570,12 +1637,15 @@ impl Emitter {
         velocity_mm_per_sec: f64,
         phase: Phase,
     ) {
-        // Gesture-engine convention: positive `signed_progress` = finger
-        // centroid moved +X (right) / +Y (down) since gesture start.
-        // Dock's wire convention is the opposite on both axes (measured
-        // at the keyboard); negate to match. Flip a branch if a swipe
-        // goes the wrong direction.
-        let origin_offset = -signed_progress;
+        if matches!(phase, Phase::Began) {
+            let sign = dock_swipe_wire_sign(
+                dock_swipe_uses_iohid(),
+                crate::system_prefs::natural_scrolling(),
+            );
+            self.swipe_wire_sign.set(sign);
+        }
+        let sign = self.swipe_wire_sign.get();
+        let origin_offset = sign * signed_progress;
         let motion = match axis {
             SwipeAxis::Horizontal => SWIPE_MOTION_HORIZONTAL,
             SwipeAxis::Vertical => SWIPE_MOTION_VERTICAL,
@@ -1594,8 +1664,16 @@ impl Emitter {
         // Velocity is meaningful at lift only; cap to keep fast lifts
         // from looking abrupt vs. real-trackpad feel. See
         // SWIPE_END_VELOCITY_MAX comment.
-        let velocity = matches!(phase, Phase::Ended | Phase::Cancelled)
-            .then(|| velocity_mm_per_sec.clamp(-SWIPE_END_VELOCITY_MAX, SWIPE_END_VELOCITY_MAX));
+        let velocity = matches!(phase, Phase::Ended | Phase::Cancelled).then(|| {
+            let capped = velocity_mm_per_sec.clamp(-SWIPE_END_VELOCITY_MAX, SWIPE_END_VELOCITY_MAX);
+            // The IOHID velocity must use the same coordinates as progress.
+            // Preserve the established field-only behavior on earlier macOS.
+            if dock_swipe_uses_iohid() {
+                sign * capped
+            } else {
+                capped
+            }
+        });
         log::trace!(
             "post: swipe (synthetic) axis={:?} motion={} progress={:+.3} origin_offset={:+.3} v={:+.1} (capped {:+.1}) phase={:?}",
             axis,
@@ -1711,6 +1789,30 @@ fn send_dock_notification(name: &str) {
     }
 }
 
+fn dock_swipe_wire_sign(embed_iohid: bool, natural: bool) -> f64 {
+    // The IOHID path now applies the system's natural-scroll preference
+    // itself. Compensate so physical gesture directions stay consistent.
+    if embed_iohid && natural { 1.0 } else { -1.0 }
+}
+
+fn dock_swipe_uses_iohid() -> bool {
+    static USE_IOHID: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *USE_IOHID.get_or_init(|| {
+        let major = objc2_foundation::NSProcessInfo::processInfo()
+            .operatingSystemVersion()
+            .majorVersion;
+        log::info!(
+            "swipe output: macOS {major}, {}",
+            if major >= 27 {
+                "embedded IOHID payload"
+            } else {
+                "legacy CGEvent fields"
+            }
+        );
+        major >= 27
+    })
+}
+
 /// Synthesize and post a DockSwipe event on `kCGSessionEventTap`.
 /// Drives the rubber-band animated path (Mission Control / App
 /// Exposé / Spaces / Full-Screen Apps).
@@ -1732,25 +1834,51 @@ fn post_dock_swipe(
     velocity: Option<f64>,
     ts: Timestamp,
 ) {
-    let Some(event) = Event::with_source(source) else {
+    let embed_iohid = dock_swipe_uses_iohid();
+    let swipe = crate::dock_swipe::DockSwipe {
+        motion: motion as u16,
+        phase: phase as u32,
+        progress: origin_offset,
+        velocity,
+        timestamp_ns: ts.as_nanos(),
+    };
+    let Some(event) = make_dock_swipe(source, &swipe, embed_iohid) else {
+        log::warn!("could not construct DockSwipe event (embedded IOHID={embed_iohid})");
         return;
     };
+    event.post_to(kCGSessionEventTap);
+}
+
+/// Construct without posting, so the real CoreGraphics parser can be
+/// exercised by tests without changing desktops or opening Mission Control.
+fn make_dock_swipe(
+    source: CGEventSourceRef,
+    swipe: &crate::dock_swipe::DockSwipe,
+    embed_iohid: bool,
+) -> Option<Event> {
+    let event = Event::with_source(source)?;
     event.set_int(kCGSEventTypeField, kCGSEventDockControl);
     event.set_int(kCGEventGestureHIDType, kIOHIDEventTypeDockSwipe);
-    event.set_int(kCGEventGesturePhase, phase);
-    event.set_int(kCGEventGestureSwipeMotion, motion);
-    event.set_dbl(kCGEventGestureSwipeProgress, origin_offset);
-    // Same progress, written into field 135's *integer* slot as the
-    // bit pattern of `(Float32) progress`. Sign-preserving int32 →
-    // int64. See module comment for why this is necessary.
-    let progress_bits_i32 = (origin_offset as f32).to_bits() as i32;
-    event.set_int(kCGEventScrollGestureFlagBits, i64::from(progress_bits_i32));
-    if let Some(v) = velocity {
+    event.set_int(kCGEventGesturePhase, i64::from(swipe.phase));
+    event.set_int(kCGEventGestureSwipeMotion, i64::from(swipe.motion));
+    event.set_dbl(kCGEventGestureSwipeProgress, swipe.progress);
+    // Field 135 stores the signed f32 bit pattern in an integer slot.
+    let progress_bits = (swipe.progress as f32).to_bits() as i32;
+    event.set_int(kCGEventScrollGestureFlagBits, i64::from(progress_bits));
+    if let Some(v) = swipe.velocity {
         event.set_dbl(kCGEventGestureSwipeVelocityX, v);
         event.set_dbl(kCGEventGestureSwipeVelocityY, v);
     }
-    unsafe { CGEventSetTimestamp(event.0, ts.as_nanos()) };
-    event.post_to(kCGSessionEventTap);
+    unsafe { CGEventSetTimestamp(event.0, swipe.timestamp_ns) };
+    if !embed_iohid {
+        return Some(event);
+    }
+    let mut bytes = event.serialized()?;
+    if let Err(reason) = swipe.append_to(&mut bytes) {
+        log::warn!("DockSwipe serialization: {reason}");
+        return None;
+    }
+    Event::from_serialized(&bytes)
 }
 
 /// Post a single phased scroll event. Exactly one of `scroll_phase` and
@@ -2064,6 +2192,9 @@ impl Output for Emitter {
     fn set_left_button_held(&self, held: bool) {
         Emitter::set_left_button_held(self, held);
     }
+    fn begin_tap_drag(&self) {
+        Emitter::begin_tap_drag(self);
+    }
     fn scroll(&self, dx_mm: f64, dy_mm: f64, phase: Phase) {
         Emitter::scroll(self, dx_mm, dy_mm, phase);
     }
@@ -2087,6 +2218,68 @@ impl Output for Emitter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dock_swipe_formats_survive_coregraphics_serialization() {
+        // No CGEventPost, device open, or permission prompts in this test.
+        unsafe extern "C" {
+            fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
+            fn CGEventGetDoubleValueField(event: CGEventRef, field: u32) -> f64;
+            fn CGEventGetTimestamp(event: CGEventRef) -> u64;
+        }
+        for embed_iohid in [false, true] {
+            for motion in [SWIPE_MOTION_HORIZONTAL, SWIPE_MOTION_VERTICAL] {
+                for phase in [1, 2, 4, 8] {
+                    for progress in [-0.25, 0.25] {
+                        let swipe = crate::dock_swipe::DockSwipe {
+                            motion: motion as u16,
+                            phase,
+                            progress,
+                            velocity: (phase == 4 || phase == 8).then_some(progress * 14.0),
+                            timestamp_ns: 1234567890000,
+                        };
+                        let event = make_dock_swipe(std::ptr::null_mut(), &swipe, embed_iohid)
+                            .expect("CoreGraphics must accept the swipe event");
+                        // Reparse the serialized result to exercise both formats.
+                        let bytes = event.serialized().unwrap();
+                        let event = Event::from_serialized(&bytes).unwrap();
+                        let payload = swipe.payload();
+                        assert_eq!(
+                            bytes.windows(payload.len()).any(|w| w == payload),
+                            embed_iohid
+                        );
+                        unsafe {
+                            assert_eq!(
+                                CGEventGetIntegerValueField(event.0, kCGSEventTypeField),
+                                30
+                            );
+                            assert_eq!(
+                                CGEventGetIntegerValueField(event.0, kCGEventGestureHIDType),
+                                23
+                            );
+                            assert_eq!(
+                                CGEventGetIntegerValueField(event.0, kCGEventGestureSwipeMotion),
+                                motion
+                            );
+                            assert_eq!(
+                                CGEventGetIntegerValueField(event.0, kCGEventGesturePhase),
+                                i64::from(phase)
+                            );
+                            assert_eq!(
+                                CGEventGetDoubleValueField(event.0, kCGEventGestureSwipeProgress),
+                                progress
+                            );
+                            assert_eq!(
+                                CGEventGetDoubleValueField(event.0, kCGEventGestureSwipeVelocityX),
+                                swipe.velocity.unwrap_or(0.0)
+                            );
+                            assert_eq!(CGEventGetTimestamp(event.0), swipe.timestamp_ns);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn policy_on_admits_without_calling_lookup() {

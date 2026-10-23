@@ -1,6 +1,6 @@
 //! Per-frame gesture classifier.
 //!
-//! Tracks contacts across frames, distinguishes 1-finger (cursor/tap),
+//! Tracks contacts across frames, distinguishes 1-finger (cursor/tap/drag),
 //! 2-finger (pan/pinch/rotate, mode-locked on first significant motion),
 //! 3-finger swipe, and 4-finger swipe. Pure logic — depends only on
 //! [`crate::report::Frame`] and an [`Output`] sink — so the heuristics
@@ -651,6 +651,8 @@ pub struct State<O: Output> {
     /// frames stretch — e.g. coalesced reports under load).
     prev_frame_at: Option<Timestamp>,
     pending_two_finger_tap: Option<PendingTwoFingerTap>,
+    tap_drag: crate::tap_drag::TapDrag,
+    tap_drag_suppresses_taps: bool,
     /// See [`TwoFingerRecent`]. Set on a 2F → 1F partial lift, taken
     /// at the top of the next `transition` call to decide whether to
     /// restore. Auto-cleared if it goes stale (window expired) while
@@ -760,6 +762,8 @@ impl<O: Output> State<O> {
             cursor_carry_y_px: 0.0,
             prev_frame_at: None,
             pending_two_finger_tap: None,
+            tap_drag: crate::tap_drag::TapDrag::default(),
+            tap_drag_suppresses_taps: false,
             two_finger_recent: None,
             born_during_coast: false,
             suppress_one_finger_click: false,
@@ -787,6 +791,10 @@ impl<O: Output> State<O> {
 
     /// Cancel contact recognition without fabricating a physical button-up.
     fn cancel_contacts_at(&mut self, now: Timestamp) {
+        if self.tap_drag.cancel() && !self.prev_button {
+            self.out.set_left_button_held(false);
+        }
+        self.tap_drag_suppresses_taps = false;
         self.out.cancel_inertia();
         match self.kind {
             GestureKind::TwoFingerPan => {
@@ -926,10 +934,14 @@ impl<O: Output> State<O> {
             *rejected &= down[id];
         }
         if lost_confidence {
+            let was_tap_drag = self.tap_drag.held();
             for id in self.contacts.keys() {
                 self.rejected_contacts[*id as usize] = down[*id as usize];
             }
             self.cancel_contacts_at(now);
+            if was_tap_drag {
+                self.tap_drag.suppress_until_lift();
+            }
         }
         for c in &frame.contacts {
             if c.tip && !c.confidence {
@@ -942,6 +954,27 @@ impl<O: Output> State<O> {
             .copied()
             .filter(|c| c.tip && !self.rejected_contacts[c.id as usize])
             .collect();
+
+        if self.physical_button_used {
+            // Transfer an existing software hold to a real button without
+            // inserting an up/down pair. Its eventual hardware release owns up.
+            if self.tap_drag.cancel() && !frame.button {
+                self.out.set_left_button_held(false);
+            }
+            self.tap_drag_suppresses_taps = false;
+        } else {
+            let action = self
+                .tap_drag
+                .update(&active, now, TAP_MAX_DURATION, TAP_MAX_MOVE_MM);
+            if action.release {
+                self.out.set_left_button_held(false);
+            }
+            if action.press {
+                log::debug!("tap drag: holding left button");
+                self.out.begin_tap_drag();
+            }
+            self.tap_drag_suppresses_taps = action.suppress_taps;
+        }
 
         // Refresh tracked-contact state (prev → current).
         let mut next: HashMap<u8, Tracked> = HashMap::with_capacity(active.len());
@@ -1121,6 +1154,7 @@ impl<O: Output> State<O> {
             since_start,
             max_move_mm,
             tap_window_open: !active.is_empty()
+                && !self.tap_drag_suppresses_taps
                 && !self.physical_button_used
                 && max_move_mm < TAP_MAX_MOVE_MM
                 && since_start < TAP_MAX_DURATION,
@@ -1218,11 +1252,10 @@ impl<O: Output> State<O> {
                 let pending_2f = self.pending_two_finger_tap.take();
                 let suppress_residual = std::mem::take(&mut self.suppress_one_finger_click);
                 if matches!(new_kind, GestureKind::Idle) {
-                    if bc {
-                        // Born during coast: nothing this session does
-                        // counts as a click. Whether the residual was
-                        // also a 2F-tail or a fresh 1F is irrelevant.
-                        log::debug!("1f lift, click suppressed (born during coast)");
+                    if bc || self.tap_drag_suppresses_taps {
+                        // Stopping inertia and ending a drag both consume the
+                        // touch; neither may turn into another click on lift.
+                        log::debug!("1f lift, click suppressed (coast or tap drag)");
                     } else if let Some(p) = pending_2f {
                         // Residual 1F is the tail of an asynchronous 2F
                         // lift. Combine the 2F window/motion with the
@@ -1271,6 +1304,7 @@ impl<O: Output> State<O> {
                                 },
                             );
                             self.out.click(MouseButton::Left);
+                            self.tap_drag.arm(now);
                         } else {
                             log::debug!(
                                 "1f lift, no tap: dur={}ms max_move={:.2}mm (limits dur<{}ms move<{:.2}mm)",
@@ -1332,6 +1366,7 @@ impl<O: Output> State<O> {
                 let dur = now - self.started_at;
                 let max_move = self.max_move_sq.sqrt();
                 let tap_eligible = !self.physical_button_used
+                    && !self.tap_drag_suppresses_taps
                     && dur < TAP_MAX_DURATION
                     && max_move < TAP_MAX_MOVE_MM;
                 if matches!(new_kind, GestureKind::Idle) {
@@ -1800,8 +1835,10 @@ impl<O: Output> State<O> {
         // moment we cross the threshold.
         let max_move = tr.max_move_sq.sqrt();
         let dur = now - self.started_at;
-        let could_still_tap =
-            !self.physical_button_used && max_move < TAP_MAX_MOVE_MM && dur < TAP_MAX_DURATION;
+        let could_still_tap = !self.physical_button_used
+            && !self.tap_drag.held()
+            && max_move < TAP_MAX_MOVE_MM
+            && dur < TAP_MAX_DURATION;
         if could_still_tap {
             self.pending_motion = None;
             return;
@@ -2664,6 +2701,217 @@ mod tests {
 
     fn at_ms(ms: u64) -> Timestamp {
         Timestamp::from_nanos(1_000_000_000 + ms * 1_000_000)
+    }
+
+    fn start_tap_drag(s: &mut State<&Recorder>) {
+        s.on_frame_at(frame(&[(1, 0.2, 0.4)]), at_ms(0));
+        s.on_frame_at(frame(&[]), at_ms(40));
+        s.on_frame_at(frame(&[(2, 0.2, 0.4)]), at_ms(120));
+        s.on_frame_at(frame(&[(2, 0.24, 0.4)]), at_ms(140));
+        s.on_frame_at(frame(&[(2, 0.28, 0.4)]), at_ms(160));
+    }
+
+    #[test]
+    fn tap_drag_presses_before_moving_and_releases_on_the_lift_report() {
+        let out = Recorder::default();
+        let mut s = State::new(&out, test_accel());
+        start_tap_drag(&mut s);
+        let log = out.pop();
+        assert_eq!(
+            log.iter().filter(|l| *l == "click Left").count(),
+            1,
+            "{log:?}"
+        );
+        let press = log
+            .iter()
+            .position(|l| l == "set_left_button_held true")
+            .unwrap();
+        let movement = log.iter().position(|l| l.starts_with("move ")).unwrap();
+        assert!(press < movement, "{log:?}");
+        assert!(!log.iter().any(|l| l == "set_left_button_held false"));
+        s.on_frame_at(frame(&[]), at_ms(180));
+        assert_eq!(out.pop(), ["set_left_button_held false"]);
+        s.on_frame_at(frame(&[]), at_ms(190));
+        assert!(out.pop().is_empty());
+    }
+
+    #[test]
+    fn a_touch_immediately_after_drag_release_is_normal_pointer_motion() {
+        let out = Recorder::default();
+        let mut s = State::new(&out, test_accel());
+        start_tap_drag(&mut s);
+        s.on_frame_at(frame(&[]), at_ms(180));
+        out.pop();
+        s.on_frame_at(frame(&[(3, 0.28, 0.4)]), at_ms(190));
+        s.on_frame_at(frame(&[(3, 0.4, 0.4)]), at_ms(210));
+        s.on_frame_at(frame(&[(3, 0.5, 0.4)]), at_ms(230));
+        s.on_frame_at(frame(&[]), at_ms(250));
+        let log = out.pop();
+        assert!(log.iter().any(|l| l.starts_with("move ")), "{log:?}");
+        assert!(
+            !log.iter()
+                .any(|l| l.starts_with("set_left_button") || l.starts_with("click")),
+            "{log:?}"
+        );
+    }
+
+    #[test]
+    fn quick_double_and_triple_taps_still_emit_normal_clicks() {
+        let out = Recorder::default();
+        let mut s = State::new(&out, test_accel());
+        for (id, ms) in [(1, 0), (2, 120), (3, 240)] {
+            s.on_frame_at(frame(&[(id, 0.2, 0.4)]), at_ms(ms));
+            s.on_frame_at(frame(&[]), at_ms(ms + 40));
+        }
+        let log = out.pop();
+        assert_eq!(
+            log.iter().filter(|l| *l == "click Left").count(),
+            3,
+            "{log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.starts_with("set_left_button")),
+            "{log:?}"
+        );
+    }
+
+    #[test]
+    fn tap_drag_requires_a_recent_nearby_single_finger_tap() {
+        for (second_time, second_x) in [(400, 0.2), (120, 0.6)] {
+            let out = Recorder::default();
+            let mut s = State::new(&out, test_accel());
+            s.on_frame_at(frame(&[(1, 0.2, 0.4)]), at_ms(0));
+            s.on_frame_at(frame(&[]), at_ms(40));
+            s.on_frame_at(frame(&[(2, second_x, 0.4)]), at_ms(second_time));
+            s.on_frame_at(frame(&[(2, second_x + 0.05, 0.4)]), at_ms(second_time + 20));
+            s.on_frame_at(frame(&[(2, second_x + 0.1, 0.4)]), at_ms(second_time + 40));
+            let log = out.pop();
+            assert!(log.iter().any(|l| l.starts_with("move ")), "{log:?}");
+            assert!(
+                !log.iter().any(|l| l.starts_with("set_left_button")),
+                "{log:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn second_touch_can_hold_then_drag_but_a_lone_hold_does_not_drag() {
+        let out = Recorder::default();
+        let mut s = State::new(&out, test_accel());
+        s.on_frame_at(frame(&[(1, 0.2, 0.4)]), at_ms(0));
+        s.on_frame_at(frame(&[(1, 0.2, 0.4)]), at_ms(200));
+        s.on_frame_at(frame(&[]), at_ms(240));
+        assert!(!out.pop().iter().any(|l| l.starts_with("set_left_button")));
+        s.on_frame_at(frame(&[(1, 0.2, 0.4)]), at_ms(300));
+        s.on_frame_at(frame(&[]), at_ms(340));
+        s.on_frame_at(frame(&[(2, 0.2, 0.4)]), at_ms(400));
+        s.on_frame_at(frame(&[(2, 0.2, 0.4)]), at_ms(550));
+        assert!(out.pop().iter().any(|l| l == "set_left_button_held true"));
+    }
+
+    #[test]
+    fn cancellation_and_drop_release_active_drags_without_releasing_twice_after_lift() {
+        for lifted in [false, true] {
+            for drop_state in [false, true] {
+                let out = Recorder::default();
+                let mut s = State::new(&out, test_accel());
+                start_tap_drag(&mut s);
+                if lifted {
+                    s.on_frame_at(frame(&[]), at_ms(180));
+                }
+                out.pop();
+                if drop_state {
+                    drop(s);
+                } else {
+                    s.cancel_at(at_ms(200));
+                    s.cancel_at(at_ms(210));
+                }
+                let log = out.pop();
+                assert_eq!(
+                    log.iter()
+                        .filter(|l| *l == "set_left_button_held false")
+                        .count(),
+                    usize::from(!lifted),
+                    "{log:?}"
+                );
+                assert!(!log.iter().any(|l| l.starts_with("click")), "{log:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn added_finger_or_confidence_loss_ends_drag_without_extra_taps() {
+        for confidence_loss in [false, true] {
+            let out = Recorder::default();
+            let mut s = State::new(&out, test_accel());
+            start_tap_drag(&mut s);
+            out.pop();
+            let mut f = frame(&[(2, 0.28, 0.4), (3, 0.5, 0.4)]);
+            if confidence_loss {
+                f.contacts[0].confidence = false;
+            }
+            s.on_frame_at(f, at_ms(180));
+            s.on_frame_at(frame(&[(3, 0.5, 0.4)]), at_ms(200));
+            s.on_frame_at(frame(&[]), at_ms(220));
+            let log = out.pop();
+            assert_eq!(
+                log.iter()
+                    .filter(|l| *l == "set_left_button_held false")
+                    .count(),
+                1,
+                "{log:?}"
+            );
+            assert!(!log.iter().any(|l| l.starts_with("click")), "{log:?}");
+        }
+    }
+
+    #[test]
+    fn physical_button_can_take_over_a_software_drag_without_releasing_it() {
+        let out = Recorder::default();
+        let mut s = State::new(&out, test_accel());
+        start_tap_drag(&mut s);
+        out.pop();
+        s.on_frame_at(frame_with_button(&[(2, 0.28, 0.4)], true), at_ms(180));
+        assert!(!out.pop().iter().any(|l| l == "set_left_button_held false"));
+        s.on_frame_at(frame_with_button(&[], true), at_ms(200));
+        s.on_frame_at(frame(&[]), at_ms(220));
+        let log = out.pop();
+        assert_eq!(
+            log.iter()
+                .filter(|l| *l == "set_left_button_held false")
+                .count(),
+            1,
+            "{log:?}"
+        );
+    }
+
+    #[test]
+    fn tap_followed_by_two_or_three_fingers_still_scrolls_or_swipes() {
+        for count in [2, 3] {
+            let out = Recorder::default();
+            let mut s = State::new(&out, test_accel());
+            s.on_frame_at(frame(&[(1, 0.2, 0.4)]), at_ms(0));
+            s.on_frame_at(frame(&[]), at_ms(40));
+            // Fingers arrive separately, so the first is initially a candidate.
+            s.on_frame_at(frame(&[(2, 0.2, 0.4)]), at_ms(100));
+            for (time, dx) in [(110, 0.0), (130, 0.1), (150, 0.2)] {
+                let contacts: Vec<_> = (0..count)
+                    .map(|i| (i + 2, 0.2 + dx, 0.2 + f64::from(i) * 0.2))
+                    .collect();
+                s.on_frame_at(frame(&contacts), at_ms(time));
+            }
+            s.on_frame_at(frame(&[]), at_ms(180));
+            let log = out.pop();
+            assert!(
+                log.iter()
+                    .any(|l| l.starts_with(if count == 2 { "scroll " } else { "swipe " })),
+                "{log:?}"
+            );
+            assert!(
+                !log.iter().any(|l| l.starts_with("set_left_button")),
+                "{log:?}"
+            );
+        }
     }
 
     #[test]

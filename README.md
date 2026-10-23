@@ -16,6 +16,17 @@ well for me and has served as a base for refining gesture recognition. It has
 tests inspired by real usage logs. Eventually I hope to distill what I've
 learned into a nice spec and develop a high-quality codebase from it.
 
+For HongMall P-T066 (`048D:8911`) setup, macOS 27 swipe failures, and
+USB-triggered startup, see [the device and troubleshooting guide](docs/hongmall-macos27.md).
+
+To select text or drag an item without a physical button, tap once, then
+touch again nearby within 300 ms and keep that finger down while moving.
+A quick second tap still double-clicks. Lifting your finger releases the
+button immediately, with no drag lock or repositioning delay. This
+recognition is built into the companion and does not change macOS's
+trackpad settings. Two-finger scrolling and three-finger swipes remain
+available; adding a finger during an active drag ends that drag.
+
 ## Build & run
 
 The primary artifact is a menu-bar app bundle:
@@ -112,6 +123,56 @@ That matters more than convenience. A pad on the spec Input Mode path
 stops responding the moment nothing is driving it, so an unattended
 crash would otherwise leave a dead trackpad until someone noticed.
 
+### Start only when a USB trackpad is attached
+
+For occasional use, `scripts/usb-autostart.py` installs a separate per-user
+LaunchAgent. macOS launches the companion when the selected USB VID/PID
+appears; the companion exits half a second after the last matching device
+is removed. There is no resident companion or custom polling process while
+the pad is unplugged. The USB watcher works independently of HID access.
+
+Build the app, then stage and install the agent (example: HongMall P-T066):
+
+```sh
+SIGN_IDENTITY=- ./scripts/bundle.sh
+python3 scripts/usb-autostart.py prepare --app target/companion.app \
+  --config /absolute/path/to/companion-hongmall.toml \
+  --vid 0x048d --pid 0x8911 --output ../usb-autostart
+python3 scripts/usb-autostart.py install --prepared ../usb-autostart
+```
+
+Preparation writes only reviewable staging files. Installation copies the
+app to `~/Applications/Trackpad Companion USB.app` and registers
+`~/Library/LaunchAgents/net.guemez.trackpad-companion.usb.plist`. It uses
+the selected config by absolute path; keep that file in place. The app
+needs its own Input Monitoring and Accessibility grants. Stop any manual
+instance before testing; the same single-instance lock protects both modes.
+
+Add the installed `.app` in `~/Applications` to both privacy panes, rather
+than the staged copy or its inner executable. macOS may reopen the app
+without its arguments after a permission change. In that case, hand control
+back to the configured USB job:
+
+```sh
+python3 scripts/usb-autostart.py restart
+```
+
+Leave **Start at Login** disabled when using USB activation. Clean Quit
+stays quit until the next USB connection. The USB job does not restart on
+every process exit; if the app crashes, reconnect the pad. Logs are in
+`~/Library/Logs/macos-trackpad-companion.usb.log`. No root or extra Apple
+entitlements are needed.
+
+```sh
+python3 scripts/usb-autostart.py status
+python3 scripts/usb-autostart.py uninstall
+```
+
+Uninstalling this agent stops its managed instance and disables USB startup;
+the app and config are retained. Ordinary manual and login startup keep
+their existing behavior. `--usb-triggered` is the companion flag used by
+the agent; it requires `device.vid` and `device.pid` in the config.
+
 ## Configuration
 
 All tuning lives in a TOML file at
@@ -188,6 +249,12 @@ check_at_launch = true        # one check shortly after launch; silent unless
                               #   there is something to report
 # feed_url = "https://…/appcast.json"   # "" turns checking off entirely
 ```
+
+On macOS 27 and later, `synthetic` embeds the IOHID DockSwipe payload
+required by the Dock. Earlier versions retain field-based output. Both
+axes stream progress while the fingers move; no configuration change is
+needed. macOS 27 output has been manually tested with a HongMall P-T066
+on macOS 27.0.1. Longer-term use and other devices remain untested.
 
 ### Live reload
 
@@ -584,6 +651,7 @@ on separate interfaces.
 | `descriptor.rs` | Walks a HID report descriptor and extracts the touch-report `Layout` (contact count, X/Y max, field offsets). |
 | `report.rs` | Decodes one input-report buffer into a `Frame` of normalized contacts. |
 | `gesture.rs` | Pure state machine — classifies 1F/2F/3F/4F gestures, locks 2F mode on first significant motion. Tested without I/O. |
+| `tap_drag.rs` | Single-finger tap-then-drag recognition, with immediate release on lift. |
 | `output.rs` | macOS event synthesis. Public CGEvent for cursor/click/scroll, private CGEvent type/field IDs for pinch/rotate/swipe. |
 | `hid.rs` | IOHIDManager FFI: device matching, descriptor + input-report subscription, run-loop pumping. |
 | `app_kit.rs` | Shared `NSApp` bring-up (accessory policy) and the `[NSApp run]` event loop, plus the cross-thread stop. |

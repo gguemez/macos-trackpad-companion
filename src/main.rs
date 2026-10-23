@@ -22,6 +22,7 @@
 use macos_trackpad_companion::{
     app_kit, capture, config, config_watch, gesture, hid, instance_lock, onboarding, output,
     overlay, pause, permissions, scope, settings, status_item, system_prefs, time, update,
+    usb_launch,
 };
 
 use anyhow::{Context, Result};
@@ -61,6 +62,11 @@ struct Args {
     /// `replay` binary.
     #[arg(long, value_name = "PATH")]
     record: Option<PathBuf>,
+
+    /// Run only while the configured USB device is attached. Used by a
+    /// launchd USB LaunchEvents agent; requires device.vid and device.pid.
+    #[arg(long, conflicts_with = "dump_descriptors")]
+    usb_triggered: bool,
 }
 
 fn main() -> Result<()> {
@@ -75,6 +81,7 @@ fn main() -> Result<()> {
     hid::block_shutdown_signals();
 
     let args = Args::parse();
+    let _launch_events = args.usb_triggered.then(usb_launch::LaunchEvents::listen);
     let (cfg, cfg_path) = config::load(args.config.as_deref())?;
 
     let level = if args.verbose > 0 {
@@ -138,6 +145,25 @@ fn main() -> Result<()> {
     if args.dump_descriptors {
         return dump_descriptors(&cfg);
     }
+
+    let _usb_watch = if args.usb_triggered {
+        let vid = cfg
+            .device
+            .vid
+            .context("--usb-triggered requires device.vid")?;
+        let pid = cfg
+            .device
+            .pid
+            .context("--usb-triggered requires device.pid")?;
+        let watch = usb_launch::Watch::new(vid, pid)?;
+        if !watch.is_present() {
+            log::info!("USB device {vid:04x}:{pid:04x} is absent; exiting");
+            return Ok(());
+        }
+        Some(watch)
+    } else {
+        None
+    };
 
     let lock = match instance_lock::acquire() {
         Ok(lock) => lock,
