@@ -171,9 +171,16 @@ enable = "on"
 
 [gestures.swipe.horizontal]   # left/right 3F/4F → Spaces / Full-Screen Apps
 enable  = "on"
-backend = "synthetic"         # synthetic | notification | off
-                              #   (notification is silently `off` on this axis —
-                              #    no Dock notification exists for switching spaces)
+backend = "synthetic"         # synthetic | notification | shortcut | off
+                              #   synthetic    — private swipe events; the animation
+                              #                  follows your fingers. Ignored by
+                              #                  macOS 27, see docs/known-gaps.md
+                              #   notification — asks the Dock directly, on lift.
+                              #                  Vertical only: silently `off` here,
+                              #                  no Dock notification switches spaces
+                              #   shortcut     — presses Control + arrow, on lift.
+                              #                  Needs the default Mission Control
+                              #                  keyboard shortcuts left enabled
 
 [gestures.swipe.vertical]     # up/down 3F/4F → Mission Control / App Exposé
 enable  = "on"

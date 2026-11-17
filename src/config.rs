@@ -31,7 +31,7 @@
 //! enable = "on"
 //! [gestures.swipe.horizontal]
 //! enable  = "on"
-//! backend = "synthetic"            # synthetic | notification | off
+//! backend = "synthetic"            # synthetic | notification | shortcut | off
 //! [gestures.swipe.vertical]
 //! enable  = "on"
 //! backend = "synthetic"
@@ -244,6 +244,7 @@ impl Default for SwipeAxisCfg {
 pub enum SwipeBackend {
     Synthetic,
     Notification,
+    Shortcut,
     Off,
 }
 
@@ -472,6 +473,18 @@ mod tests {
         assert_eq!(
             cfg.gestures.swipe.vertical.backend,
             SwipeBackend::Notification
+        );
+
+        let cfg: Config = toml::from_str(
+            r#"
+            [gestures.swipe.horizontal]
+            backend = "shortcut"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.gestures.swipe.horizontal.backend,
+            SwipeBackend::Shortcut
         );
     }
 

@@ -396,16 +396,62 @@ const DOCK_NOTIF_MISSION_CONTROL: &str = "com.apple.expose.awake";
 /// hammerspoon/extensions/spaces/spaces.lua:272.
 const DOCK_NOTIF_APP_EXPOSE: &str = "com.apple.expose.front.awake";
 
-/// Cumulative-progress threshold above which a vertical swipe commits
-/// the Mission Control / Exposé toggle. With
-/// [`SWIPE_PROGRESS_REF_MM`] = 50mm, 0.2 ≈ 10mm of finger travel —
-/// large enough to clearly distinguish from a 3F tap or accidental
-/// drift past the axis-lock threshold (3mm), small enough that a
-/// natural quick flick (10–15mm) reliably fires. Only meaningful in
-/// the `Notification` swipe backend — `Synthetic` defers commit
+/// Cumulative-progress threshold above which a discrete swipe backend
+/// (`Notification`, `Shortcut`) commits on lift. Progress is travel as
+/// a fraction of a full swipe, which is scaled to the pad — 0.2 is
+/// 24 mm across and 14 mm up a 209 x 119 mm pad. Large enough to
+/// clearly distinguish from a 3F tap or accidental drift past the
+/// axis-lock threshold (3mm), small enough that a natural quick flick
+/// reliably fires. Not used by `Synthetic`, which defers commit
 /// decisions to the Dock itself based on origin offset and lift
 /// velocity, like a real trackpad.
-const SWIPE_VERTICAL_COMMIT_PROGRESS: f64 = 0.2;
+const SWIPE_DISCRETE_COMMIT_PROGRESS: f64 = 0.2;
+
+// ---------- Keyboard-shortcut swipe ----------
+//
+// The third way to act on a swipe, and the only discrete one that
+// covers the horizontal axis: press the Mission Control keyboard
+// shortcut. Added because macOS 27 stopped acting on synthesized
+// DockSwipe events (the driver still posts them, well-formed, and the
+// Dock ignores them), and no Dock notification exists for switching
+// Spaces. Keyboard events are public API, so this path does not
+// depend on anything reverse-engineered.
+//
+// It presses the *default* bindings — Control with an arrow key — and
+// does not read the user's own from `com.apple.symbolichotkeys`. They
+// have to be enabled and unchanged under System Settings > Keyboard >
+// Keyboard Shortcuts > Mission Control.
+
+/// Virtual key codes from `<HIToolbox/Events.h>` (`kVK_LeftArrow` …).
+const KEY_LEFT_ARROW: u16 = 123;
+const KEY_RIGHT_ARROW: u16 = 124;
+const KEY_DOWN_ARROW: u16 = 125;
+const KEY_UP_ARROW: u16 = 126;
+
+/// `kCGEventFlagMaskControl`, plus the two flags a hardware arrow key
+/// carries (`kCGEventFlagMaskSecondaryFn`, `kCGEventFlagMaskNumericPad`).
+/// The system's own bindings are stored with the Fn bit set, and an
+/// arrow posted with Control alone is not matched against them.
+const SHORTCUT_FLAGS: u64 = 0x0004_0000 | 0x0080_0000 | 0x0020_0000;
+
+/// Which arrow key, if any, a swipe event should press under the
+/// `Shortcut` backend. Fires once, on lift, past the commit threshold.
+///
+/// Direction follows a real trackpad: fingers moving left bring in the
+/// Space on the right (Control-Right), fingers moving up open Mission
+/// Control (Control-Up), fingers moving down open App Exposé.
+fn shortcut_key_for_swipe(axis: SwipeAxis, signed_progress: f64, phase: Phase) -> Option<u16> {
+    if !matches!(phase, Phase::Ended) || signed_progress.abs() < SWIPE_DISCRETE_COMMIT_PROGRESS {
+        return None;
+    }
+    let toward_negative = signed_progress < 0.0;
+    Some(match (axis, toward_negative) {
+        (SwipeAxis::Horizontal, true) => KEY_RIGHT_ARROW,
+        (SwipeAxis::Horizontal, false) => KEY_LEFT_ARROW,
+        (SwipeAxis::Vertical, true) => KEY_UP_ARROW,
+        (SwipeAxis::Vertical, false) => KEY_DOWN_ARROW,
+    })
+}
 
 /// Soft cap on the End-event velocity (mm/s). The Dock interprets
 /// large lift velocities as a deliberate flick and commits the
@@ -444,6 +490,11 @@ unsafe extern "C" {
         ty: u32,
         cursor: CGPoint,
         button: u32,
+    ) -> CGEventRef;
+    fn CGEventCreateKeyboardEvent(
+        source: CGEventSourceRef,
+        virtual_key: u16,
+        key_down: bool,
     ) -> CGEventRef;
     fn CGEventCreateScrollWheelEvent2(
         source: CGEventSourceRef,
@@ -915,6 +966,10 @@ pub enum SwipeBackend {
     /// Discrete (no live animation), vertical-only — silently `Off` if
     /// selected for the horizontal axis.
     Notification,
+    /// Press the Mission Control keyboard shortcut (Control + arrow) on
+    /// lift past a commit threshold. Discrete, works on both axes, and
+    /// uses only public API.
+    Shortcut,
     /// Suppress entirely.
     Off,
 }
@@ -1554,6 +1609,9 @@ impl Emitter {
             (SwipeBackend::Notification, SwipeAxis::Vertical) => {
                 self.swipe_notification(signed_progress, phase);
             }
+            (SwipeBackend::Shortcut, _) => {
+                self.swipe_shortcut(axis, signed_progress, phase);
+            }
             (SwipeBackend::Synthetic, _) => {
                 self.swipe_synthetic(axis, signed_progress, velocity_mm_per_sec, phase);
             }
@@ -1620,13 +1678,13 @@ impl Emitter {
     /// threshold. Vertical-only — there's no Dock notification for
     /// horizontal Space switching.
     fn swipe_notification(&self, signed_progress: f64, phase: Phase) {
-        if !matches!(phase, Phase::Ended) || signed_progress.abs() < SWIPE_VERTICAL_COMMIT_PROGRESS
+        if !matches!(phase, Phase::Ended) || signed_progress.abs() < SWIPE_DISCRETE_COMMIT_PROGRESS
         {
             log::trace!(
                 "post: vertical swipe (notification) {:?} progress={:+.3} (no-op until Ended past ±{})",
                 phase,
                 signed_progress,
-                SWIPE_VERTICAL_COMMIT_PROGRESS,
+                SWIPE_DISCRETE_COMMIT_PROGRESS,
             );
             return;
         }
@@ -1641,6 +1699,36 @@ impl Emitter {
             signed_progress,
         );
         send_dock_notification(notif);
+    }
+
+    /// Keyboard-shortcut path: one Control + arrow key press on lift
+    /// past the commit threshold. See [`shortcut_key_for_swipe`] for the
+    /// direction mapping.
+    fn swipe_shortcut(&self, axis: SwipeAxis, signed_progress: f64, phase: Phase) {
+        let Some(key) = shortcut_key_for_swipe(axis, signed_progress, phase) else {
+            log::trace!(
+                "post: swipe (shortcut) {:?} {:?} progress={:+.3} (no-op until Ended past ±{})",
+                axis,
+                phase,
+                signed_progress,
+                SWIPE_DISCRETE_COMMIT_PROGRESS,
+            );
+            return;
+        };
+        log::debug!(
+            "post: swipe {:?} → Control + key {} (progress={:+.3})",
+            axis,
+            key,
+            signed_progress,
+        );
+        for key_down in [true, false] {
+            if let Some(e) = Event::from_raw(unsafe {
+                CGEventCreateKeyboardEvent(self.event_source, key, key_down)
+            }) {
+                unsafe { CGEventSetFlags(e.0, SHORTCUT_FLAGS) };
+                e.post();
+            }
+        }
     }
 }
 
@@ -2087,6 +2175,30 @@ impl Output for Emitter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shortcut_follows_trackpad_direction() {
+        use SwipeAxis::{Horizontal, Vertical};
+        let key = |axis, progress| shortcut_key_for_swipe(axis, progress, Phase::Ended);
+        // Fingers left bring in the Space on the right, and vice versa.
+        assert_eq!(key(Horizontal, -0.5), Some(KEY_RIGHT_ARROW));
+        assert_eq!(key(Horizontal, 0.5), Some(KEY_LEFT_ARROW));
+        // +Y is down: fingers up open Mission Control, down App Exposé.
+        assert_eq!(key(Vertical, -0.5), Some(KEY_UP_ARROW));
+        assert_eq!(key(Vertical, 0.5), Some(KEY_DOWN_ARROW));
+    }
+
+    #[test]
+    fn shortcut_fires_only_on_lift_past_the_threshold() {
+        let h = SwipeAxis::Horizontal;
+        for phase in [Phase::Began, Phase::Changed, Phase::Cancelled] {
+            assert_eq!(shortcut_key_for_swipe(h, -0.9, phase), None, "{phase:?}");
+        }
+        let just_short = SWIPE_DISCRETE_COMMIT_PROGRESS - 0.01;
+        assert_eq!(shortcut_key_for_swipe(h, just_short, Phase::Ended), None);
+        assert_eq!(shortcut_key_for_swipe(h, -just_short, Phase::Ended), None);
+        assert!(shortcut_key_for_swipe(h, SWIPE_DISCRETE_COMMIT_PROGRESS, Phase::Ended).is_some());
+    }
 
     #[test]
     fn policy_on_admits_without_calling_lookup() {

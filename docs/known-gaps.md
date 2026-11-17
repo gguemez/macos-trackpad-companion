@@ -216,6 +216,39 @@ Finding it took four attempts. What worked was toggling the switch and
 looking for which plist changed:
 `find ~/Library/Preferences -name "*.plist" -mmin -5`.
 
+### macOS 27 ignores synthesized swipes
+
+Measured on macOS 27.2.1 (2026-11-17), with 0.9.3 built and tuned on
+26.6.2. Three- and four-finger swipes stopped doing anything while
+cursor, click and scroll carried on.
+
+The companion's side is intact. `gesture-tap` recorded 105 swipes across
+two 30-second windows, each a clean Began → Changed → Ended run of
+DockSwipe events posted by the companion's own pid, on both axes, with
+progress between 0.25 and 0.87. The Dock simply does not act on them.
+
+What still works, and what is configured around it:
+
+- **Vertical:** `backend = "notification"` opens Mission Control and App
+  Exposé — `CoreDockSendNotification` is still honoured.
+- **Horizontal:** no notification exists for switching Spaces, so
+  `backend = "shortcut"` presses Control + arrow instead.
+
+Both were confirmed by hand on 27.2.1. Both are discrete: they fire on
+lift, and the animation no longer follows the fingers.
+
+**Not known:** what a real trackpad's swipe looks like on macOS 27, and
+so whether the `synthetic` backend can be repaired. That needs a
+`gesture-tap` capture of four-finger swipes on the built-in trackpad
+alone, to compare against the events `post_dock_swipe` builds. The one
+attempt so far recorded only the companion's events, which leaves two
+readings open — the built-in pad was not the one being swiped, or real
+swipes no longer pass through the session tap at all.
+
+One trap for whoever runs that capture: `gesture-tap` hides a double
+field whose value is a whole number, and the End velocity is capped at
+exactly 8.0, so a capped velocity prints as if it were absent.
+
 ## UI
 
 ### The settings window is partial ✅ (mostly)

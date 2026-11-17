@@ -411,6 +411,7 @@ fn resolve_swipe(c: &config::SwipeAxisCfg) -> output::SwipeConfig {
     let backend = match c.backend {
         config::SwipeBackend::Synthetic => output::SwipeBackend::Synthetic,
         config::SwipeBackend::Notification => output::SwipeBackend::Notification,
+        config::SwipeBackend::Shortcut => output::SwipeBackend::Shortcut,
         config::SwipeBackend::Off => output::SwipeBackend::Off,
     };
     output::SwipeConfig {

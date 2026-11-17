@@ -13,6 +13,18 @@ What is understood but *not* done — and what is not understood — stays in
 [`docs/known-gaps.md`](docs/known-gaps.md). That file is a standing record
 rather than a per-version one, so it is not duplicated here.
 
+## [0.9.4] — 2026-11-17
+
+### Added
+
+- **`backend = "shortcut"`** for `[gestures.swipe.*]`. On lift, past a
+  fifth of a full swipe, it presses the Mission Control keyboard shortcut
+  — Control with the arrow key for that direction. It exists because
+  macOS 27 ignores the synthesized swipe events the default backend
+  sends, and nothing else covers left/right: there is no Dock
+  notification for switching Spaces. The default stays `synthetic`;
+  [`docs/known-gaps.md`](docs/known-gaps.md) has what was measured.
+
 ## [0.9.3] — 2026-09-12
 
 ### Added
